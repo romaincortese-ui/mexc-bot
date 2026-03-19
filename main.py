@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 MEXC_API_KEY    = "mx0vglg1LIlEl98JhQ"       # from MEXC > Profile > API Management
 MEXC_API_SECRET = "2b53b21288c8494bbec5e0cc7f34d8c2"    # same place
 
-PAPER_TRADE      = True      # ← keep True for now! Change to False for real money
+PAPER_TRADE      = False      # ← keep True for now! Change to False for real money
 PAPER_BALANCE    = 50.0     # Simulated USDT balance for paper trading
 TAKE_PROFIT_PCT  = 0.020    # 2.0% profit target
 STOP_LOSS_PCT   = 0.015     # 1.5% loss limit
