@@ -1,8 +1,13 @@
 """
-MEXC Scalping Bot — Replit edition with Telegram notifications
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MEXC Scalping Bot + Moonshot Strategy
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Two parallel strategies:
+  1. Scalper  — 95% of balance | TP: +2%  | SL: -1.5% | high-volume pairs
+  2. Moonshot —  5% of balance | TP: +25% | SL: -10%  | low-volume gems
+     + Moonshot auto-exits after 48h if TP not reached
+
 SETUP: Fill in your MEXC API details below, then hit Run.
-       Leave PAPER_TRADE = True until you've watched it work for a few days.
+       Leave PAPER_TRADE = True until you've watched it work.
 """
 
 import time, hmac, hashlib, logging, requests
@@ -14,15 +19,29 @@ from datetime import datetime, timezone
 #  CONFIG — edit these values before running
 # ═══════════════════════════════════════════════════════════════
 
-MEXC_API_KEY    = "mx0vglg1LIlEl98JhQ"       # from MEXC > Profile > API Management
-MEXC_API_SECRET = "2b53b21288c8494bbec5e0cc7f34d8c2"    # same place
+MEXC_API_KEY    = "mx0vglg1LIlEl98JhQ"
+MEXC_API_SECRET = "2b53b21288c8494bbec5e0cc7f34d8c2"
 
-PAPER_TRADE      = False      # ← keep True for now! Change to False for real money
-PAPER_BALANCE    = 50.0     # Simulated USDT balance for paper trading
-TAKE_PROFIT_PCT  = 0.020    # 2.0% profit target
-STOP_LOSS_PCT   = 0.015     # 1.5% loss limit
-SCAN_INTERVAL   = 60        # seconds between market scans (when not in a trade)
-MIN_VOLUME_USDT = 500_000   # ignore pairs with low liquidity
+PAPER_TRADE   = False    # ← keep True until ready for real money
+PAPER_BALANCE = 50.0    # simulated starting balance
+
+# ── Scalper settings (main strategy) ──────────────────────────
+SCALPER_BUDGET_PCT  = 0.95    # 95% of available balance
+SCALPER_TP          = 0.020   # +2.0%
+SCALPER_SL          = 0.015   # -1.5%
+SCALPER_MIN_VOL     = 500_000 # min 24h USDT volume
+SCALPER_THRESHOLD   = 20      # min signal score to enter
+
+# ── Moonshot settings (risky 5% bet) ──────────────────────────
+MOONSHOT_BUDGET_PCT = 0.05    # 5% of available balance
+MOONSHOT_TP         = 0.25    # +25%
+MOONSHOT_SL         = 0.10    # -10%
+MOONSHOT_MAX_VOL    = 200_000 # max 24h volume (keeps it low-cap)
+MOONSHOT_MIN_VOL    = 10_000  # min volume (avoid ghost coins)
+MOONSHOT_THRESHOLD  = 25      # slightly higher bar — needs strong momentum
+MOONSHOT_MAX_HOURS  = 48      # exit after 48h regardless
+
+SCAN_INTERVAL = 60  # seconds between scans when idle
 
 TELEGRAM_TOKEN   = "8729639207:AAGR2ytuX36ocCVagQj-tGBE2QEkvrTiqQo"
 TELEGRAM_CHAT_ID = "7058246374"
@@ -40,16 +59,18 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── State ──────────────────────────────────────────────────────
 trade_history      = []
-open_trade         = None
-last_heartbeat_at  = 0      # timestamp of last hourly heartbeat
-last_daily_summary = ""     # date string of last daily summary (e.g. "2024-01-15")
-last_top_pair      = None   # best pair seen in last scan, for heartbeat
+scalper_trade      = None
+moonshot_trade     = None
+last_heartbeat_at  = 0
+last_daily_summary = ""
+last_top_scalper   = None
+last_top_moonshot  = None
 
 # ── Telegram ───────────────────────────────────────────────────
 
 def telegram(msg: str):
-    """Send a message to Telegram. Fails silently so the bot never crashes."""
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -91,9 +112,7 @@ def private_post(path, params=None):
 # ── Balance ────────────────────────────────────────────────────
 
 def get_available_balance() -> float:
-    """Fetch free USDT balance. Returns PAPER_BALANCE in paper mode."""
     if PAPER_TRADE:
-        # In paper mode, simulate balance shrinking/growing with trade history
         pnl = sum(t["pnl_usdt"] for t in trade_history)
         return round(PAPER_BALANCE + pnl, 2)
     try:
@@ -103,7 +122,7 @@ def get_available_balance() -> float:
                 balance = float(b["free"])
                 log.info(f"💰 Available balance: ${balance:.2f} USDT")
                 return balance
-        log.warning("USDT balance not found in account response.")
+        log.warning("USDT balance not found.")
         return 0.0
     except Exception as e:
         log.error(f"Failed to fetch balance: {e}")
@@ -120,16 +139,15 @@ def rsi(series, period=14):
 
 # ── Pair scoring ───────────────────────────────────────────────
 
-def score_pair(symbol):
+def score_pair(symbol, interval="5m"):
     try:
-        data = public_get("/api/v3/klines", {"symbol": symbol, "interval": "5m", "limit": 60})
+        data = public_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": 60})
         df = pd.DataFrame(data, columns=[
             "open_time","open","high","low","close","volume",
             "close_time","quote_volume","trades","taker_buy_base","taker_buy_quote","ignore"
         ])
         for col in ["close","volume"]:
             df[col] = pd.to_numeric(df[col])
-
         if len(df) < 30:
             return None
 
@@ -155,65 +173,135 @@ def score_pair(symbol):
             "symbol":    symbol,
             "score":     round(rsi_score + ma_score + vol_score, 2),
             "rsi":       round(r, 2),
+            "rsi_score": round(rsi_score, 2),
+            "ma_score":  ma_score,
+            "vol_score": round(vol_score, 2),
             "vol_ratio": round(vol_ratio, 2),
             "price":     close.iloc[-1],
         }
     except Exception as e:
-        log.debug(f"Error scoring {symbol}: {e}")
+        log.info(f"⚠️ Error scoring {symbol}: {type(e).__name__}: {e}")
         return None
 
-# ── Market scanner ─────────────────────────────────────────────
+# ── Scanners ───────────────────────────────────────────────────
 
-def find_best_opportunity(exclude=None):
-    log.info("🔍 Scanning market for opportunities...")
+def find_scalper_opportunity(exclude=None):
+    global last_top_scalper
+    log.info("🔍 [SCALPER] Scanning high-volume pairs...")
     data = public_get("/api/v3/ticker/24hr")
     df   = pd.DataFrame(data)
     df   = df[df["symbol"].str.endswith("USDT")].copy()
     df["quoteVolume"]        = pd.to_numeric(df["quoteVolume"],        errors="coerce")
     df["priceChangePercent"] = pd.to_numeric(df["priceChangePercent"], errors="coerce")
-    df   = df[df["quoteVolume"] >= MIN_VOLUME_USDT]
+
+    total_usdt = len(df)
+    df = df[df["quoteVolume"] >= SCALPER_MIN_VOL]
+    after_vol  = len(df)
+
     df["abs_change"] = df["priceChangePercent"].abs()
-    df   = df[df["abs_change"] > 0.5]
+    df = df[df["abs_change"] > 0.3]   # loosened from 0.5 → 0.3
+    after_move = len(df)
+
     if exclude:
         df = df[df["symbol"] != exclude]
 
-    candidates = df.sort_values("quoteVolume", ascending=False).head(80)["symbol"].tolist()[:40]
+    log.info(f"[SCALPER] Filter funnel: {total_usdt} USDT pairs → "
+             f"{after_vol} after volume filter → "
+             f"{after_move} after movement filter → "
+             f"scoring top {min(40, after_move)}")
 
+    if after_move == 0:
+        log.info("[SCALPER] All pairs filtered out — market is very flat right now.")
+        return None
+
+    candidates = df.sort_values("quoteVolume", ascending=False).head(80)["symbol"].tolist()[:40]
+    scored, failed = 0, 0
     all_scores = []
     for sym in candidates:
         result = score_pair(sym)
         if result:
             all_scores.append(result)
+            scored += 1
+        else:
+            failed += 1
         time.sleep(0.1)
 
+    log.info(f"[SCALPER] Scored {scored} pairs, {failed} failed/skipped.")
+
     if not all_scores:
-        log.info("⏳ No scoreable pairs found this scan.")
+        log.info("[SCALPER] No scoreable pairs found.")
         return None
 
     all_scores.sort(key=lambda x: x["score"], reverse=True)
     best = all_scores[0]
+    last_top_scalper = best
 
-    # Always log the top pair so we can see what's happening even with no trade
     ma_label = "crossover" if best["ma_score"] == 30 else ("trending" if best["ma_score"] == 15 else "no trend")
     log.info(
-        f"📊 Top pair: {best['symbol']} | "
-        f"Score: {best['score']}/100 (threshold: 20) | "
+        f"📊 [SCALPER] Top: {best['symbol']} | Score: {best['score']}/100 | "
         f"RSI: {best['rsi']} ({best['rsi_score']:.0f}pts) | "
         f"MA: {ma_label} ({best['ma_score']}pts) | "
-        f"Vol: {best['vol_ratio']}x ({best['vol_score']:.0f}pts) | "
-        f"Price: {best['price']}"
+        f"Vol: {best['vol_ratio']}x ({best['vol_score']:.0f}pts)"
     )
 
-    tradeable = [s for s in all_scores if s["score"] > 20]
+    tradeable = [s for s in all_scores if s["score"] > SCALPER_THRESHOLD]
     if not tradeable:
-        log.info(f"⏳ No trade — best score {best['score']} is below threshold of 20. "
-                 f"Scanned {len(all_scores)} pairs. Retrying in {SCAN_INTERVAL}s...")
+        log.info(f"[SCALPER] Best score {best['score']} below threshold {SCALPER_THRESHOLD}. Waiting...")
         return None
 
-    best_tradeable = tradeable[0]
-    last_top_pair  = best_tradeable
-    log.info(f"✅ Signal found! Entering {best_tradeable['symbol']} with score {best_tradeable['score']}")
-    return best_tradeable
+    log.info(f"✅ [SCALPER] Signal! {tradeable[0]['symbol']} score {tradeable[0]['score']}")
+    return tradeable[0]
+
+
+def find_moonshot_opportunity(exclude=None):
+    global last_top_moonshot
+    log.info("🌙 [MOONSHOT] Scanning low-volume gems...")
+    data = public_get("/api/v3/ticker/24hr")
+    df   = pd.DataFrame(data)
+    df   = df[df["symbol"].str.endswith("USDT")].copy()
+    df["quoteVolume"]        = pd.to_numeric(df["quoteVolume"],        errors="coerce")
+    df["priceChangePercent"] = pd.to_numeric(df["priceChangePercent"], errors="coerce")
+    df   = df[df["quoteVolume"] >= MOONSHOT_MIN_VOL]
+    df   = df[df["quoteVolume"] <= MOONSHOT_MAX_VOL]
+    df["abs_change"] = df["priceChangePercent"].abs()
+    df   = df[df["abs_change"] > 3.0]        # at least 3% move in 24h
+    df   = df[df["priceChangePercent"] > 0]  # upward momentum only
+    if exclude:
+        df = df[df["symbol"] != exclude]
+
+    candidates = df.sort_values("priceChangePercent", ascending=False).head(30)["symbol"].tolist()
+
+    if not candidates:
+        log.info("[MOONSHOT] No low-cap movers found this scan.")
+        return None
+
+    all_scores = []
+    for sym in candidates:
+        result = score_pair(sym, interval="15m")  # 15m candles suit bigger moves
+        if result:
+            all_scores.append(result)
+        time.sleep(0.1)
+
+    if not all_scores:
+        log.info("[MOONSHOT] No scoreable pairs found.")
+        return None
+
+    all_scores.sort(key=lambda x: x["score"], reverse=True)
+    best = all_scores[0]
+    last_top_moonshot = best
+
+    log.info(
+        f"🌙 [MOONSHOT] Top: {best['symbol']} | Score: {best['score']}/100 | "
+        f"RSI: {best['rsi']} | Vol: {best['vol_ratio']}x | Price: {best['price']}"
+    )
+
+    tradeable = [s for s in all_scores if s["score"] > MOONSHOT_THRESHOLD]
+    if not tradeable:
+        log.info(f"[MOONSHOT] Best score {best['score']} below threshold {MOONSHOT_THRESHOLD}. Waiting...")
+        return None
+
+    log.info(f"🚀 [MOONSHOT] Signal! {tradeable[0]['symbol']} score {tradeable[0]['score']}")
+    return tradeable[0]
 
 # ── Order execution ────────────────────────────────────────────
 
@@ -233,86 +321,105 @@ def round_qty(qty, step):
     precision = max(0, -int(np.floor(np.log10(step))))
     return round(np.floor(qty / step) * step, precision)
 
-def place_order(symbol, side, qty):
+def place_order(symbol, side, qty, label=""):
+    tag = f"[{label}] " if label else ""
     if PAPER_TRADE:
-        log.info(f"📝 [PAPER] {side} {qty} {symbol} @ MARKET")
+        log.info(f"📝 [PAPER] {tag}{side} {qty} {symbol} @ MARKET")
         return {"orderId": f"PAPER_{int(time.time())}", "paper": True}
     params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": qty}
     return private_post("/api/v3/order", params)
 
 # ── Trade lifecycle ────────────────────────────────────────────
 
-def open_position(opp):
-    symbol  = opp["symbol"]
-    price   = opp["price"]
+def open_position(opp, budget_usdt, tp_pct, sl_pct, label="SCALPER"):
+    symbol = opp["symbol"]
+    price  = opp["price"]
 
-    budget = get_available_balance()
-    if budget < 1.0:
-        msg = f"⚠️ Insufficient balance: ${budget:.2f} USDT. Bot pausing."
-        log.warning(msg)
-        telegram(msg)
+    if budget_usdt < 1.0:
+        log.warning(f"[{label}] Budget ${budget_usdt:.2f} too low, skipping.")
         return None
 
     step, min_q = get_step_size(symbol)
-    qty = round_qty(budget / price, step)
+    qty = round_qty(budget_usdt / price, step)
     if qty < min_q:
-        log.warning(f"⚠️  {symbol}: qty {qty} below minimum {min_q}, skipping.")
+        log.warning(f"[{label}] {symbol} qty {qty} below min {min_q}, skipping.")
         return None
-    order = place_order(symbol, "BUY", qty)
+
+    order = place_order(symbol, "BUY", qty, label)
     if not order:
         return None
 
     trade = {
+        "label":       label,
         "symbol":      symbol,
         "entry_price": price,
         "qty":         qty,
-        "budget_used": round(budget, 2),
-        "tp_price":    round(price * (1 + TAKE_PROFIT_PCT), 8),
-        "sl_price":    round(price * (1 - STOP_LOSS_PCT),   8),
+        "budget_used": round(budget_usdt, 2),
+        "tp_price":    round(price * (1 + tp_pct), 8),
+        "sl_price":    round(price * (1 - sl_pct), 8),
+        "tp_pct":      tp_pct,
+        "sl_pct":      sl_pct,
         "opened_at":   datetime.now(timezone.utc).isoformat(),
         "score":       opp["score"],
     }
 
     mode = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
-    log.info(f"🟢 Opened: {symbol} | Budget: ${budget:.2f} | Entry: {price:.6f} | "
-             f"TP: {trade['tp_price']:.6f} | SL: {trade['sl_price']:.6f}")
+    icon = "🌙" if label == "MOONSHOT" else "🟢"
+    log.info(f"{icon} [{label}] Opened {symbol} | ${budget_usdt:.2f} | "
+             f"Entry: {price:.6f} | TP: {trade['tp_price']:.6f} | SL: {trade['sl_price']:.6f}")
+
+    timeout_line = "Max hold:    48 hours\n" if label == "MOONSHOT" else ""
     telegram(
-        f"🟢 <b>Trade Opened</b> [{mode}]\n"
+        f"{icon} <b>Trade Opened — {label}</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Pair:        <b>{symbol}</b>\n"
-        f"Budget:      <b>${budget:.2f} USDT</b>\n"
+        f"Budget:      <b>${budget_usdt:.2f} USDT</b>\n"
         f"Entry:       <b>${price:.6f}</b>\n"
-        f"Take profit: <b>${trade['tp_price']:.6f}</b>  (+2%)\n"
-        f"Stop loss:   <b>${trade['sl_price']:.6f}</b>  (-1.5%)\n"
-        f"Signal score: {opp['score']} | RSI: {opp['rsi']} | Vol: {opp['vol_ratio']}x"
+        f"Take profit: <b>${trade['tp_price']:.6f}</b>  (+{tp_pct*100:.0f}%)\n"
+        f"Stop loss:   <b>${trade['sl_price']:.6f}</b>  (-{sl_pct*100:.0f}%)\n"
+        f"{timeout_line}"
+        f"Score: {opp['score']} | RSI: {opp['rsi']} | Vol: {opp['vol_ratio']}x"
     )
     return trade
 
-def monitor_and_exit(trade):
+
+def check_exit(trade) -> tuple[bool, str]:
     symbol = trade["symbol"]
     try:
         ticker = public_get("/api/v3/ticker/price", {"symbol": symbol})
         price  = float(ticker["price"])
     except Exception as e:
-        log.error(f"Price fetch error: {e}")
+        log.error(f"Price fetch error for {symbol}: {e}")
         return False, ""
 
-    pct = (price - trade["entry_price"]) / trade["entry_price"] * 100
+    label = trade["label"]
+    pct   = (price - trade["entry_price"]) / trade["entry_price"] * 100
 
     if price >= trade["tp_price"]:
-        log.info(f"🎯 TP hit: {symbol} | +{pct:.2f}% | Price: {price:.6f}")
+        log.info(f"🎯 [{label}] TP hit: {symbol} | +{pct:.2f}%")
         return True, "TAKE_PROFIT"
     if price <= trade["sl_price"]:
-        log.info(f"🛑 SL hit: {symbol} | {pct:.2f}% | Price: {price:.6f}")
+        log.info(f"🛑 [{label}] SL hit: {symbol} | {pct:.2f}%")
         return True, "STOP_LOSS"
 
-    log.info(f"👀 Holding {symbol} | {pct:+.2f}% | Price: {price:.6f}")
+    if label == "MOONSHOT":
+        opened     = datetime.fromisoformat(trade["opened_at"])
+        hours_held = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
+        if hours_held >= MOONSHOT_MAX_HOURS:
+            log.info(f"⏰ [MOONSHOT] 48h timeout: {symbol} | {pct:+.2f}%")
+            return True, "TIMEOUT"
+
+    log.info(f"👀 [{label}] Holding {symbol} | {pct:+.2f}% | Price: {price:.6f}")
     return False, ""
 
+
 def close_position(trade, reason):
-    place_order(trade["symbol"], "SELL", trade["qty"])
+    label  = trade["label"]
+    symbol = trade["symbol"]
+    place_order(symbol, "SELL", trade["qty"], label)
+
     try:
-        ticker     = public_get("/api/v3/ticker/price", {"symbol": trade["symbol"]})
+        ticker     = public_get("/api/v3/ticker/price", {"symbol": symbol})
         exit_price = float(ticker["price"])
     except:
         exit_price = trade["tp_price"] if reason == "TAKE_PROFIT" else trade["sl_price"]
@@ -320,25 +427,30 @@ def close_position(trade, reason):
     pnl_pct  = (exit_price - trade["entry_price"]) / trade["entry_price"] * 100
     pnl_usdt = (exit_price - trade["entry_price"]) * trade["qty"]
 
-    closed = {**trade, "exit_price": exit_price, "exit_reason": reason,
-              "pnl_pct": round(pnl_pct, 4), "pnl_usdt": round(pnl_usdt, 4)}
+    closed = {**trade,
+              "exit_price":  exit_price,
+              "exit_reason": reason,
+              "closed_at":   datetime.now(timezone.utc).isoformat(),
+              "pnl_pct":     round(pnl_pct, 4),
+              "pnl_usdt":    round(pnl_usdt, 4)}
     trade_history.append(closed)
 
-    # Stats for the notification
     wins      = [t for t in trade_history if t["pnl_pct"] > 0]
     win_rate  = len(wins) / len(trade_history) * 100
     total_pnl = sum(t["pnl_usdt"] for t in trade_history)
     mode      = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
 
-    if reason == "TAKE_PROFIT":
-        emoji, label = "🎯", "Take Profit Hit"
-    else:
-        emoji, label = "🛑", "Stop Loss Hit"
+    reason_map = {
+        "TAKE_PROFIT": ("🎯", "Take Profit Hit"),
+        "STOP_LOSS":   ("🛑", "Stop Loss Hit"),
+        "TIMEOUT":     ("⏰", "48h Timeout Exit"),
+    }
+    emoji, reason_label = reason_map.get(reason, ("✅", reason))
 
     telegram(
-        f"{emoji} <b>{label}</b> [{mode}]\n"
+        f"{emoji} <b>{reason_label} — {label}</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"Pair:    <b>{trade['symbol']}</b>\n"
+        f"Pair:    <b>{symbol}</b>\n"
         f"Entry:   ${trade['entry_price']:.6f}\n"
         f"Exit:    <b>${exit_price:.6f}</b>\n"
         f"P&L:     <b>{pnl_pct:+.2f}%  (${pnl_usdt:+.2f})</b>\n"
@@ -350,46 +462,46 @@ def close_position(trade, reason):
     log.info(f"📈 Stats | Trades: {len(trade_history)} | "
              f"Win rate: {win_rate:.0f}% | Total P&L: ${total_pnl:+.2f}")
 
-# ── Heartbeat & daily summary ──────────────────────────────────
+# ── Heartbeat ──────────────────────────────────────────────────
 
 def send_heartbeat():
     global last_heartbeat_at
-    now = time.time()
-    if now - last_heartbeat_at < 3600:
+    if time.time() - last_heartbeat_at < 3600:
         return
-    last_heartbeat_at = now
+    last_heartbeat_at = time.time()
 
     balance = get_available_balance()
     mode    = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
+    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    trades_today = len([t for t in trade_history if t.get("closed_at", "")[:10] == today])
 
-    if open_trade:
-        try:
-            ticker = public_get("/api/v3/ticker/price", {"symbol": open_trade["symbol"]})
-            price  = float(ticker["price"])
-            pct    = (price - open_trade["entry_price"]) / open_trade["entry_price"] * 100
-            trade_line = (f"In trade: <b>{open_trade['symbol']}</b> | "
-                          f"Currently: {pct:+.2f}%")
-        except:
-            trade_line = f"In trade: <b>{open_trade['symbol']}</b>"
-    elif last_top_pair:
-        trade_line = (f"Watching: <b>{last_top_pair['symbol']}</b> | "
-                      f"Score: {last_top_pair['score']} | "
-                      f"RSI: {last_top_pair['rsi']}")
-    else:
-        trade_line = "No strong signals yet this scan"
+    def trade_line(trade, top_pair, label):
+        if trade:
+            try:
+                ticker = public_get("/api/v3/ticker/price", {"symbol": trade["symbol"]})
+                price  = float(ticker["price"])
+                pct    = (price - trade["entry_price"]) / trade["entry_price"] * 100
+                return f"{label}: <b>{trade['symbol']}</b> {pct:+.2f}%"
+            except:
+                return f"{label}: <b>{trade['symbol']}</b> (in trade)"
+        elif top_pair:
+            return f"{label} watching: <b>{top_pair['symbol']}</b> (score {top_pair['score']})"
+        return f"{label}: scanning..."
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    trades_today = len([t for t in trade_history if t["closed_at"][:10] == today])
+    scalper_line  = trade_line(scalper_trade,  last_top_scalper,  "Scalper")
+    moonshot_line = trade_line(moonshot_trade, last_top_moonshot, "Moonshot")
 
     telegram(
         f"💓 <b>Heartbeat</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Bot is alive and running\n"
-        f"Balance: <b>${balance:.2f} USDT</b>\n"
-        f"{trade_line}\n"
+        f"Balance:      <b>${balance:.2f} USDT</b>\n"
+        f"{scalper_line}\n"
+        f"{moonshot_line}\n"
         f"Trades today: {trades_today}"
     )
 
+# ── Daily summary ──────────────────────────────────────────────
 
 def send_daily_summary():
     global last_daily_summary
@@ -399,96 +511,108 @@ def send_daily_summary():
         return
     last_daily_summary = today
 
+    mode = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
     if not trade_history:
-        telegram(
-            f"📅 <b>Daily Summary</b>\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"No trades placed today.\n"
-            f"Bot is scanning but signals weren't strong enough to enter."
-        )
+        telegram(f"📅 <b>Daily Summary</b> [{mode}]\n━━━━━━━━━━━━━━━\nNo trades today. Still scanning.")
         return
 
-    wins      = [t for t in trade_history if t["pnl_pct"] > 0]
-    losses    = [t for t in trade_history if t["pnl_pct"] <= 0]
-    win_rate  = len(wins) / len(trade_history) * 100
-    total_pnl = sum(t["pnl_usdt"] for t in trade_history)
-    best      = max(trade_history, key=lambda t: t["pnl_pct"])
-    worst     = min(trade_history, key=lambda t: t["pnl_pct"])
+    def summary_block(label):
+        trades = [t for t in trade_history if t.get("label") == label]
+        if not trades:
+            return f"\n<b>{label}</b>: no trades today"
+        wins     = [t for t in trades if t["pnl_pct"] > 0]
+        win_rate = len(wins) / len(trades) * 100
+        pnl      = sum(t["pnl_usdt"] for t in trades)
+        return (f"\n<b>{label}</b>: {len(trades)} trades | "
+                f"Win rate: {win_rate:.0f}% | P&L: ${pnl:+.2f}")
+
     balance   = get_available_balance()
-    mode      = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
+    total_pnl = sum(t["pnl_usdt"] for t in trade_history)
 
     telegram(
         f"📅 <b>Daily Summary</b> [{mode}]\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"Trades:    <b>{len(trade_history)}</b>  "
-        f"({len(wins)} wins / {len(losses)} losses)\n"
-        f"Win rate:  <b>{win_rate:.0f}%</b>\n"
+        f"━━━━━━━━━━━━━━━"
+        + summary_block("SCALPER")
+        + summary_block("MOONSHOT")
+        + f"\n━━━━━━━━━━━━━━━\n"
         f"Total P&L: <b>${total_pnl:+.2f}</b>\n"
-        f"Balance:   <b>${balance:.2f} USDT</b>\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"Best trade:  {best['symbol']} {best['pnl_pct']:+.2f}%\n"
-        f"Worst trade: {worst['symbol']} {worst['pnl_pct']:+.2f}%"
+        f"Balance:   <b>${balance:.2f} USDT</b>"
     )
 
 # ── Main loop ──────────────────────────────────────────────────
 
 def run():
-    global open_trade
+    global scalper_trade, moonshot_trade
+
     mode = "📝 PAPER TRADING" if PAPER_TRADE else "💰 LIVE TRADING"
-    log.info(f"🚀 MEXC Scalping Bot — {mode}")
-    log.info(f"   Mode: {mode} | TP: {TAKE_PROFIT_PCT*100}% | SL: {STOP_LOSS_PCT*100}%")
+    log.info(f"🚀 MEXC Bot — {mode}")
+    log.info(f"   Scalper : TP {SCALPER_TP*100}% / SL {SCALPER_SL*100}%")
+    log.info(f"   Moonshot: TP {MOONSHOT_TP*100}% / SL {MOONSHOT_SL*100}% / max 48h")
 
     startup_balance = get_available_balance()
     telegram(
-        f"🚀 <b>MEXC Scalping Bot Started</b>\n"
+        f"🚀 <b>MEXC Bot Started</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"Mode:         <b>{mode}</b>\n"
-        f"Balance:      <b>${startup_balance:.2f} USDT</b>\n"
-        f"Take profit:  +{TAKE_PROFIT_PCT*100:.1f}%\n"
-        f"Stop loss:    -{STOP_LOSS_PCT*100:.1f}%\n"
-        f"Signals:      RSI + EMA crossover + Volume"
+        f"Balance: <b>${startup_balance:.2f} USDT</b>\n"
+        f"\n<b>Scalper</b> (95% budget)\n"
+        f"  TP: +{SCALPER_TP*100:.0f}%  |  SL: -{SCALPER_SL*100:.1f}%\n"
+        f"  High-volume pairs\n"
+        f"\n<b>Moonshot</b> (5% budget)\n"
+        f"  TP: +{MOONSHOT_TP*100:.0f}%  |  SL: -{MOONSHOT_SL*100:.0f}%\n"
+        f"  Low-cap gems | 48h max hold"
     )
 
-    last_excluded = None
+    scalper_excluded  = None
+    moonshot_excluded = None
 
     while True:
         try:
-            if open_trade is None:
-                opp = find_best_opportunity(exclude=last_excluded)
-                if opp:
-                    open_trade = open_position(opp)
-                    last_excluded = None
-                else:
-                    log.info(f"⏳ No opportunity. Retrying in {SCAN_INTERVAL}s...")
-                    time.sleep(SCAN_INTERVAL)
-                    continue
+            balance = get_available_balance()
 
-            if open_trade:
-                should_exit, reason = monitor_and_exit(open_trade)
-                if should_exit:
-                    last_excluded = open_trade["symbol"]
-                    close_position(open_trade, reason)
-                    open_trade = None
-                    log.info("🔄 Closed. Scanning for next opportunity...")
-                    time.sleep(5)
-                else:
-                    time.sleep(15)
+            # ── Scalper leg ───────────────────────────────────────
+            if scalper_trade is None:
+                opp = find_scalper_opportunity(exclude=scalper_excluded)
+                if opp:
+                    budget        = round(balance * SCALPER_BUDGET_PCT, 2)
+                    scalper_trade = open_position(opp, budget, SCALPER_TP, SCALPER_SL, "SCALPER")
+                    scalper_excluded = None
             else:
-                time.sleep(SCAN_INTERVAL)
+                should_exit, reason = check_exit(scalper_trade)
+                if should_exit:
+                    scalper_excluded = scalper_trade["symbol"]
+                    close_position(scalper_trade, reason)
+                    scalper_trade = None
+                    log.info("🔄 [SCALPER] Closed. Re-scanning...")
+
+            # ── Moonshot leg ──────────────────────────────────────
+            if moonshot_trade is None:
+                opp = find_moonshot_opportunity(exclude=moonshot_excluded)
+                if opp:
+                    budget         = round(balance * MOONSHOT_BUDGET_PCT, 2)
+                    moonshot_trade = open_position(opp, budget, MOONSHOT_TP, MOONSHOT_SL, "MOONSHOT")
+                    moonshot_excluded = None
+            else:
+                should_exit, reason = check_exit(moonshot_trade)
+                if should_exit:
+                    moonshot_excluded = moonshot_trade["symbol"]
+                    close_position(moonshot_trade, reason)
+                    moonshot_trade = None
+                    log.info("🔄 [MOONSHOT] Closed. Re-scanning...")
+
+            send_heartbeat()
+            send_daily_summary()
+            time.sleep(15)  # check both trades every 15s
 
         except KeyboardInterrupt:
             log.info("🛑 Stopped.")
-            if open_trade:
-                log.warning(f"⚠️  Still holding {open_trade['symbol']} — close manually on MEXC if live!")
+            for t in [scalper_trade, moonshot_trade]:
+                if t:
+                    log.warning(f"⚠️  Still holding {t['symbol']} ({t['label']}) — close manually if live!")
             telegram("🛑 <b>Bot stopped.</b> Check Railway — it may need restarting.")
             break
         except Exception as e:
             log.error(f"Error: {e}", exc_info=True)
             telegram(f"⚠️ <b>Bot error:</b> {str(e)[:200]}\nWill retry in 30s.")
             time.sleep(30)
-
-        # ── Heartbeat & daily summary (runs every loop iteration) ─
-        send_heartbeat()
-        send_daily_summary()
 
 run()
