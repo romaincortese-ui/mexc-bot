@@ -201,8 +201,8 @@ def find_scalper_opportunity(exclude=None):
     df = df[df["quoteVolume"] >= SCALPER_MIN_VOL]
     after_vol  = len(df)
 
-    df["abs_change"] = df["priceChangePercent"].abs()
-    df = df[df["abs_change"] > 0.3]   # loosened from 0.5 → 0.3
+    df["lastPrice"] = pd.to_numeric(df["lastPrice"], errors="coerce")
+    df = df[df["lastPrice"] >= 0.001]   # exclude ultra-cheap coins with lot size quirks
     after_move = len(df)
 
     if exclude:
@@ -210,7 +210,7 @@ def find_scalper_opportunity(exclude=None):
 
     log.info(f"[SCALPER] Filter funnel: {total_usdt} USDT pairs → "
              f"{after_vol} after volume filter → "
-             f"{after_move} after movement filter → "
+             f"{after_move} after movement+price filter → "
              f"scoring top {min(40, after_move)}")
 
     if after_move == 0:
@@ -252,8 +252,26 @@ def find_scalper_opportunity(exclude=None):
         log.info(f"[SCALPER] Best score {best['score']} below threshold {SCALPER_THRESHOLD}. Waiting...")
         return None
 
-    log.info(f"✅ [SCALPER] Signal! {tradeable[0]['symbol']} score {tradeable[0]['score']}")
-    return tradeable[0]
+    # Try each candidate in score order until one passes the notional check
+    balance = get_available_balance()
+    budget  = round(balance * SCALPER_BUDGET_PCT, 2)
+    for candidate in tradeable:
+        step, min_q, min_notional = get_step_size(candidate["symbol"])
+        qty      = round_qty(budget / candidate["price"], step)
+        notional = qty * candidate["price"]
+        log.info(f"[SCALPER] Checking {candidate['symbol']} | price: {candidate['price']} | "
+                 f"step: {step} | qty: {qty} | notional: ${notional:.4f} | min: ${min_notional}")
+        if qty < min_q:
+            log.info(f"[SCALPER] Skipping {candidate['symbol']} — qty {qty} below min {min_q}")
+            continue
+        if notional < min_notional:
+            log.info(f"[SCALPER] Skipping {candidate['symbol']} — notional ${notional:.2f} below min ${min_notional}")
+            continue
+        log.info(f"✅ [SCALPER] Signal! {candidate['symbol']} score {candidate['score']} | notional ${notional:.2f}")
+        return candidate
+
+    log.info("[SCALPER] All tradeable candidates failed notional/qty checks. Waiting...")
+    return None
 
 
 def find_moonshot_opportunity(exclude=None):
@@ -303,8 +321,24 @@ def find_moonshot_opportunity(exclude=None):
         log.info(f"[MOONSHOT] Best score {best['score']} below threshold {MOONSHOT_THRESHOLD}. Waiting...")
         return None
 
-    log.info(f"🚀 [MOONSHOT] Signal! {tradeable[0]['symbol']} score {tradeable[0]['score']}")
-    return tradeable[0]
+    # Try each candidate in score order until one passes the notional check
+    balance = get_available_balance()
+    budget  = round(balance * MOONSHOT_BUDGET_PCT, 2)
+    for candidate in tradeable:
+        step, min_q, min_notional = get_step_size(candidate["symbol"])
+        qty      = round_qty(budget / candidate["price"], step)
+        notional = qty * candidate["price"]
+        if qty < min_q:
+            log.info(f"[MOONSHOT] Skipping {candidate['symbol']} — qty {qty} below min {min_q}")
+            continue
+        if notional < min_notional:
+            log.info(f"[MOONSHOT] Skipping {candidate['symbol']} — notional ${notional:.2f} below min ${min_notional}")
+            continue
+        log.info(f"🚀 [MOONSHOT] Signal! {candidate['symbol']} score {candidate['score']} | notional ${notional:.2f}")
+        return candidate
+
+    log.info("[MOONSHOT] All tradeable candidates failed notional/qty checks. Waiting...")
+    return None
 
 # ── Order execution ────────────────────────────────────────────
 
@@ -326,11 +360,22 @@ def get_step_size(symbol):
     return 0.001, 0.001, 1.0
 
 def round_qty(qty, step):
-    if step >= 1:
-        return int(qty // step) * int(step)
-    decimal_places = len(str(step).rstrip("0").split(".")[-1]) if "." in str(step) else 0
-    factor = 10 ** decimal_places
-    return int(qty * factor // (step * factor)) * step / factor
+    """
+    Round qty DOWN to the nearest valid step.
+    Works for any step size: 1, 0.1, 0.01, 0.001, 10, 100 etc.
+    Uses string-based precision to avoid floating point artifacts.
+    """
+    if step <= 0:
+        return qty
+    # How many decimal places does the step have?
+    step_str = f"{step:.10f}".rstrip("0")
+    if "." in step_str:
+        decimals = len(step_str.split(".")[1])
+    else:
+        decimals = 0
+    # Floor to nearest step, then round to correct decimals
+    floored = (qty // step) * step
+    return round(floored, decimals)
 
 def place_order(symbol, side, qty, label=""):
     tag = f"[{label}] " if label else ""
