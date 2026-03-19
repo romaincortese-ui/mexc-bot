@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 MEXC_API_KEY    = "mx0vglg1LIlEl98JhQ"       # from MEXC > Profile > API Management
 MEXC_API_SECRET = "2b53b21288c8494bbec5e0cc7f34d8c2"    # same place
 
-PAPER_TRADE      = False      # ← keep True for now! Change to False for real money
+PAPER_TRADE      = True      # ← keep True for now! Change to False for real money
 PAPER_BALANCE    = 50.0     # Simulated USDT balance for paper trading
 TAKE_PROFIT_PCT  = 0.020    # 2.0% profit target
 STOP_LOSS_PCT   = 0.015     # 1.5% loss limit
@@ -179,22 +179,41 @@ def find_best_opportunity(exclude=None):
 
     candidates = df.sort_values("quoteVolume", ascending=False).head(80)["symbol"].tolist()[:40]
 
-    scores = []
+    all_scores = []
     for sym in candidates:
         result = score_pair(sym)
-        if result and result["score"] > 20:
-            scores.append(result)
+        if result:
+            all_scores.append(result)
         time.sleep(0.1)
 
-    if not scores:
-        log.info("No strong signals found this scan.")
+    if not all_scores:
+        log.info("⏳ No scoreable pairs found this scan.")
         return None
 
-    best = sorted(scores, key=lambda x: x["score"], reverse=True)[0]
-    last_top_pair = best
-    log.info(f"📊 Top pick: {best['symbol']} | Score: {best['score']} | "
-             f"RSI: {best['rsi']} | Vol: {best['vol_ratio']}x | Price: {best['price']}")
-    return best
+    all_scores.sort(key=lambda x: x["score"], reverse=True)
+    best = all_scores[0]
+
+    # Always log the top pair so we can see what's happening even with no trade
+    ma_label = "crossover" if best["ma_score"] == 30 else ("trending" if best["ma_score"] == 15 else "no trend")
+    log.info(
+        f"📊 Top pair: {best['symbol']} | "
+        f"Score: {best['score']}/100 (threshold: 20) | "
+        f"RSI: {best['rsi']} ({best['rsi_score']:.0f}pts) | "
+        f"MA: {ma_label} ({best['ma_score']}pts) | "
+        f"Vol: {best['vol_ratio']}x ({best['vol_score']:.0f}pts) | "
+        f"Price: {best['price']}"
+    )
+
+    tradeable = [s for s in all_scores if s["score"] > 20]
+    if not tradeable:
+        log.info(f"⏳ No trade — best score {best['score']} is below threshold of 20. "
+                 f"Scanned {len(all_scores)} pairs. Retrying in {SCAN_INTERVAL}s...")
+        return None
+
+    best_tradeable = tradeable[0]
+    last_top_pair  = best_tradeable
+    log.info(f"✅ Signal found! Entering {best_tradeable['symbol']} with score {best_tradeable['score']}")
+    return best_tradeable
 
 # ── Order execution ────────────────────────────────────────────
 
