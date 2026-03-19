@@ -313,16 +313,24 @@ def get_step_size(symbol):
         info = public_get("/api/v3/exchangeInfo")
         for s in info.get("symbols", []):
             if s["symbol"] == symbol:
+                step, min_qty, min_notional = "0.001", "0.001", "1"
                 for f in s.get("filters", []):
                     if f["filterType"] == "LOT_SIZE":
-                        return float(f["stepSize"]), float(f["minQty"])
-    except:
-        pass
-    return 0.001, 0.001
+                        step    = f.get("stepSize", "0.001")
+                        min_qty = f.get("minQty",   "0.001")
+                    if f["filterType"] == "MIN_NOTIONAL":
+                        min_notional = f.get("minNotional", "1")
+                return float(step), float(min_qty), float(min_notional)
+    except Exception as e:
+        log.warning(f"get_step_size failed for {symbol}: {e}")
+    return 0.001, 0.001, 1.0
 
 def round_qty(qty, step):
-    precision = max(0, -int(np.floor(np.log10(step))))
-    return round(np.floor(qty / step) * step, precision)
+    if step >= 1:
+        return int(qty // step) * int(step)
+    decimal_places = len(str(step).rstrip("0").split(".")[-1]) if "." in str(step) else 0
+    factor = 10 ** decimal_places
+    return int(qty * factor // (step * factor)) * step / factor
 
 def place_order(symbol, side, qty, label=""):
     tag = f"[{label}] " if label else ""
@@ -330,7 +338,15 @@ def place_order(symbol, side, qty, label=""):
         log.info(f"📝 [PAPER] {tag}{side} {qty} {symbol} @ MARKET")
         return {"orderId": f"PAPER_{int(time.time())}", "paper": True}
     params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": qty}
-    return private_post("/api/v3/order", params)
+    try:
+        result = private_post("/api/v3/order", params)
+        log.info(f"✅ [{label}] Order placed: {result}")
+        return result
+    except requests.exceptions.HTTPError as e:
+        error_body = e.response.text if e.response else "no body"
+        log.error(f"🚨 [{label}] Order rejected by MEXC: {e} | Response: {error_body}")
+        telegram(f"🚨 <b>Order rejected</b> [{label}]\n{symbol} {side} {qty}\nReason: {error_body[:200]}")
+        return None
 
 # ── Trade lifecycle ────────────────────────────────────────────
 
@@ -342,10 +358,14 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label="SCALPER"):
         log.warning(f"[{label}] Budget ${budget_usdt:.2f} too low, skipping.")
         return None
 
-    step, min_q = get_step_size(symbol)
+    step, min_q, min_notional = get_step_size(symbol)
     qty = round_qty(budget_usdt / price, step)
+
     if qty < min_q:
         log.warning(f"[{label}] {symbol} qty {qty} below min {min_q}, skipping.")
+        return None
+    if qty * price < min_notional:
+        log.warning(f"[{label}] {symbol} notional ${qty*price:.2f} below min ${min_notional}, skipping.")
         return None
 
     order = place_order(symbol, "BUY", qty, label)
