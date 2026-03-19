@@ -142,11 +142,14 @@ def rsi(series, period=14):
 def score_pair(symbol, interval="5m"):
     try:
         data = public_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": 60})
-        df = pd.DataFrame(data, columns=[
-            "open_time","open","high","low","close","volume",
-            "close_time","quote_volume","trades","taker_buy_base","taker_buy_quote","ignore"
-        ])
-        for col in ["close","volume"]:
+        if not data:
+            return None
+        # MEXC returns variable column counts — grab by position, not name
+        df = pd.DataFrame(data)
+        df.columns = range(len(df.columns))
+        df = df.rename(columns={0: "open_time", 1: "open", 2: "high",
+                                 3: "low",       4: "close", 5: "volume"})
+        for col in ["close", "volume"]:
             df[col] = pd.to_numeric(df[col])
         if len(df) < 30:
             return None
