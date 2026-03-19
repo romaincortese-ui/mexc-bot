@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 MEXC_API_KEY    = "mx0vglg1LIlEl98JhQ"       # from MEXC > Profile > API Management
 MEXC_API_SECRET = "2b53b21288c8494bbec5e0cc7f34d8c2"    # same place
 
-PAPER_TRADE      = False      # ← keep True for now! Change to False for real money
+PAPER_TRADE      = True      # ← keep True for now! Change to False for real money
 PAPER_BALANCE    = 50.0     # Simulated USDT balance for paper trading
 TAKE_PROFIT_PCT  = 0.020    # 2.0% profit target
 STOP_LOSS_PCT   = 0.015     # 1.5% loss limit
@@ -40,8 +40,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-trade_history = []
-open_trade    = None
+trade_history      = []
+open_trade         = None
+last_heartbeat_at  = 0      # timestamp of last hourly heartbeat
+last_daily_summary = ""     # date string of last daily summary (e.g. "2024-01-15")
+last_top_pair      = None   # best pair seen in last scan, for heartbeat
 
 # ── Telegram ───────────────────────────────────────────────────
 
@@ -188,6 +191,7 @@ def find_best_opportunity(exclude=None):
         return None
 
     best = sorted(scores, key=lambda x: x["score"], reverse=True)[0]
+    last_top_pair = best
     log.info(f"📊 Top pick: {best['symbol']} | Score: {best['score']} | "
              f"RSI: {best['rsi']} | Vol: {best['vol_ratio']}x | Price: {best['price']}")
     return best
@@ -327,6 +331,86 @@ def close_position(trade, reason):
     log.info(f"📈 Stats | Trades: {len(trade_history)} | "
              f"Win rate: {win_rate:.0f}% | Total P&L: ${total_pnl:+.2f}")
 
+# ── Heartbeat & daily summary ──────────────────────────────────
+
+def send_heartbeat():
+    global last_heartbeat_at
+    now = time.time()
+    if now - last_heartbeat_at < 3600:
+        return
+    last_heartbeat_at = now
+
+    balance = get_available_balance()
+    mode    = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
+
+    if open_trade:
+        try:
+            ticker = public_get("/api/v3/ticker/price", {"symbol": open_trade["symbol"]})
+            price  = float(ticker["price"])
+            pct    = (price - open_trade["entry_price"]) / open_trade["entry_price"] * 100
+            trade_line = (f"In trade: <b>{open_trade['symbol']}</b> | "
+                          f"Currently: {pct:+.2f}%")
+        except:
+            trade_line = f"In trade: <b>{open_trade['symbol']}</b>"
+    elif last_top_pair:
+        trade_line = (f"Watching: <b>{last_top_pair['symbol']}</b> | "
+                      f"Score: {last_top_pair['score']} | "
+                      f"RSI: {last_top_pair['rsi']}")
+    else:
+        trade_line = "No strong signals yet this scan"
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    trades_today = len([t for t in trade_history if t["closed_at"][:10] == today])
+
+    telegram(
+        f"💓 <b>Heartbeat</b> [{mode}]\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Bot is alive and running\n"
+        f"Balance: <b>${balance:.2f} USDT</b>\n"
+        f"{trade_line}\n"
+        f"Trades today: {trades_today}"
+    )
+
+
+def send_daily_summary():
+    global last_daily_summary
+    today    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now_hour = datetime.now(timezone.utc).hour
+    if last_daily_summary == today or now_hour != 0:
+        return
+    last_daily_summary = today
+
+    if not trade_history:
+        telegram(
+            f"📅 <b>Daily Summary</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"No trades placed today.\n"
+            f"Bot is scanning but signals weren't strong enough to enter."
+        )
+        return
+
+    wins      = [t for t in trade_history if t["pnl_pct"] > 0]
+    losses    = [t for t in trade_history if t["pnl_pct"] <= 0]
+    win_rate  = len(wins) / len(trade_history) * 100
+    total_pnl = sum(t["pnl_usdt"] for t in trade_history)
+    best      = max(trade_history, key=lambda t: t["pnl_pct"])
+    worst     = min(trade_history, key=lambda t: t["pnl_pct"])
+    balance   = get_available_balance()
+    mode      = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
+
+    telegram(
+        f"📅 <b>Daily Summary</b> [{mode}]\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Trades:    <b>{len(trade_history)}</b>  "
+        f"({len(wins)} wins / {len(losses)} losses)\n"
+        f"Win rate:  <b>{win_rate:.0f}%</b>\n"
+        f"Total P&L: <b>${total_pnl:+.2f}</b>\n"
+        f"Balance:   <b>${balance:.2f} USDT</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Best trade:  {best['symbol']} {best['pnl_pct']:+.2f}%\n"
+        f"Worst trade: {worst['symbol']} {worst['pnl_pct']:+.2f}%"
+    )
+
 # ── Main loop ──────────────────────────────────────────────────
 
 def run():
@@ -377,11 +461,15 @@ def run():
             log.info("🛑 Stopped.")
             if open_trade:
                 log.warning(f"⚠️  Still holding {open_trade['symbol']} — close manually on MEXC if live!")
-            telegram("🛑 <b>Bot stopped.</b> Check Replit — it may need restarting.")
+            telegram("🛑 <b>Bot stopped.</b> Check Railway — it may need restarting.")
             break
         except Exception as e:
             log.error(f"Error: {e}", exc_info=True)
             telegram(f"⚠️ <b>Bot error:</b> {str(e)[:200]}\nWill retry in 30s.")
             time.sleep(30)
+
+        # ── Heartbeat & daily summary (runs every loop iteration) ─
+        send_heartbeat()
+        send_daily_summary()
 
 run()
