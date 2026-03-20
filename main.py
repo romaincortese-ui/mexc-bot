@@ -2,7 +2,7 @@
 MEXC Trading Bot — 3 Strategies
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   1. SCALPER  — Max 3 trades (30% each) | Trailing Stop | ATR SL | 1H trend aligned
-  2. MOONSHOT — 1 trade (5%) | TP +12% | SL -10% | 1H momentum + new listings
+  2. MOONSHOT — 1 trade (5%) | TP +25% | SL -10% | 1H momentum + new listings
   3. REVERSAL — 1 trade (5%) | TP +3%  | SL -2%  | Oversold bounce + volume capitulation
      Moonshot and Reversal share the 5% slot.
 """
@@ -45,7 +45,7 @@ SCALPER_MAX_RSI     = 70
 # ── Moonshot ──────────────────────────────────────────────────
 ALT_MAX_TRADES      = 3         # max concurrent moonshot/reversal trades
 MOONSHOT_BUDGET_PCT = 0.05
-MOONSHOT_TP         = 0.12
+MOONSHOT_TP         = 0.25
 MOONSHOT_SL         = 0.10
 MOONSHOT_MAX_VOL    = 500_000
 MOONSHOT_MIN_VOL    = 5_000
@@ -96,11 +96,11 @@ _symbol_rules         = {}
 _symbol_rules_fetched = False
 _symbol_rules_at      = 0
 
-# Rolling buffer of scanner activity lines for /logs command
 # Symbols that returned "not support api" — skip permanently
-_api_blacklist: set = set()
+_api_blacklist        = set()
 
-
+# Rolling buffer of scanner activity lines for /logs command
+_scanner_log_buffer   = []
 _MAX_SCANNER_LOGS     = 5
 _paused               = False  # set by /pause command, cleared by /resume
 
@@ -118,7 +118,6 @@ def telegram(msg: str):
 
 def scanner_log(msg: str):
     """Log a scanner activity line and keep it in the rolling buffer for /logs."""
-    global _scanner_log_buffer
     global _scanner_log_buffer
     ts  = datetime.now(timezone.utc).strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
