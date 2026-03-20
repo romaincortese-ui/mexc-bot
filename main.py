@@ -292,7 +292,7 @@ def evaluate_scalper_candidate(sym: str) -> dict | None:
     Returns dict with score, rsi, price, atr_pct or None if disqualified.
     """
     # 1H trend filter — don't fight the trend
-    df_1h = parse_klines(sym, interval="1h", limit=60)
+    df_1h = parse_klines(sym, interval="60m", limit=60)
     if df_1h is None:
         return None
     ema50_1h = calc_ema(df_1h["close"], 50).iloc[-1]
@@ -394,7 +394,7 @@ def find_scalper_opportunity(tickers: pd.DataFrame, budget: float,
 
 def get_1h_change(symbol: str) -> float | None:
     try:
-        df = parse_klines(symbol, interval="1h", limit=3, min_len=2)
+        df = parse_klines(symbol, interval="60m", limit=3, min_len=2)
         if df is None:
             return None
         prev = float(df["close"].iloc[-2])
@@ -468,7 +468,7 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
                 time.sleep(0.1)
                 continue
 
-        interval = "1h" if is_new else "15m"
+        interval = "60m" if is_new else "15m"
         df_k     = parse_klines(sym, interval=interval, limit=60)
         if df_k is None:
             time.sleep(0.1)
