@@ -2,7 +2,7 @@
 MEXC Trading Bot — 3 Strategies
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   1. SCALPER  — Max 3 trades (30% each) | Trailing Stop | ATR SL | 1H trend aligned
-  2. MOONSHOT — 1 trade (5%) | TP +25% | SL -10% | 1H momentum + new listings
+  2. MOONSHOT — 1 trade (5%) | TP +12% | SL -10% | 1H momentum + new listings
   3. REVERSAL — 1 trade (5%) | TP +3%  | SL -2%  | Oversold bounce + volume capitulation
      Moonshot and Reversal share the 5% slot.
 """
@@ -45,7 +45,7 @@ SCALPER_MAX_RSI     = 70
 # ── Moonshot ──────────────────────────────────────────────────
 ALT_MAX_TRADES      = 3         # max concurrent moonshot/reversal trades
 MOONSHOT_BUDGET_PCT = 0.05
-MOONSHOT_TP         = 0.25
+MOONSHOT_TP         = 0.12
 MOONSHOT_SL         = 0.10
 MOONSHOT_MAX_VOL    = 500_000
 MOONSHOT_MIN_VOL    = 5_000
