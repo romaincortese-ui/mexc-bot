@@ -32,6 +32,7 @@ SCALPER_TP_LIMIT    = 0.10      # +10% — exchange limit order
 SCALPER_TRAIL_ACT   = 0.02      # trailing stop activates at +2%
 SCALPER_TRAIL_PCT   = 0.01      # trail 1% below highest price
 SCALPER_ATR_MULT    = 1.5       # SL = 1.5 × ATR
+SCALPER_SL          = 0.02      # fallback SL if ATR unavailable (2%)
 SCALPER_FLAT_MINS   = 30        # exit flat trade after 30min
 SCALPER_FLAT_RANGE  = 0.005     # ±0.5% = flat
 SCALPER_ROTATE_GAP  = 20        # rotate worst trade if new opp scores this much higher
