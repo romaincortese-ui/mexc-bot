@@ -382,6 +382,7 @@ def find_scalper_opportunity(tickers: pd.DataFrame, budget: float,
         time.sleep(0.05)
 
     log.info(f"🔍 [SCALPER] Scoring {len(established)} pairs after age filter (parallel)...")
+    scores = []
     with ThreadPoolExecutor(max_workers=5) as ex:
         futures = {ex.submit(evaluate_scalper_candidate, sym): sym for sym in established}
         for f in as_completed(futures):
