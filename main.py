@@ -1153,7 +1153,7 @@ def send_weekly_summary(balance: float):
 # ── Telegram commands ─────────────────────────────────────────
 
 def listen_for_commands(balance: float):
-    global last_telegram_update
+    global last_telegram_update, _paused
     try:
         params = {"timeout": 0, "limit": 5}
         if last_telegram_update:
@@ -1213,8 +1213,6 @@ def listen_for_commands(balance: float):
 
             elif text in ("/pause", "/pause@mexcbot"):
                 log.info("⏸️ /pause received")
-                # Set a global pause flag — checked in main loop before scanning
-                global _paused
                 _paused = True
                 telegram(
                     "⏸️ <b>Bot paused.</b>\n"
@@ -1225,7 +1223,6 @@ def listen_for_commands(balance: float):
 
             elif text in ("/resume", "/resume@mexcbot"):
                 log.info("▶️ /resume received")
-                global _paused
                 _paused = False
                 telegram("▶️ <b>Bot resumed.</b> Scanning for new trades.")
 
