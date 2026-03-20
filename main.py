@@ -97,7 +97,10 @@ _symbol_rules_fetched = False
 _symbol_rules_at      = 0
 
 # Rolling buffer of scanner activity lines for /logs command
-_scanner_log_buffer   = []
+# Symbols that returned "not support api" — skip permanently
+_api_blacklist: set = set()
+
+
 _MAX_SCANNER_LOGS     = 5
 _paused               = False  # set by /pause command, cleared by /resume
 
@@ -363,7 +366,7 @@ def find_scalper_opportunity(tickers: pd.DataFrame, budget: float,
     df = df[df["quoteVolume"] >= SCALPER_MIN_VOL]
     df = df[df["lastPrice"]   >= SCALPER_MIN_PRICE]
     df = df[df["abs_change"]  >= SCALPER_MIN_CHANGE]
-    df = df[~df["symbol"].isin(open_symbols | exclude)]
+    df = df[~df["symbol"].isin(open_symbols | exclude | _api_blacklist)]
     candidates = df.sort_values("quoteVolume", ascending=False).head(80)["symbol"].tolist()[:40]
 
     log.info(f"🔍 [SCALPER] Ticker filters: vol≥${SCALPER_MIN_VOL/1e6:.1f}M "
@@ -427,7 +430,7 @@ def find_new_listings(tickers: pd.DataFrame, exclude: set,
     df = tickers.copy()
     df = df[df["quoteVolume"] >= MOONSHOT_MIN_VOL]
     df = df[df["lastPrice"]   >= MIN_PRICE]
-    df = df[~df["symbol"].isin(open_symbols | exclude)]
+    df = df[~df["symbol"].isin(open_symbols | exclude | _api_blacklist)]
     candidates = df.sort_values("quoteVolume", ascending=False).head(60)["symbol"].tolist()
 
     new = []
@@ -457,7 +460,7 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
     df = df[df["quoteVolume"] >= MOONSHOT_MIN_VOL]
     df = df[df["quoteVolume"] <= MOONSHOT_MAX_VOL]
     df = df[df["lastPrice"]   >= MIN_PRICE]
-    df = df[~df["symbol"].isin(open_symbols | exclude)]
+    df = df[~df["symbol"].isin(open_symbols | exclude | _api_blacklist)]
     momentum_candidates = df.sort_values("priceChangePercent", ascending=False).head(40)["symbol"].tolist()
 
     # ── Source 2: New listings ─────────────────────────────────
@@ -604,7 +607,7 @@ def find_reversal_opportunity(tickers: pd.DataFrame, budget: float,
     df = df[df["quoteVolume"]        >= REVERSAL_MIN_VOL]
     df = df[df["lastPrice"]          >= MIN_PRICE]
     df = df[df["priceChangePercent"] <= -REVERSAL_MIN_DROP]
-    df = df[~df["symbol"].isin(open_symbols | exclude)]
+    df = df[~df["symbol"].isin(open_symbols | exclude | _api_blacklist)]
     candidates = df.sort_values("priceChangePercent", ascending=True).head(30)["symbol"].tolist()
 
     log.info(f"🔄 [REVERSAL] Scoring {len(candidates)} oversold pairs (parallel)...")
@@ -645,8 +648,13 @@ def place_market_buy(symbol, qty, label=""):
     except requests.exceptions.HTTPError as e:
         try:    error_body = e.response.json()
         except: error_body = e.response.text if e.response else "no response"
-        log.error(f"🚨 [{label}] BUY rejected: {error_body}")
-        telegram(f"🚨 <b>BUY rejected</b> [{label}]\n{symbol} qty={qty}\nReason: {str(error_body)[:300]}")
+        # Code 10007 = symbol not API-tradeable — blacklist permanently
+        if isinstance(error_body, dict) and error_body.get("code") == 10007:
+            _api_blacklist.add(symbol)
+            log.warning(f"⚠️ [{label}] {symbol} not API-tradeable — blacklisted.")
+        else:
+            log.error(f"🚨 [{label}] BUY rejected: {error_body}")
+            telegram(f"🚨 <b>BUY rejected</b> [{label}]\n{symbol} qty={qty}\nReason: {str(error_body)[:300]}")
         return None
 
 
