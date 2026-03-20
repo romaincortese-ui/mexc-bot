@@ -35,12 +35,14 @@ SCALPER_ATR_MULT    = 1.5       # SL = 1.5 × ATR
 SCALPER_FLAT_MINS   = 30        # exit flat trade after 30min
 SCALPER_FLAT_RANGE  = 0.005     # ±0.5% = flat
 SCALPER_ROTATE_GAP  = 20        # rotate worst trade if new opp scores this much higher
-SCALPER_MIN_VOL     = 1_000_000
+SCALPER_MIN_VOL     = 500_000   # min 24h USDT volume — lowered to widen candidate pool
 SCALPER_MIN_PRICE   = 0.01
+SCALPER_MIN_CHANGE  = 0.1       # min 24h abs % change — kept low, scoring handles momentum
 SCALPER_THRESHOLD   = 20
 SCALPER_MAX_RSI     = 70
 
 # ── Moonshot ──────────────────────────────────────────────────
+ALT_MAX_TRADES      = 3         # max concurrent moonshot/reversal trades
 MOONSHOT_BUDGET_PCT = 0.05
 MOONSHOT_TP         = 0.25
 MOONSHOT_SL         = 0.10
@@ -48,7 +50,7 @@ MOONSHOT_MAX_VOL    = 500_000
 MOONSHOT_MIN_VOL    = 5_000
 MOONSHOT_MIN_1H     = 5.0
 MOONSHOT_THRESHOLD  = 15
-MOONSHOT_MAX_HOURS  = 48
+MOONSHOT_MAX_HOURS  = 1
 MOONSHOT_MIN_DAYS   = 2         # skip listings < 48h old (too volatile)
 MOONSHOT_NEW_DAYS   = 14        # listings < 14 days = "new"
 
@@ -81,7 +83,7 @@ log = logging.getLogger(__name__)
 # ── State ──────────────────────────────────────────────────────
 trade_history        = []
 scalper_trades       = []   # list — up to SCALPER_MAX_TRADES open at once
-alt_trade            = None
+alt_trades           = []   # list — up to ALT_MAX_TRADES open at once
 last_heartbeat_at    = 0
 last_daily_summary   = ""
 last_weekly_summary  = ""
@@ -92,6 +94,11 @@ last_top_alt         = None
 _symbol_rules         = {}
 _symbol_rules_fetched = False
 _symbol_rules_at      = 0
+
+# Rolling buffer of scanner activity lines for /logs command
+_scanner_log_buffer   = []
+_MAX_SCANNER_LOGS     = 5
+_paused               = False  # set by /pause command, cleared by /resume
 
 # ── Telegram ───────────────────────────────────────────────────
 
@@ -105,7 +112,15 @@ def telegram(msg: str):
     except Exception as e:
         log.warning(f"Telegram send failed: {e}")
 
-# ── MEXC API helpers ───────────────────────────────────────────
+def scanner_log(msg: str):
+    """Log a scanner activity line and keep it in the rolling buffer for /logs."""
+    global _scanner_log_buffer
+    ts  = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    log.info(msg)
+    _scanner_log_buffer.append(line)
+    if len(_scanner_log_buffer) > _MAX_SCANNER_LOGS:
+        _scanner_log_buffer.pop(0)
 
 def public_get(path, params=None):
     r = requests.get(BASE_URL + path, params=params or {}, timeout=10)
@@ -346,11 +361,12 @@ def find_scalper_opportunity(tickers: pd.DataFrame, budget: float,
     df = tickers.copy()
     df = df[df["quoteVolume"] >= SCALPER_MIN_VOL]
     df = df[df["lastPrice"]   >= SCALPER_MIN_PRICE]
-    df = df[df["abs_change"]  >= 0.3]
+    df = df[df["abs_change"]  >= SCALPER_MIN_CHANGE]
     df = df[~df["symbol"].isin(open_symbols | exclude)]
     candidates = df.sort_values("quoteVolume", ascending=False).head(80)["symbol"].tolist()[:40]
 
-    log.info(f"🔍 [SCALPER] Scoring {len(candidates)} pairs (parallel)...")
+    log.info(f"🔍 [SCALPER] Ticker filters: vol≥${SCALPER_MIN_VOL/1e6:.1f}M "
+             f"price≥${SCALPER_MIN_PRICE} change≥{SCALPER_MIN_CHANGE}% → {len(candidates)} candidates")
 
     # Pre-filter new listings (< 7 days) — pump risk
     established = []
@@ -365,8 +381,7 @@ def find_scalper_opportunity(tickers: pd.DataFrame, budget: float,
             established.append(sym)
         time.sleep(0.05)
 
-    # Score in parallel
-    scores = []
+    log.info(f"🔍 [SCALPER] Scoring {len(established)} pairs after age filter (parallel)...")
     with ThreadPoolExecutor(max_workers=5) as ex:
         futures = {ex.submit(evaluate_scalper_candidate, sym): sym for sym in established}
         for f in as_completed(futures):
@@ -375,7 +390,7 @@ def find_scalper_opportunity(tickers: pd.DataFrame, budget: float,
                 scores.append(result)
 
     if not scores:
-        log.info("[SCALPER] No qualifying pairs.")
+        scanner_log("🔍 [SCALPER] No qualifying pairs after 1H trend + scoring filters.")
         return None
 
     scores.sort(key=lambda x: x["score"], reverse=True)
@@ -384,9 +399,9 @@ def find_scalper_opportunity(tickers: pd.DataFrame, budget: float,
 
     vol_row  = tickers[tickers["symbol"] == best["symbol"]]
     best_vol = float(vol_row["quoteVolume"].iloc[0]) if not vol_row.empty else 0
-    log.info(f"📊 [SCALPER] Top: {best['symbol']} | Score: {best['score']}/100 | "
-             f"24h vol: ${best_vol:,.0f} | RSI: {best['rsi']} | "
-             f"Vol: {best['vol_ratio']}x | ATR: {best['atr_pct']*100:.2f}%")
+    scanner_log(f"📊 [SCALPER] Top: {best['symbol']} | Score: {best['score']}/100 | "
+                f"24h vol: ${best_vol:,.0f} | RSI: {best['rsi']} | "
+                f"Vol: {best['vol_ratio']}x | ATR: {best['atr_pct']*100:.2f}%")
 
     return pick_tradeable(scores, budget, "SCALPER")
 
@@ -468,7 +483,7 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
                 time.sleep(0.1)
                 continue
 
-        interval = "60m" if is_new else "15m"
+        interval = "1h" if is_new else "15m"
         df_k     = parse_klines(sym, interval=interval, limit=60)
         if df_k is None:
             time.sleep(0.1)
@@ -500,14 +515,14 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
         time.sleep(0.1)
 
     if not scores:
-        log.info("[MOONSHOT] No qualifying candidates.")
+        scanner_log("🌙 [MOONSHOT] No qualifying candidates.")
         return None
 
     scores.sort(key=lambda x: x["score"] + (5 if x.get("_is_new") else 0), reverse=True)
     best = scores[0]
     last_top_alt = best
-    log.info(f"🌙 [MOONSHOT] Top: {best['symbol']}{'🆕' if best.get('_is_new') else ''} | "
-             f"Score: {best['score']}/100 | 1h: {best['_1h_chg']:+.1f}% | RSI: {best['rsi']}")
+    scanner_log(f"🌙 [MOONSHOT] Top: {best['symbol']}{'🆕' if best.get('_is_new') else ''} | "
+                f"Score: {best['score']}/100 | 1h: {best['_1h_chg']:+.1f}% | RSI: {best['rsi']}")
 
     tradeable = []
     for s in scores:
@@ -603,13 +618,13 @@ def find_reversal_opportunity(tickers: pd.DataFrame, budget: float,
                 tradeable.append(result)
 
     if not tradeable:
-        log.info("[REVERSAL] No oversold pairs with capitulation + green candle.")
+        scanner_log("[REVERSAL] No oversold pairs with capitulation + green candle.")
         return None
 
     tradeable.sort(key=lambda x: x["rsi"])  # most oversold first
     best = tradeable[0]
     last_top_alt = best
-    log.info(f"🔄 [REVERSAL] Top: {best['symbol']} | RSI: {best['rsi']} | Price: {best['price']}")
+    scanner_log(f"🔄 [REVERSAL] Top: {best['symbol']} | RSI: {best['rsi']} | Price: {best['price']}")
 
     return pick_tradeable(tradeable, budget, "REVERSAL")
 
@@ -933,13 +948,16 @@ def send_heartbeat(balance: float):
             scalper_lines.append("  Scanning...")
 
     alt_line = ""
-    if alt_trade:
-        try:
-            px  = float(public_get("/api/v3/ticker/price", {"symbol": alt_trade["symbol"]})["price"])
-            pct = (px - alt_trade["entry_price"]) / alt_trade["entry_price"] * 100
-            alt_line = f"{alt_trade['label']}: <b>{alt_trade['symbol']}</b> {pct:+.2f}%"
-        except:
-            alt_line = f"{alt_trade['label']}: <b>{alt_trade['symbol']}</b>"
+    if alt_trades:
+        lines = []
+        for t in alt_trades:
+            try:
+                px  = float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
+                pct = (px - t["entry_price"]) / t["entry_price"] * 100
+                lines.append(f"  {t['label']}: <b>{t['symbol']}</b> {pct:+.2f}%")
+            except:
+                lines.append(f"  {t['label']}: <b>{t['symbol']}</b>")
+        alt_line = "\n".join(lines)
     elif last_top_alt:
         alt_line = f"ALT watching: <b>{last_top_alt['symbol']}</b> (score {last_top_alt['score']})"
     else:
@@ -951,6 +969,7 @@ def send_heartbeat(balance: float):
         f"Balance:  <b>${balance:.2f} USDT</b>\n"
         f"Scalpers ({len(scalper_trades)}/{SCALPER_MAX_TRADES}):\n"
         + "\n".join(scalper_lines) + "\n"
+        f"Alt ({len(alt_trades)}/{ALT_MAX_TRADES}):\n"
         + alt_line + "\n"
         f"Trades today: {trades_today}\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -1169,18 +1188,83 @@ def listen_for_commands(balance: float):
                         lines.append(f"🟢 {t['symbol']} (price unavailable)")
                 if not scalper_trades:
                     lines.append("Scalper: scanning...")
-                if alt_trade:
-                    try:
-                        px  = float(public_get("/api/v3/ticker/price", {"symbol": alt_trade["symbol"]})["price"])
-                        pct = (px - alt_trade["entry_price"]) / alt_trade["entry_price"] * 100
-                        lines.append(f"{alt_trade['label']}: <b>{alt_trade['symbol']}</b> | {pct:+.2f}% | "
-                                     f"TP: ${alt_trade['tp_price']:.6f} | SL: ${alt_trade['sl_price']:.6f}")
-                    except:
-                        lines.append(f"{alt_trade['label']}: {alt_trade['symbol']} (unavailable)")
+                if alt_trades:
+                    for t in alt_trades:
+                        try:
+                            px  = float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
+                            pct = (px - t["entry_price"]) / t["entry_price"] * 100
+                            lines.append(f"{t['label']}: <b>{t['symbol']}</b> | {pct:+.2f}% | "
+                                         f"TP: ${t['tp_price']:.6f} | SL: ${t['sl_price']:.6f}")
+                        except:
+                            lines.append(f"{t['label']}: {t['symbol']} (unavailable)")
                 else:
                     lines.append("Alt: scanning...")
                 lines.append(f"Balance: <b>${balance:.2f} USDT</b>")
                 telegram("\n".join(lines))
+
+            elif text in ("/logs", "/logs@mexcbot"):
+                log.info("📜 /logs received")
+                if _scanner_log_buffer:
+                    msg = "📜 <b>Last Scanner Activity</b>\n━━━━━━━━━━━━━━━\n"
+                    msg += "\n".join(f"<code>{line}</code>" for line in _scanner_log_buffer)
+                else:
+                    msg = "📜 <b>Last Scanner Activity</b>\n━━━━━━━━━━━━━━━\nNo scanner activity yet."
+                telegram(msg)
+
+            elif text in ("/pause", "/pause@mexcbot"):
+                log.info("⏸️ /pause received")
+                # Set a global pause flag — checked in main loop before scanning
+                global _paused
+                _paused = True
+                telegram(
+                    "⏸️ <b>Bot paused.</b>\n"
+                    "No new trades will be opened.\n"
+                    "Existing positions are still monitored.\n"
+                    "Send /resume to restart scanning."
+                )
+
+            elif text in ("/resume", "/resume@mexcbot"):
+                log.info("▶️ /resume received")
+                global _paused
+                _paused = False
+                telegram("▶️ <b>Bot resumed.</b> Scanning for new trades.")
+
+            elif text in ("/close", "/close@mexcbot"):
+                log.info("🚨 /close received — closing all positions")
+                telegram("🚨 <b>Emergency close triggered.</b> Closing all open positions...")
+                closed = 0
+                for t in scalper_trades[:]:
+                    if close_position(t, "STOP_LOSS"):
+                        scalper_trades.remove(t)
+                        closed += 1
+                for t in alt_trades[:]:
+                    if close_position(t, "STOP_LOSS"):
+                        alt_trades.remove(t)
+                        closed += 1
+                telegram(f"✅ Closed {closed} position(s). Bot will resume scanning.")
+
+            elif text in ("/config", "/config@mexcbot"):
+                log.info("⚙️ /config received")
+                telegram(
+                    f"⚙️ <b>Current Config</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"🟢 <b>Scalper</b>\n"
+                    f"  Max trades: {SCALPER_MAX_TRADES} × {SCALPER_BUDGET_PCT*100:.0f}%\n"
+                    f"  TP limit:   +{SCALPER_TP_LIMIT*100:.0f}%\n"
+                    f"  Trail:      +{SCALPER_TRAIL_ACT*100:.0f}% → {SCALPER_TRAIL_PCT*100:.0f}% trail\n"
+                    f"  ATR SL:     ×{SCALPER_ATR_MULT}\n"
+                    f"  Flat exit:  {SCALPER_FLAT_MINS}min ±{SCALPER_FLAT_RANGE*100:.1f}%\n"
+                    f"  Min vol:    ${SCALPER_MIN_VOL:,}\n"
+                    f"\n🌙 <b>Moonshot</b>\n"
+                    f"  TP: +{MOONSHOT_TP*100:.0f}%  SL: -{MOONSHOT_SL*100:.0f}%\n"
+                    f"  Max hold: {MOONSHOT_MAX_HOURS}h\n"
+                    f"  Min 1h move: {MOONSHOT_MIN_1H}%\n"
+                    f"\n🔄 <b>Reversal</b>\n"
+                    f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%\n"
+                    f"  Max hold: {REVERSAL_MAX_HOURS}h\n"
+                    f"  Min drop: {REVERSAL_MIN_DROP}%  Max RSI: {REVERSAL_MAX_RSI}\n"
+                    f"\n{'⏸️ PAUSED' if _paused else '▶️ RUNNING'}"
+                )
 
     except Exception as e:
         log.debug(f"Telegram poll error: {e}")
@@ -1211,7 +1295,7 @@ def reconcile_open_positions():
 # ── Main loop ──────────────────────────────────────────────────
 
 def run():
-    global scalper_trades, alt_trade
+    global scalper_trades, alt_trades
 
     mode = "📝 PAPER TRADING" if PAPER_TRADE else "💰 LIVE TRADING"
     log.info(f"🚀 MEXC Bot — {mode}")
@@ -1233,11 +1317,11 @@ def run():
         f"\n🟢 <b>Scalper</b> (max {SCALPER_MAX_TRADES} trades, {SCALPER_BUDGET_PCT*100:.0f}% each)\n"
         f"  TP: +{SCALPER_TP_LIMIT*100:.0f}% limit | Trail: +{SCALPER_TRAIL_ACT*100:.0f}% → {SCALPER_TRAIL_PCT*100:.0f}%\n"
         f"  SL: ATR ×{SCALPER_ATR_MULT} | 1H trend aligned\n"
-        f"\n🌙 <b>Moonshot</b> (5% | 1H momentum + new listings)\n"
+        f"\n🌙 <b>Moonshot</b> (max {ALT_MAX_TRADES} trades, 5% each)\n"
         f"  TP: +{MOONSHOT_TP*100:.0f}%  |  SL: -{MOONSHOT_SL*100:.0f}%  |  max {MOONSHOT_MAX_HOURS}h\n"
         f"\n🔄 <b>Reversal</b> (5% | oversold + capitulation)\n"
         f"  TP: +{REVERSAL_TP*100:.1f}%  |  SL: -{REVERSAL_SL*100:.1f}%  |  max {REVERSAL_MAX_HOURS}h\n"
-        f"\n<i>/pnl — weekly P&L | /status — open trades</i>"
+        f"\n<i>/status · /pnl · /logs · /config · /pause · /resume · /close</i>"
     )
 
     scalper_excluded = set()
@@ -1249,12 +1333,12 @@ def run():
             _load_symbol_rules()
 
             open_symbols = {t["symbol"] for t in scalper_trades}
-            if alt_trade:
-                open_symbols.add(alt_trade["symbol"])
+            for t in alt_trades:
+                open_symbols.add(t["symbol"])
 
             # Total account value for smart alt budget
             total_value = balance
-            all_open = scalper_trades + ([alt_trade] if alt_trade else [])
+            all_open = scalper_trades + alt_trades
             for t in all_open:
                 if not PAPER_TRADE:
                     try:
@@ -1267,11 +1351,11 @@ def run():
                     total_value += t["budget_used"]
 
             # Fetch tickers when needed
-            need_scan = len(scalper_trades) < SCALPER_MAX_TRADES or alt_trade is None
+            need_scan = (not _paused and len(scalper_trades) < SCALPER_MAX_TRADES) or len(alt_trades) < ALT_MAX_TRADES
             tickers   = fetch_tickers() if need_scan else None
 
             # ── Scalper leg ───────────────────────────────────────
-            if len(scalper_trades) < SCALPER_MAX_TRADES:
+            if not _paused and len(scalper_trades) < SCALPER_MAX_TRADES:
                 budget = round(balance * SCALPER_BUDGET_PCT, 2)
                 opp    = find_scalper_opportunity(tickers, budget,
                                                   exclude=scalper_excluded,
@@ -1321,7 +1405,7 @@ def run():
                                 log.info(f"🔄 [SCALPER] Closed {trade['symbol']} [{reason}]")
 
             # ── Alt leg (Moonshot OR Reversal) ────────────────────
-            if alt_trade is None:
+            if not _paused and len(alt_trades) < ALT_MAX_TRADES:
                 ideal_budget = round(total_value * MOONSHOT_BUDGET_PCT, 2)
                 budget       = min(ideal_budget, balance)
                 log.info(f"💰 Alt budget: ${budget:.2f} "
@@ -1330,38 +1414,44 @@ def run():
                                                 exclude=alt_excluded,
                                                 open_symbols=open_symbols)
                 if opp:
-                    alt_trade    = open_position(opp, budget, MOONSHOT_TP, MOONSHOT_SL,
-                                                 "MOONSHOT", max_hours=MOONSHOT_MAX_HOURS)
-                    alt_excluded = set()
+                    trade = open_position(opp, budget, MOONSHOT_TP, MOONSHOT_SL,
+                                          "MOONSHOT", max_hours=MOONSHOT_MAX_HOURS)
+                    if trade:
+                        alt_trades.append(trade)
+                        alt_excluded = set()
                 else:
                     opp = find_reversal_opportunity(tickers, budget,
                                                     exclude=alt_excluded,
                                                     open_symbols=open_symbols)
                     if opp:
-                        alt_trade    = open_position(opp, budget, REVERSAL_TP, REVERSAL_SL,
-                                                     "REVERSAL", max_hours=REVERSAL_MAX_HOURS)
-                        alt_excluded = set()
-            else:
-                should_exit, reason = check_exit(alt_trade)
+                        trade = open_position(opp, budget, REVERSAL_TP, REVERSAL_SL,
+                                              "REVERSAL", max_hours=REVERSAL_MAX_HOURS)
+                        if trade:
+                            alt_trades.append(trade)
+                            alt_excluded = set()
+
+            # Monitor all open alt trades
+            for trade in alt_trades[:]:
+                should_exit, reason = check_exit(trade)
                 if should_exit:
-                    closed_label = alt_trade["label"]
-                    alt_excluded.add(alt_trade["symbol"])
-                    if close_position(alt_trade, reason):
-                        alt_trade = None
-                        log.info(f"🔄 [{closed_label}] Closed. Re-scanning...")
+                    closed_label = trade["label"]
+                    alt_excluded.add(trade["symbol"])
+                    if close_position(trade, reason):
+                        alt_trades.remove(trade)
+                        log.info(f"🔄 [{closed_label}] Closed {trade['symbol']}. Re-scanning...")
 
             send_heartbeat(balance)
             send_daily_summary(balance)
             send_weekly_summary(balance)
             listen_for_commands(balance)
-            time.sleep(5 if (scalper_trades or alt_trade) else SCAN_INTERVAL)
+            time.sleep(5 if (scalper_trades or alt_trades) else SCAN_INTERVAL)
 
         except KeyboardInterrupt:
             log.info("🛑 Stopped.")
             for t in scalper_trades:
                 log.warning(f"⚠️  Still holding {t['symbol']} (SCALPER) — close manually if live!")
-            if alt_trade:
-                log.warning(f"⚠️  Still holding {alt_trade['symbol']} ({alt_trade['label']}) — close manually!")
+            for t in alt_trades:
+                log.warning(f"⚠️  Still holding {t['symbol']} ({t['label']}) — close manually if live!")
             telegram("🛑 <b>Bot stopped.</b> Check Railway — it may need restarting.")
             break
         except Exception as e:
