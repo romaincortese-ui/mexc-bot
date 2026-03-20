@@ -119,6 +119,7 @@ def telegram(msg: str):
 def scanner_log(msg: str):
     """Log a scanner activity line and keep it in the rolling buffer for /logs."""
     global _scanner_log_buffer
+    global _scanner_log_buffer
     ts  = datetime.now(timezone.utc).strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
     log.info(msg)
