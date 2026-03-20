@@ -799,8 +799,15 @@ def send_daily_summary(balance: float):
         return
 
     try:
-        now_ms = int(time.time() * 1000)
-        data   = private_get("/api/v3/myTrades", {"startTime": now_ms - 86400_000, "limit": 1000})
+        now_ms   = int(time.time() * 1000)
+        start_ms = now_ms - 86400_000
+        symbols  = get_traded_symbols(start_ms)
+
+        if not symbols:
+            telegram(f"📅 <b>Daily Summary</b> [{mode}]\n━━━━━━━━━━━━━━━\nNo trades today. Still scanning.")
+            return
+
+        data = fetch_mexc_trades_for_symbols(symbols, start_ms)
         if not data:
             telegram(f"📅 <b>Daily Summary</b> [{mode}]\n━━━━━━━━━━━━━━━\nNo trades today. Still scanning.")
             return
@@ -841,7 +848,37 @@ def send_daily_summary(balance: float):
         log.error(f"Daily summary failed: {e}")
         telegram(f"📅 <b>Daily Summary</b> [{mode}]\n━━━━━━━━━━━━━━━\nCould not fetch: {str(e)[:200]}")
 
-# ── Weekly P&L ────────────────────────────────────────────────
+def fetch_mexc_trades_for_symbols(symbols: list, start_ms: int) -> list:
+    """
+    Fetch trades for a list of symbols. MEXC requires symbol param on myTrades.
+    Returns combined list of fills across all symbols.
+    """
+    all_fills = []
+    for sym in symbols:
+        try:
+            fills = private_get("/api/v3/myTrades", {
+                "symbol":    sym,
+                "startTime": start_ms,
+                "limit":     1000,
+            })
+            if fills:
+                all_fills.extend(fills)
+        except Exception as e:
+            log.debug(f"myTrades fetch failed for {sym}: {e}")
+        time.sleep(0.1)
+    return all_fills
+
+
+def get_traded_symbols(start_ms: int) -> list:
+    """
+    Return symbols we've traded in the current session (from trade_history).
+    Falls back to a hardcoded list of common pairs if history is empty.
+    """
+    session_symbols = list({t["symbol"] for t in trade_history})
+    if session_symbols:
+        return session_symbols
+    # No history yet (e.g. bot just started) — return empty, P&L will show 0
+    return []
 
 def fetch_mexc_weekly_pnl() -> dict:
     if PAPER_TRADE:
@@ -857,12 +894,20 @@ def fetch_mexc_weekly_pnl() -> dict:
             "worst":    min(week_trades, key=lambda t: t["pnl_pct"]) if week_trades else None,
         }
     try:
-        now_ms = int(time.time() * 1000)
-        data   = private_get("/api/v3/myTrades", {"startTime": now_ms - 7*86400_000, "limit": 1000})
-        if not data:
-            return {"error": "No trade data from MEXC"}
+        now_ms   = int(time.time() * 1000)
+        start_ms = now_ms - 7 * 86400_000
+        symbols  = get_traded_symbols(start_ms)
 
-        orders = defaultdict(lambda: {"symbol":"","qty":0,"cost":0,"side":"","time":0})
+        if not symbols:
+            return {"total": 0, "buys": 0, "sells": 0,
+                    "pnl_usdt": 0.0, "total_bought": 0.0, "total_sold": 0.0,
+                    "note": "No trades recorded this session yet."}
+
+        data = fetch_mexc_trades_for_symbols(symbols, start_ms)
+        if not data:
+            return {"error": "No fills found for traded symbols"}
+
+        orders = defaultdict(lambda: {"symbol":"","qty":0,"cost":0,"side":""})
         for fill in data:
             oid = fill["orderId"]
             orders[oid]["symbol"] = fill["symbol"]
