@@ -13,6 +13,7 @@ SETUP: Fill in your MEXC API details below. Leave PAPER_TRADE = True to start.
 import time, hmac, hashlib, logging, requests
 import pandas as pd
 import numpy as np
+from collections import defaultdict, Counter
 from datetime import datetime, timezone
 
 # ═══════════════════════════════════════════════════════════════
@@ -26,33 +27,33 @@ PAPER_TRADE   = False    # ← keep True until ready for real money
 PAPER_BALANCE = 50.0    # simulated starting balance
 
 # ── Scalper (main strategy — momentum) ────────────────────────
-SCALPER_BUDGET_PCT  = 0.95    # 95% of available balance
-SCALPER_TP          = 0.020   # +2.0%
-SCALPER_SL          = 0.015   # -1.5%
-SCALPER_MIN_VOL     = 500_000 # min 24h USDT volume
-SCALPER_THRESHOLD   = 20      # min signal score to enter
-SCALPER_MAX_RSI     = 70      # don't enter overbought pairs
+SCALPER_BUDGET_PCT  = 0.95      # 95% of available balance
+SCALPER_TP          = 0.020     # +2.0%
+SCALPER_SL          = 0.015     # -1.5%
+SCALPER_MIN_VOL     = 1_000_000 # min 24h USDT volume
+SCALPER_THRESHOLD   = 20        # min signal score to enter
+SCALPER_MAX_RSI     = 70        # don't enter overbought pairs
 
 # ── Moonshot (breakout — low-cap gems) ────────────────────────
-MOONSHOT_BUDGET_PCT = 0.05    # 5% of available balance
-MOONSHOT_TP         = 0.25    # +25%
-MOONSHOT_SL         = 0.10    # -10%
-MOONSHOT_MAX_VOL    = 200_000 # max 24h volume (keeps it low-cap)
-MOONSHOT_MIN_VOL    = 10_000  # min volume (avoid ghost coins)
-MOONSHOT_THRESHOLD  = 25      # min signal score
-MOONSHOT_MAX_HOURS  = 48      # exit after 48h regardless
+MOONSHOT_BUDGET_PCT = 0.05      # 5% of available balance
+MOONSHOT_TP         = 0.25      # +25%
+MOONSHOT_SL         = 0.10      # -10%
+MOONSHOT_MAX_VOL    = 200_000   # max 24h volume (keeps it low-cap)
+MOONSHOT_MIN_VOL    = 10_000    # min volume (avoid ghost coins)
+MOONSHOT_THRESHOLD  = 25        # min signal score
+MOONSHOT_MAX_HOURS  = 48        # exit after 48h regardless
 
 # ── Reversal (mean reversion — oversold bounce) ────────────────
-# Shares the 5% slot with moonshot — only one fires at a time
-REVERSAL_TP         = 0.030   # +3%
-REVERSAL_SL         = 0.020   # -2%
-REVERSAL_MIN_VOL    = 100_000 # needs some liquidity
-REVERSAL_MAX_RSI    = 32      # only enter deeply oversold pairs
-REVERSAL_MIN_DROP   = 3.0     # pair must be down at least 3% in 24h
-REVERSAL_MAX_HOURS  = 4       # exit after 4h regardless — bounce or bail
+REVERSAL_BUDGET_PCT = 0.05      # shares 5% slot with moonshot
+REVERSAL_TP         = 0.030     # +3%
+REVERSAL_SL         = 0.020     # -2%
+REVERSAL_MIN_VOL    = 100_000   # needs some liquidity
+REVERSAL_MAX_RSI    = 32        # only enter deeply oversold pairs
+REVERSAL_MIN_DROP   = 3.0       # pair must be down at least 3% in 24h
+REVERSAL_MAX_HOURS  = 4         # exit after 4h regardless — bounce or bail
 
 # ── Shared ────────────────────────────────────────────────────
-MIN_PRICE     = 0.001   # ignore coins below this price (lot size quirks)
+MIN_PRICE     = 0.001   # ignore coins below this price
 SCAN_INTERVAL = 60      # seconds between scans when idle
 
 TELEGRAM_TOKEN   = "8729639207:AAGR2ytuX36ocCVagQj-tGBE2QEkvrTiqQo"
@@ -72,20 +73,20 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── State ──────────────────────────────────────────────────────
-trade_history      = []
-scalper_trade      = None
-alt_trade          = None   # holds either a MOONSHOT or REVERSAL trade
+trade_history        = []
+scalper_trade        = None
+alt_trade            = None   # holds either a MOONSHOT or REVERSAL trade
 last_heartbeat_at    = 0
 last_daily_summary   = ""
-last_weekly_summary  = ""   # ISO week string e.g. "2024-W12"
-last_telegram_update = 0    # last Telegram update_id processed
+last_weekly_summary  = ""
+last_telegram_update = 0
 last_top_scalper     = None
 last_top_alt         = None
 
-# Exchange info cached once at startup, refreshed every 24h
-_exchange_info_cache     = {}
-_exchange_info_fetched   = False
-_exchange_info_fetched_at = 0
+# Exchange info: min_qty and min_notional per symbol, refreshed every 24h
+_symbol_rules         = {}
+_symbol_rules_fetched = False
+_symbol_rules_at      = 0
 
 # ── Telegram ───────────────────────────────────────────────────
 
@@ -130,37 +131,38 @@ def private_post(path, params=None):
     r.raise_for_status()
     return r.json()
 
-# ── Exchange info cache ────────────────────────────────────────
+# ── Symbol rules cache ────────────────────────────────────────
 
-def _load_exchange_info():
-    global _exchange_info_fetched, _exchange_info_fetched_at
-    # Refresh every 24h in case MEXC adds/changes pair rules
-    if _exchange_info_fetched and (time.time() - _exchange_info_fetched_at) < 86400:
+def _load_symbol_rules():
+    """Cache min_qty and min_notional for all symbols. Refreshes every 24h."""
+    global _symbol_rules_fetched, _symbol_rules_at
+    if _symbol_rules_fetched and (time.time() - _symbol_rules_at) < 86400:
         return
-    log.info("📋 Loading exchange info...")
+    log.info("📋 Loading symbol rules...")
     try:
         info = public_get("/api/v3/exchangeInfo")
         for s in info.get("symbols", []):
-            sym  = s["symbol"]
-            step, min_qty, min_notional = 0.001, 0.001, 1.0
+            sym          = s["symbol"]
+            min_qty      = 1.0
+            min_notional = 1.0
             for f in s.get("filters", []):
                 if f["filterType"] == "LOT_SIZE":
-                    step    = float(f.get("stepSize", 0.001))
-                    min_qty = float(f.get("minQty",   0.001))
+                    min_qty = float(f.get("minQty", 1.0))
                 if f["filterType"] == "MIN_NOTIONAL":
                     min_notional = float(f.get("minNotional", 1.0))
-            _exchange_info_cache[sym] = {"step": step, "min_qty": min_qty, "min_notional": min_notional}
-        _exchange_info_fetched    = True
-        _exchange_info_fetched_at = time.time()
-        log.info(f"📋 Loaded rules for {len(_exchange_info_cache)} symbols.")
+            _symbol_rules[sym] = {"min_qty": min_qty, "min_notional": min_notional}
+        _symbol_rules_fetched = True
+        _symbol_rules_at      = time.time()
+        log.info(f"📋 Loaded rules for {len(_symbol_rules)} symbols.")
     except Exception as e:
-        log.error(f"Failed to load exchange info: {e}")
+        log.error(f"Failed to load symbol rules: {e}")
 
 def get_symbol_rules(symbol):
-    rules = _exchange_info_cache.get(symbol)
+    """Return (min_qty, min_notional). Falls back to safe defaults."""
+    rules = _symbol_rules.get(symbol)
     if rules:
-        return rules["step"], rules["min_qty"], rules["min_notional"]
-    return 0.001, 0.001, 1.0
+        return rules["min_qty"], rules["min_notional"]
+    return 1.0, 1.0
 
 # ── Balance ────────────────────────────────────────────────────
 
@@ -179,20 +181,6 @@ def get_available_balance() -> float:
         log.error(f"Failed to fetch balance: {e}")
         return 0.0
 
-# ── Quantity rounding ──────────────────────────────────────────
-
-def round_qty(qty: float, step: float) -> float:
-    """Floor qty to nearest valid step using integer arithmetic to avoid float artifacts."""
-    if step <= 0:
-        return qty
-    decimals = max(0, -int(np.floor(np.log10(step)))) if step < 1 else 0
-    factor   = 10 ** decimals
-    # Scale to integers, floor divide, scale back — no extra division
-    floored  = int(qty * factor) // int(round(step * factor))
-    result   = round(floored * step, decimals)
-    # If step >= 1 result must be a whole number — force it to avoid decimal qty rejections
-    return int(result) if step >= 1 else result
-
 # ── Indicators ─────────────────────────────────────────────────
 
 def calc_rsi(series, period=14) -> float:
@@ -206,8 +194,10 @@ def calc_rsi(series, period=14) -> float:
 def calc_ema(series, span) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
+# ── Kline parsing ──────────────────────────────────────────────
+
 def parse_klines(symbol, interval="5m", limit=60, min_len=30) -> pd.DataFrame | None:
-    """Fetch and parse klines robustly regardless of MEXC column count."""
+    """Fetch and parse OHLCV data. Returns None if data is insufficient."""
     try:
         data = public_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
         if not data:
@@ -223,11 +213,16 @@ def parse_klines(symbol, interval="5m", limit=60, min_len=30) -> pd.DataFrame | 
         log.info(f"⚠️ Klines error {symbol}: {type(e).__name__}: {e}")
         return None
 
-# ── Pair scoring (shared signal engine) ───────────────────────
+# ── Pair scoring ───────────────────────────────────────────────
 
-def score_pair(symbol, interval="5m") -> dict | None:
-    df = parse_klines(symbol, interval)
+def score_pair(symbol=None, interval="5m", df=None) -> dict | None:
+    """
+    Score a pair using RSI + EMA crossover + volume spike.
+    Accepts either a symbol (fetches klines) or a pre-fetched df.
+    """
     if df is None:
+        df = parse_klines(symbol, interval)
+    if df is None or symbol is None and "symbol" not in df.columns:
         return None
     try:
         close  = df["close"]
@@ -237,17 +232,14 @@ def score_pair(symbol, interval="5m") -> dict | None:
         if np.isnan(r):
             return None
 
-        # RSI score: reward oversold (low RSI), penalise overbought (high RSI)
         rsi_score = max(0, 40 - r) if r < 50 else 0
 
-        # EMA crossover score
         ema9  = calc_ema(close, 9)
         ema21 = calc_ema(close, 21)
         crossed_up  = (ema9.iloc[-1] > ema21.iloc[-1]) and (ema9.iloc[-2] <= ema21.iloc[-2])
         trending_up = ema9.iloc[-1] > ema21.iloc[-1]
         ma_score = 30 if crossed_up else (15 if trending_up else 0)
 
-        # Volume spike score
         avg_vol   = volume.iloc[-20:-1].mean()
         last_vol  = float(volume.iloc[-1])
         vol_ratio = (last_vol / avg_vol) if avg_vol > 0 else 1.0
@@ -274,6 +266,7 @@ def fetch_tickers() -> pd.DataFrame:
     df   = pd.DataFrame(data)
     df   = df[df["symbol"].str.endswith("USDT")].copy()
     df["quoteVolume"]        = pd.to_numeric(df["quoteVolume"],        errors="coerce")
+    df["volume"]             = pd.to_numeric(df["volume"],             errors="coerce")
     df["priceChangePercent"] = pd.to_numeric(df["priceChangePercent"], errors="coerce")
     df["lastPrice"]          = pd.to_numeric(df["lastPrice"],          errors="coerce")
     df["abs_change"]         = df["priceChangePercent"].abs()
@@ -282,13 +275,13 @@ def fetch_tickers() -> pd.DataFrame:
 # ── Notional pre-check ─────────────────────────────────────────
 
 def pick_tradeable(candidates: list, budget: float, label: str) -> dict | None:
-    """Walk scored candidates in order, return first that passes lot/notional checks."""
+    """Walk scored candidates in order, return first that passes notional/qty checks."""
     for c in candidates:
-        step, min_qty, min_notional = get_symbol_rules(c["symbol"])
-        qty      = round_qty(budget / c["price"], step)
+        min_qty, min_notional = get_symbol_rules(c["symbol"])
+        qty      = int(budget / c["price"])
         notional = round(qty * c["price"], 4)
         log.info(f"[{label}] Checking {c['symbol']} | price: {c['price']:.6f} | "
-                 f"step: {step} | qty: {qty} | notional: ${notional:.2f} | min: ${min_notional:.2f}")
+                 f"qty: {qty} | notional: ${notional:.2f} | min_notional: ${min_notional:.2f}")
         if qty < min_qty:
             log.info(f"[{label}] Skip {c['symbol']} — qty {qty} < min {min_qty}")
             continue
@@ -296,12 +289,13 @@ def pick_tradeable(candidates: list, budget: float, label: str) -> dict | None:
             log.info(f"[{label}] Skip {c['symbol']} — notional ${notional:.2f} < min ${min_notional:.2f}")
             continue
         return c
-    log.info(f"[{label}] All candidates failed lot/notional checks.")
+    log.info(f"[{label}] All candidates failed notional/qty checks.")
     return None
 
 # ── Scanner: Scalper ───────────────────────────────────────────
 
-def find_scalper_opportunity(tickers: pd.DataFrame, budget: float, exclude=None) -> dict | None:
+def find_scalper_opportunity(tickers: pd.DataFrame, budget: float,
+                              exclude=None, open_symbols: set = None) -> dict | None:
     global last_top_scalper
 
     df = tickers.copy()
@@ -310,9 +304,11 @@ def find_scalper_opportunity(tickers: pd.DataFrame, budget: float, exclude=None)
     df = df[df["abs_change"]  >= 0.3]
     if exclude:
         df = df[df["symbol"] != exclude]
+    if open_symbols:
+        df = df[~df["symbol"].isin(open_symbols)]
 
     candidates = df.sort_values("quoteVolume", ascending=False).head(80)["symbol"].tolist()[:40]
-    log.info(f"🔍 [SCALPER] Scoring {len(candidates)} pairs...")
+    log.info(f"🔍 [SCALPER] Scoring {len(candidates)} pairs (min vol: ${SCALPER_MIN_VOL:,})...")
 
     scores = []
     for sym in candidates:
@@ -326,14 +322,15 @@ def find_scalper_opportunity(tickers: pd.DataFrame, budget: float, exclude=None)
         log.info("[SCALPER] No scoreable pairs.")
         return None
 
-    best = scores[0]
+    best    = scores[0]
     last_top_scalper = best
+    vol_row = tickers[tickers["symbol"] == best["symbol"]]
+    best_vol = float(vol_row["quoteVolume"].iloc[0]) if not vol_row.empty else 0
     ma_label = "crossover" if best["ma_score"] == 30 else ("trending" if best["ma_score"] == 15 else "flat")
     log.info(f"📊 [SCALPER] Top: {best['symbol']} | Score: {best['score']}/100 | "
-             f"RSI: {best['rsi']} ({best['rsi_score']:.0f}pts) | "
-             f"MA: {ma_label} ({best['ma_score']}pts) | Vol: {best['vol_ratio']}x ({best['vol_score']:.0f}pts)")
+             f"24h vol: ${best_vol:,.0f} | RSI: {best['rsi']} ({best['rsi_score']:.0f}pts) | "
+             f"MA: {ma_label} ({best['ma_score']}pts) | Vol spike: {best['vol_ratio']}x ({best['vol_score']:.0f}pts)")
 
-    # Filter: must be above threshold AND not overbought
     tradeable = [s for s in scores
                  if s["score"] >= SCALPER_THRESHOLD and s["rsi"] <= SCALPER_MAX_RSI]
     if not tradeable:
@@ -344,16 +341,19 @@ def find_scalper_opportunity(tickers: pd.DataFrame, budget: float, exclude=None)
 
 # ── Scanner: Moonshot ──────────────────────────────────────────
 
-def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float, exclude=None) -> dict | None:
+def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
+                               exclude=None, open_symbols: set = None) -> dict | None:
     global last_top_alt
 
     df = tickers.copy()
     df = df[df["quoteVolume"]        >= MOONSHOT_MIN_VOL]
     df = df[df["quoteVolume"]        <= MOONSHOT_MAX_VOL]
     df = df[df["lastPrice"]          >= MIN_PRICE]
-    df = df[df["priceChangePercent"] >= 3.0]   # upward movers only
+    df = df[df["priceChangePercent"] >= 3.0]
     if exclude:
         df = df[df["symbol"] != exclude]
+    if open_symbols:
+        df = df[~df["symbol"].isin(open_symbols)]
 
     candidates = df.sort_values("priceChangePercent", ascending=False).head(30)["symbol"].tolist()
     log.info(f"🌙 [MOONSHOT] Scoring {len(candidates)} low-cap movers...")
@@ -362,8 +362,14 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float, exclude=None
 
     scores = []
     for sym in candidates:
-        result = score_pair(sym, interval="15m")
+        # Fetch klines once, reuse for both scoring and burst detection
+        df15m = parse_klines(sym, interval="15m", limit=60)
+        if df15m is None:
+            time.sleep(0.1)
+            continue
+        result = score_pair(symbol=sym, interval="15m", df=df15m)
         if result:
+            result["_df"] = df15m  # carry df through for burst check
             scores.append(result)
         time.sleep(0.1)
     scores.sort(key=lambda x: x["score"], reverse=True)
@@ -377,69 +383,62 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float, exclude=None
     log.info(f"🌙 [MOONSHOT] Top: {best['symbol']} | Score: {best['score']}/100 | "
              f"RSI: {best['rsi']} | Vol: {best['vol_ratio']}x | Price: {best['price']}")
 
-    # Burst detection — confirm sudden activity in the last 15-30 minutes
-    # We want to catch the START of a pump, not one that's already hours old
+    # Burst detection — confirm sudden activity in last 15-30 mins
     tradeable = []
     for s in scores:
         if s["score"] < MOONSHOT_THRESHOLD:
             continue
 
-        df15m = parse_klines(s["symbol"], interval="15m", limit=20)
-        if df15m is None:
+        df15m = s.pop("_df", None)
+        if df15m is None or len(df15m) < 12:
             tradeable.append(s)  # can't verify, give benefit of the doubt
             continue
 
-        close  = df15m["close"].astype(float)
-        volume = df15m["volume"].astype(float)
+        close  = df15m["close"]
+        volume = df15m["volume"]
+        opens  = df15m["open"]
 
-        # 1. Volume acceleration: last candle volume vs average of prior 10 candles
         avg_vol   = volume.iloc[-11:-1].mean()
-        last_vol  = float(volume.iloc[-1])
-        vol_burst = (last_vol / avg_vol) if avg_vol > 0 else 1.0
+        vol_burst = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
 
-        # 2. Price acceleration: last candle % move vs average candle % move
-        candle_moves  = (close - df15m["open"].astype(float)).abs() / df15m["open"].astype(float) * 100
-        avg_move      = candle_moves.iloc[-11:-1].mean()
-        last_move     = float(candle_moves.iloc[-1])
-        price_burst   = (last_move / avg_move) if avg_move > 0 else 1.0
+        candle_moves = (close - opens).abs() / opens * 100
+        avg_move     = candle_moves.iloc[-11:-1].mean()
+        price_burst  = (float(candle_moves.iloc[-1]) / avg_move) if avg_move > 0 else 1.0
 
-        # 3. Consecutive green candles: last 2 candles both green
-        opens  = df15m["open"].astype(float)
         greens = sum(1 for i in [-2, -1] if close.iloc[i] > opens.iloc[i])
 
-        log.info(f"[MOONSHOT] Burst check {s['symbol']} | "
-                 f"Vol burst: {vol_burst:.1f}x | Price burst: {price_burst:.1f}x | "
-                 f"Green candles: {greens}/2")
+        log.info(f"[MOONSHOT] Burst {s['symbol']} | Vol: {vol_burst:.1f}x | "
+                 f"Price: {price_burst:.1f}x | Green: {greens}/2")
 
-        # Require: volume at least 3x normal OR price move at least 2x normal
-        # AND at least 1 of last 2 candles green (still moving up)
-        if (vol_burst < 3.0 and price_burst < 2.0):
-            log.info(f"[MOONSHOT] Skip {s['symbol']} — no burst detected")
+        if vol_burst < 3.0 and price_burst < 2.0:
+            log.info(f"[MOONSHOT] Skip {s['symbol']} — no burst")
             continue
         if greens == 0:
-            log.info(f"[MOONSHOT] Skip {s['symbol']} — both recent candles red, burst may be over")
+            log.info(f"[MOONSHOT] Skip {s['symbol']} — both candles red")
             continue
 
         tradeable.append(s)
 
     if not tradeable:
-        log.info("[MOONSHOT] No pairs with burst activity detected.")
+        log.info("[MOONSHOT] No pairs with burst activity.")
         return None
 
     return pick_tradeable(tradeable, budget, "MOONSHOT")
 
 # ── Scanner: Reversal ──────────────────────────────────────────
 
-def find_reversal_opportunity(tickers: pd.DataFrame, budget: float, exclude=None) -> dict | None:
+def find_reversal_opportunity(tickers: pd.DataFrame, budget: float,
+                               exclude=None, open_symbols: set = None) -> dict | None:
     global last_top_alt
 
     df = tickers.copy()
     df = df[df["quoteVolume"]        >= REVERSAL_MIN_VOL]
     df = df[df["lastPrice"]          >= MIN_PRICE]
-    # Down at least 3% — looking for oversold bounces
     df = df[df["priceChangePercent"] <= -REVERSAL_MIN_DROP]
     if exclude:
         df = df[df["symbol"] != exclude]
+    if open_symbols:
+        df = df[~df["symbol"].isin(open_symbols)]
 
     candidates = df.sort_values("priceChangePercent", ascending=True).head(30)["symbol"].tolist()
     log.info(f"🔄 [REVERSAL] Scoring {len(candidates)} oversold pairs...")
@@ -448,27 +447,20 @@ def find_reversal_opportunity(tickers: pd.DataFrame, budget: float, exclude=None
 
     tradeable = []
     for sym in candidates:
-        # Fetch klines once, reuse for both scoring and green candle check
+        # Fetch klines once — reuse for both scoring and green candle check
         df5m = parse_klines(sym, interval="5m", limit=60, min_len=30)
         if df5m is None:
             time.sleep(0.1)
             continue
 
-        s = score_pair(sym, interval="5m")
-        if s is None:
+        s = score_pair(symbol=sym, interval="5m", df=df5m)
+        if s is None or s["rsi"] > REVERSAL_MAX_RSI:
             time.sleep(0.1)
             continue
 
-        # Must be deeply oversold
-        if s["rsi"] > REVERSAL_MAX_RSI:
-            time.sleep(0.1)
-            continue
-
-        # Last candle must be green — price has started recovering
-        last_open  = float(df5m["open"].iloc[-1])
-        last_close = float(df5m["close"].iloc[-1])
-        if last_close <= last_open:
-            log.info(f"[REVERSAL] Skip {sym} — last candle still red")
+        # Last candle must be green — bounce has started
+        if float(df5m["close"].iloc[-1]) <= float(df5m["open"].iloc[-1]):
+            log.info(f"[REVERSAL] Skip {sym} — last candle red")
             time.sleep(0.1)
             continue
 
@@ -479,7 +471,7 @@ def find_reversal_opportunity(tickers: pd.DataFrame, budget: float, exclude=None
         log.info("[REVERSAL] No deeply oversold pairs with green candle.")
         return None
 
-    tradeable.sort(key=lambda x: x["rsi"])  # lowest RSI first = most oversold
+    tradeable.sort(key=lambda x: x["rsi"])  # most oversold first
     best = tradeable[0]
     last_top_alt = best
     log.info(f"🔄 [REVERSAL] Top: {best['symbol']} | RSI: {best['rsi']} | Price: {best['price']}")
@@ -509,22 +501,26 @@ def place_order(symbol, side, qty, label=""):
 # ── Trade lifecycle ────────────────────────────────────────────
 
 def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
-    symbol           = opp["symbol"]
-    step, min_qty, _ = get_symbol_rules(symbol)
+    symbol               = opp["symbol"]
+    min_qty, min_notional = get_symbol_rules(symbol)
 
-    # Always use a fresh price at order time
+    # Always fetch a fresh price right before ordering
     try:
         price = float(public_get("/api/v3/ticker/price", {"symbol": symbol})["price"])
     except Exception as e:
         log.warning(f"[{label}] Fresh price failed, using scored price: {e}")
         price = opp["price"]
 
-    qty = round_qty(budget_usdt / price, step)
+    qty      = int(budget_usdt / price)
+    notional = round(qty * price, 4)
+
     if qty < min_qty:
         log.warning(f"[{label}] {symbol} qty {qty} below min {min_qty}, skipping.")
         return None
+    if notional < min_notional:
+        log.warning(f"[{label}] {symbol} notional ${notional:.2f} below min ${min_notional:.2f}, skipping.")
+        return None
 
-    notional = round(qty * price, 4)
     log.info(f"[{label}] Placing: {symbol} | qty: {qty} | price: ${price:.6f} | notional: ${notional:.2f}")
 
     order = place_order(symbol, "BUY", qty, label)
@@ -584,7 +580,6 @@ def check_exit(trade) -> tuple[bool, str]:
     if price <= trade["sl_price"]:
         log.info(f"🛑 [{label}] SL hit: {trade['symbol']} | {pct:.2f}%")
         return True, "STOP_LOSS"
-
     if trade.get("max_hours"):
         hours_held = (datetime.now(timezone.utc) -
                       datetime.fromisoformat(trade["opened_at"])).total_seconds() / 3600
@@ -599,16 +594,7 @@ def check_exit(trade) -> tuple[bool, str]:
 def close_position(trade, reason):
     label  = trade["label"]
     symbol = trade["symbol"]
-
-    # Re-round the sell qty using current step rules — buy qty may have been
-    # calculated with a stale or mismatched step size
-    step, _, _ = get_symbol_rules(symbol)
-    sell_qty   = round_qty(trade["qty"], step)
-    if sell_qty <= 0:
-        sell_qty = trade["qty"]  # fall back to original if rounding kills it
-        log.warning(f"[{label}] Could not re-round sell qty, using original: {sell_qty}")
-
-    place_order(symbol, "SELL", sell_qty, label)
+    place_order(symbol, "SELL", trade["qty"], label)
 
     try:
         exit_price = float(public_get("/api/v3/ticker/price", {"symbol": symbol})["price"])
@@ -630,7 +616,9 @@ def close_position(trade, reason):
     win_rate  = len(wins) / len(trade_history) * 100
     total_pnl = sum(t["pnl_usdt"] for t in trade_history)
     mode      = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
-    icons     = {"TAKE_PROFIT": ("🎯","Take Profit Hit"), "STOP_LOSS": ("🛑","Stop Loss Hit"), "TIMEOUT": ("⏰","Timeout Exit")}
+    icons     = {"TAKE_PROFIT": ("🎯","Take Profit Hit"),
+                 "STOP_LOSS":   ("🛑","Stop Loss Hit"),
+                 "TIMEOUT":     ("⏰","Timeout Exit")}
     emoji, reason_label = icons.get(reason, ("✅", reason))
 
     telegram(
@@ -711,22 +699,15 @@ def send_daily_summary(balance: float):
         + f"\n━━━━━━━━━━━━━━━\nTotal P&L: <b>${total_pnl:+.2f}</b>\nBalance: <b>${balance:.2f} USDT</b>"
     )
 
-# ── Weekly P&L from MEXC ──────────────────────────────────────
+# ── Weekly P&L ────────────────────────────────────────────────
 
 def fetch_mexc_weekly_pnl() -> dict:
-    """
-    Pull closed orders from MEXC for the past 7 days.
-    Returns a summary dict with total PnL, trade count, wins, losses.
-    Works even after bot restarts since it reads directly from MEXC.
-    """
     if PAPER_TRADE:
-        # In paper mode, calculate from local history
-        now   = datetime.now(timezone.utc)
-        week_ago_ts = now.timestamp() - 7 * 86400
+        week_ago  = datetime.now(timezone.utc).timestamp() - 7 * 86400
         week_trades = [t for t in trade_history
-                       if datetime.fromisoformat(t.get("closed_at","1970-01-01")).timestamp() >= week_ago_ts]
-        wins  = [t for t in week_trades if t["pnl_pct"] > 0]
-        losses= [t for t in week_trades if t["pnl_pct"] <= 0]
+                       if datetime.fromisoformat(t.get("closed_at","1970-01-01")).timestamp() >= week_ago]
+        wins   = [t for t in week_trades if t["pnl_pct"] > 0]
+        losses = [t for t in week_trades if t["pnl_pct"] <= 0]
         return {
             "total":    len(week_trades),
             "wins":     len(wins),
@@ -735,114 +716,90 @@ def fetch_mexc_weekly_pnl() -> dict:
             "best":     max(week_trades, key=lambda t: t["pnl_pct"]) if week_trades else None,
             "worst":    min(week_trades, key=lambda t: t["pnl_pct"]) if week_trades else None,
         }
-
     try:
-        now_ms      = int(time.time() * 1000)
-        week_ago_ms = now_ms - 7 * 86400 * 1000
-        data        = private_get("/api/v3/myTrades", {
-            "startTime": week_ago_ms,
+        now_ms  = int(time.time() * 1000)
+        data    = private_get("/api/v3/myTrades", {
+            "startTime": now_ms - 7 * 86400 * 1000,
             "limit":     1000,
         })
-
         if not data:
             return {"error": "No trade data returned from MEXC"}
 
-        # MEXC myTrades returns individual fills — group by orderId to get net per trade
-        from collections import defaultdict
         orders = defaultdict(lambda: {"symbol":"","qty":0,"cost":0,"side":"","time":0})
         for fill in data:
             oid = fill["orderId"]
             orders[oid]["symbol"] = fill["symbol"]
-            orders[oid]["side"]   = fill["isBuyer"] and "BUY" or "SELL"
+            orders[oid]["side"]   = "BUY" if fill["isBuyer"] else "SELL"
             orders[oid]["time"]   = fill["time"]
             orders[oid]["qty"]   += float(fill["qty"])
             orders[oid]["cost"]  += float(fill["quoteQty"])
 
-        # Pair BUY/SELL orders to calculate P&L per round-trip
         buys  = {o: v for o, v in orders.items() if v["side"] == "BUY"}
         sells = {o: v for o, v in orders.items() if v["side"] == "SELL"}
 
-        # Simple approach: total USDT in (buys) vs total USDT out (sells)
         total_bought = sum(v["cost"] for v in buys.values())
         total_sold   = sum(v["cost"] for v in sells.values())
-        net_pnl      = round(total_sold - total_bought, 4)
 
-        # Count completed round-trips (matched buy+sell pairs by symbol)
-        from collections import Counter
-        buy_symbols  = Counter(v["symbol"] for v in buys.values())
-        sell_symbols = Counter(v["symbol"] for v in sells.values())
-        completed    = sum(min(buy_symbols[s], sell_symbols[s]) for s in buy_symbols)
+        buy_syms  = Counter(v["symbol"] for v in buys.values())
+        sell_syms = Counter(v["symbol"] for v in sells.values())
+        completed = sum(min(buy_syms[s], sell_syms[s]) for s in buy_syms)
 
         return {
-            "total":       completed,
-            "buys":        len(buys),
-            "sells":       len(sells),
-            "pnl_usdt":    net_pnl,
+            "total":        completed,
+            "buys":         len(buys),
+            "sells":        len(sells),
+            "pnl_usdt":     round(total_sold - total_bought, 4),
             "total_bought": round(total_bought, 2),
             "total_sold":   round(total_sold, 2),
-            "best":        None,  # not available from raw fills without more grouping
-            "worst":       None,
         }
     except Exception as e:
-        log.error(f"Failed to fetch weekly P&L from MEXC: {e}")
+        log.error(f"Failed to fetch weekly P&L: {e}")
         return {"error": str(e)}
 
 
 def build_weekly_message(pnl: dict, balance: float) -> str:
-    mode = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
-    if "error" in pnl:
-        return f"📊 <b>Weekly P&L</b> [{mode}]\n━━━━━━━━━━━━━━━\nCould not fetch data: {pnl['error']}"
+    mode      = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
+    pnl_emoji = "📈" if pnl.get("pnl_usdt", 0) >= 0 else "📉"
 
-    win_rate = f"{pnl['wins']/pnl['total']*100:.0f}%" if pnl.get("total") else "n/a"
-    pnl_emoji = "📈" if pnl["pnl_usdt"] >= 0 else "📉"
+    if "error" in pnl:
+        return f"📊 <b>Weekly P&L</b> [{mode}]\n━━━━━━━━━━━━━━━\nCould not fetch: {pnl['error']}"
 
     if PAPER_TRADE:
-        lines = (
-            f"{pnl_emoji} <b>Weekly Summary</b> [{mode}]\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"Trades:    <b>{pnl['total']}</b>  ({pnl.get('wins',0)}W / {pnl.get('losses',0)}L)\n"
-            f"Win rate:  <b>{win_rate}</b>\n"
-            f"P&L:       <b>${pnl['pnl_usdt']:+.2f} USDT</b>\n"
-            f"Balance:   <b>${balance:.2f} USDT</b>\n"
-        )
+        win_rate = f"{pnl['wins']/pnl['total']*100:.0f}%" if pnl.get("total") else "n/a"
+        msg = (f"{pnl_emoji} <b>Weekly Summary</b> [{mode}]\n"
+               f"━━━━━━━━━━━━━━━\n"
+               f"Trades:   <b>{pnl['total']}</b>  ({pnl.get('wins',0)}W / {pnl.get('losses',0)}L)\n"
+               f"Win rate: <b>{win_rate}</b>\n"
+               f"P&L:      <b>${pnl['pnl_usdt']:+.2f} USDT</b>\n"
+               f"Balance:  <b>${balance:.2f} USDT</b>")
         if pnl.get("best"):
-            lines += f"Best:      {pnl['best']['symbol']} {pnl['best']['pnl_pct']:+.2f}%\n"
+            msg += f"\nBest:     {pnl['best']['symbol']} {pnl['best']['pnl_pct']:+.2f}%"
         if pnl.get("worst"):
-            lines += f"Worst:     {pnl['worst']['symbol']} {pnl['worst']['pnl_pct']:+.2f}%\n"
-    else:
-        lines = (
-            f"{pnl_emoji} <b>Weekly Summary</b> [{mode}]\n"
+            msg += f"\nWorst:    {pnl['worst']['symbol']} {pnl['worst']['pnl_pct']:+.2f}%"
+        return msg
+
+    return (f"{pnl_emoji} <b>Weekly Summary</b> [{mode}]\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"Round trips:    <b>{pnl['total']}</b>\n"
-            f"Total bought:   <b>${pnl['total_bought']:,.2f} USDT</b>\n"
-            f"Total sold:     <b>${pnl['total_sold']:,.2f} USDT</b>\n"
-            f"Net P&L:        <b>${pnl['pnl_usdt']:+.2f} USDT</b>\n"
-            f"Balance:        <b>${balance:.2f} USDT</b>\n"
-        )
-    return lines
+            f"Round trips:  <b>{pnl['total']}</b>\n"
+            f"Total bought: <b>${pnl['total_bought']:,.2f} USDT</b>\n"
+            f"Total sold:   <b>${pnl['total_sold']:,.2f} USDT</b>\n"
+            f"Net P&L:      <b>${pnl['pnl_usdt']:+.2f} USDT</b>\n"
+            f"Balance:      <b>${balance:.2f} USDT</b>")
 
 
 def send_weekly_summary(balance: float):
     global last_weekly_summary
     now      = datetime.now(timezone.utc)
     week_str = f"{now.isocalendar()[0]}-W{now.isocalendar()[1]:02d}"
-    # Send every Monday at midnight UTC
     if last_weekly_summary == week_str or now.weekday() != 0 or now.hour != 0:
         return
     last_weekly_summary = week_str
-    pnl = fetch_mexc_weekly_pnl()
-    telegram(build_weekly_message(pnl, balance))
+    telegram(build_weekly_message(fetch_mexc_weekly_pnl(), balance))
     log.info(f"📊 Weekly summary sent for {week_str}")
-
 
 # ── Telegram command listener ──────────────────────────────────
 
 def listen_for_commands(balance: float):
-    """
-    Poll Telegram for incoming messages.
-    Supports: /pnl — sends weekly P&L on demand
-              /status — sends current trade status
-    """
     global last_telegram_update
     try:
         params = {"timeout": 0, "limit": 5}
@@ -857,20 +814,16 @@ def listen_for_commands(balance: float):
             last_telegram_update = update["update_id"]
             msg  = update.get("message", {})
             text = msg.get("text", "").strip().lower()
-            chat = msg.get("chat", {}).get("id")
-
-            # Only respond to your own chat
-            if str(chat) != str(TELEGRAM_CHAT_ID):
+            if str(msg.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
                 continue
 
             if text in ("/pnl", "/pnl@mexcbot"):
                 log.info("📊 /pnl command received")
-                pnl = fetch_mexc_weekly_pnl()
-                telegram(build_weekly_message(pnl, balance))
+                telegram(build_weekly_message(fetch_mexc_weekly_pnl(), balance))
 
             elif text in ("/status", "/status@mexcbot"):
-                log.info("📊 /status command received")
-                mode = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
+                log.info("📋 /status command received")
+                mode  = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
                 lines = [f"📋 <b>Status</b> [{mode}]\n━━━━━━━━━━━━━━━"]
                 for t, name in [(scalper_trade, "Scalper"), (alt_trade, "Alt")]:
                     if t:
@@ -901,7 +854,7 @@ def run():
     log.info(f"   Moonshot: TP {MOONSHOT_TP*100}% / SL {MOONSHOT_SL*100}% / max {MOONSHOT_MAX_HOURS}h")
     log.info(f"   Reversal: TP {REVERSAL_TP*100}% / SL {REVERSAL_SL*100}% / max {REVERSAL_MAX_HOURS}h")
 
-    _load_exchange_info()
+    _load_symbol_rules()
 
     startup_balance = get_available_balance()
     log.info(f"💰 Starting balance: ${startup_balance:.2f} USDT")
@@ -924,17 +877,18 @@ def run():
     while True:
         try:
             balance = get_available_balance()
-            _load_exchange_info()  # no-op unless 24h has passed
+            _load_symbol_rules()  # no-op unless 24h has passed
 
-            # Only fetch tickers when we actually need to scan
-            need_scalper_scan = scalper_trade is None
-            need_alt_scan     = alt_trade is None
-            tickers = fetch_tickers() if (need_scalper_scan or need_alt_scan) else None
+            open_symbols = {t["symbol"] for t in [scalper_trade, alt_trade] if t}
+
+            tickers = fetch_tickers() if (scalper_trade is None or alt_trade is None) else None
 
             # ── Scalper leg ───────────────────────────────────────
             if scalper_trade is None:
                 budget = round(balance * SCALPER_BUDGET_PCT, 2)
-                opp    = find_scalper_opportunity(tickers, budget, exclude=scalper_excluded)
+                opp    = find_scalper_opportunity(tickers, budget,
+                                                  exclude=scalper_excluded,
+                                                  open_symbols=open_symbols)
                 if opp:
                     scalper_trade    = open_position(opp, budget, SCALPER_TP, SCALPER_SL, "SCALPER")
                     scalper_excluded = None
@@ -946,18 +900,20 @@ def run():
                     scalper_trade = None
                     log.info("🔄 [SCALPER] Closed. Re-scanning next cycle...")
 
-            # ── Alt leg (Moonshot OR Reversal — whichever fires first) ─
+            # ── Alt leg (Moonshot OR Reversal) ────────────────────
             if alt_trade is None:
                 budget = round(balance * MOONSHOT_BUDGET_PCT, 2)
-
-                # Try moonshot first, fall back to reversal
-                opp = find_moonshot_opportunity(tickers, budget, exclude=alt_excluded)
+                opp    = find_moonshot_opportunity(tickers, budget,
+                                                   exclude=alt_excluded,
+                                                   open_symbols=open_symbols)
                 if opp:
                     alt_trade    = open_position(opp, budget, MOONSHOT_TP, MOONSHOT_SL,
                                                  "MOONSHOT", max_hours=MOONSHOT_MAX_HOURS)
                     alt_excluded = None
                 else:
-                    opp = find_reversal_opportunity(tickers, budget, exclude=alt_excluded)
+                    opp = find_reversal_opportunity(tickers, budget,
+                                                    exclude=alt_excluded,
+                                                    open_symbols=open_symbols)
                     if opp:
                         alt_trade    = open_position(opp, budget, REVERSAL_TP, REVERSAL_SL,
                                                      "REVERSAL", max_hours=REVERSAL_MAX_HOURS)
@@ -975,7 +931,6 @@ def run():
             send_daily_summary(balance)
             send_weekly_summary(balance)
             listen_for_commands(balance)
-            # Sleep shorter while monitoring active trades, longer when just scanning
             time.sleep(15 if (scalper_trade or alt_trade) else SCAN_INTERVAL)
 
         except KeyboardInterrupt:
