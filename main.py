@@ -182,7 +182,9 @@ def round_qty(qty: float, step: float) -> float:
         return qty
     decimals = max(0, -int(np.floor(np.log10(step)))) if step < 1 else 0
     factor   = 10 ** decimals
-    return int(qty * factor // (step * factor)) * step / factor
+    # Scale to integers, floor divide, scale back — no extra division
+    floored  = int(qty * factor) // int(round(step * factor))
+    return round(floored * step, decimals)
 
 # ── Indicators ─────────────────────────────────────────────────
 
