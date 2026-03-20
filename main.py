@@ -75,14 +75,17 @@ log = logging.getLogger(__name__)
 trade_history      = []
 scalper_trade      = None
 alt_trade          = None   # holds either a MOONSHOT or REVERSAL trade
-last_heartbeat_at  = 0
-last_daily_summary = ""
-last_top_scalper   = None
-last_top_alt       = None
+last_heartbeat_at    = 0
+last_daily_summary   = ""
+last_weekly_summary  = ""   # ISO week string e.g. "2024-W12"
+last_telegram_update = 0    # last Telegram update_id processed
+last_top_scalper     = None
+last_top_alt         = None
 
-# Exchange info cached once at startup
-_exchange_info_cache   = {}
-_exchange_info_fetched = False
+# Exchange info cached once at startup, refreshed every 24h
+_exchange_info_cache     = {}
+_exchange_info_fetched   = False
+_exchange_info_fetched_at = 0
 
 # ── Telegram ───────────────────────────────────────────────────
 
@@ -130,10 +133,11 @@ def private_post(path, params=None):
 # ── Exchange info cache ────────────────────────────────────────
 
 def _load_exchange_info():
-    global _exchange_info_fetched
-    if _exchange_info_fetched:
+    global _exchange_info_fetched, _exchange_info_fetched_at
+    # Refresh every 24h in case MEXC adds/changes pair rules
+    if _exchange_info_fetched and (time.time() - _exchange_info_fetched_at) < 86400:
         return
-    log.info("📋 Loading exchange info (one-time)...")
+    log.info("📋 Loading exchange info...")
     try:
         info = public_get("/api/v3/exchangeInfo")
         for s in info.get("symbols", []):
@@ -146,7 +150,8 @@ def _load_exchange_info():
                 if f["filterType"] == "MIN_NOTIONAL":
                     min_notional = float(f.get("minNotional", 1.0))
             _exchange_info_cache[sym] = {"step": step, "min_qty": min_qty, "min_notional": min_notional}
-        _exchange_info_fetched = True
+        _exchange_info_fetched    = True
+        _exchange_info_fetched_at = time.time()
         log.info(f"📋 Loaded rules for {len(_exchange_info_cache)} symbols.")
     except Exception as e:
         log.error(f"Failed to load exchange info: {e}")
@@ -184,7 +189,9 @@ def round_qty(qty: float, step: float) -> float:
     factor   = 10 ** decimals
     # Scale to integers, floor divide, scale back — no extra division
     floored  = int(qty * factor) // int(round(step * factor))
-    return round(floored * step, decimals)
+    result   = round(floored * step, decimals)
+    # If step >= 1 result must be a whole number — force it to avoid decimal qty rejections
+    return int(result) if step >= 1 else result
 
 # ── Indicators ─────────────────────────────────────────────────
 
@@ -592,7 +599,16 @@ def check_exit(trade) -> tuple[bool, str]:
 def close_position(trade, reason):
     label  = trade["label"]
     symbol = trade["symbol"]
-    place_order(symbol, "SELL", trade["qty"], label)
+
+    # Re-round the sell qty using current step rules — buy qty may have been
+    # calculated with a stale or mismatched step size
+    step, _, _ = get_symbol_rules(symbol)
+    sell_qty   = round_qty(trade["qty"], step)
+    if sell_qty <= 0:
+        sell_qty = trade["qty"]  # fall back to original if rounding kills it
+        log.warning(f"[{label}] Could not re-round sell qty, using original: {sell_qty}")
+
+    place_order(symbol, "SELL", sell_qty, label)
 
     try:
         exit_price = float(public_get("/api/v3/ticker/price", {"symbol": symbol})["price"])
@@ -661,7 +677,9 @@ def send_heartbeat(balance: float):
         f"Balance:      <b>${balance:.2f} USDT</b>\n"
         f"{trade_line(scalper_trade, last_top_scalper, 'Scalper')}\n"
         f"{trade_line(alt_trade, last_top_alt, alt_label)}\n"
-        f"Trades today: {trades_today}"
+        f"Trades today: {trades_today}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"<i>/pnl — weekly P&L  |  /status — open trades</i>"
     )
 
 
@@ -693,6 +711,185 @@ def send_daily_summary(balance: float):
         + f"\n━━━━━━━━━━━━━━━\nTotal P&L: <b>${total_pnl:+.2f}</b>\nBalance: <b>${balance:.2f} USDT</b>"
     )
 
+# ── Weekly P&L from MEXC ──────────────────────────────────────
+
+def fetch_mexc_weekly_pnl() -> dict:
+    """
+    Pull closed orders from MEXC for the past 7 days.
+    Returns a summary dict with total PnL, trade count, wins, losses.
+    Works even after bot restarts since it reads directly from MEXC.
+    """
+    if PAPER_TRADE:
+        # In paper mode, calculate from local history
+        now   = datetime.now(timezone.utc)
+        week_ago_ts = now.timestamp() - 7 * 86400
+        week_trades = [t for t in trade_history
+                       if datetime.fromisoformat(t.get("closed_at","1970-01-01")).timestamp() >= week_ago_ts]
+        wins  = [t for t in week_trades if t["pnl_pct"] > 0]
+        losses= [t for t in week_trades if t["pnl_pct"] <= 0]
+        return {
+            "total":    len(week_trades),
+            "wins":     len(wins),
+            "losses":   len(losses),
+            "pnl_usdt": round(sum(t["pnl_usdt"] for t in week_trades), 4),
+            "best":     max(week_trades, key=lambda t: t["pnl_pct"]) if week_trades else None,
+            "worst":    min(week_trades, key=lambda t: t["pnl_pct"]) if week_trades else None,
+        }
+
+    try:
+        now_ms      = int(time.time() * 1000)
+        week_ago_ms = now_ms - 7 * 86400 * 1000
+        data        = private_get("/api/v3/myTrades", {
+            "startTime": week_ago_ms,
+            "limit":     1000,
+        })
+
+        if not data:
+            return {"error": "No trade data returned from MEXC"}
+
+        # MEXC myTrades returns individual fills — group by orderId to get net per trade
+        from collections import defaultdict
+        orders = defaultdict(lambda: {"symbol":"","qty":0,"cost":0,"side":"","time":0})
+        for fill in data:
+            oid = fill["orderId"]
+            orders[oid]["symbol"] = fill["symbol"]
+            orders[oid]["side"]   = fill["isBuyer"] and "BUY" or "SELL"
+            orders[oid]["time"]   = fill["time"]
+            orders[oid]["qty"]   += float(fill["qty"])
+            orders[oid]["cost"]  += float(fill["quoteQty"])
+
+        # Pair BUY/SELL orders to calculate P&L per round-trip
+        buys  = {o: v for o, v in orders.items() if v["side"] == "BUY"}
+        sells = {o: v for o, v in orders.items() if v["side"] == "SELL"}
+
+        # Simple approach: total USDT in (buys) vs total USDT out (sells)
+        total_bought = sum(v["cost"] for v in buys.values())
+        total_sold   = sum(v["cost"] for v in sells.values())
+        net_pnl      = round(total_sold - total_bought, 4)
+
+        # Count completed round-trips (matched buy+sell pairs by symbol)
+        from collections import Counter
+        buy_symbols  = Counter(v["symbol"] for v in buys.values())
+        sell_symbols = Counter(v["symbol"] for v in sells.values())
+        completed    = sum(min(buy_symbols[s], sell_symbols[s]) for s in buy_symbols)
+
+        return {
+            "total":       completed,
+            "buys":        len(buys),
+            "sells":       len(sells),
+            "pnl_usdt":    net_pnl,
+            "total_bought": round(total_bought, 2),
+            "total_sold":   round(total_sold, 2),
+            "best":        None,  # not available from raw fills without more grouping
+            "worst":       None,
+        }
+    except Exception as e:
+        log.error(f"Failed to fetch weekly P&L from MEXC: {e}")
+        return {"error": str(e)}
+
+
+def build_weekly_message(pnl: dict, balance: float) -> str:
+    mode = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
+    if "error" in pnl:
+        return f"📊 <b>Weekly P&L</b> [{mode}]\n━━━━━━━━━━━━━━━\nCould not fetch data: {pnl['error']}"
+
+    win_rate = f"{pnl['wins']/pnl['total']*100:.0f}%" if pnl.get("total") else "n/a"
+    pnl_emoji = "📈" if pnl["pnl_usdt"] >= 0 else "📉"
+
+    if PAPER_TRADE:
+        lines = (
+            f"{pnl_emoji} <b>Weekly Summary</b> [{mode}]\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"Trades:    <b>{pnl['total']}</b>  ({pnl.get('wins',0)}W / {pnl.get('losses',0)}L)\n"
+            f"Win rate:  <b>{win_rate}</b>\n"
+            f"P&L:       <b>${pnl['pnl_usdt']:+.2f} USDT</b>\n"
+            f"Balance:   <b>${balance:.2f} USDT</b>\n"
+        )
+        if pnl.get("best"):
+            lines += f"Best:      {pnl['best']['symbol']} {pnl['best']['pnl_pct']:+.2f}%\n"
+        if pnl.get("worst"):
+            lines += f"Worst:     {pnl['worst']['symbol']} {pnl['worst']['pnl_pct']:+.2f}%\n"
+    else:
+        lines = (
+            f"{pnl_emoji} <b>Weekly Summary</b> [{mode}]\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"Round trips:    <b>{pnl['total']}</b>\n"
+            f"Total bought:   <b>${pnl['total_bought']:,.2f} USDT</b>\n"
+            f"Total sold:     <b>${pnl['total_sold']:,.2f} USDT</b>\n"
+            f"Net P&L:        <b>${pnl['pnl_usdt']:+.2f} USDT</b>\n"
+            f"Balance:        <b>${balance:.2f} USDT</b>\n"
+        )
+    return lines
+
+
+def send_weekly_summary(balance: float):
+    global last_weekly_summary
+    now      = datetime.now(timezone.utc)
+    week_str = f"{now.isocalendar()[0]}-W{now.isocalendar()[1]:02d}"
+    # Send every Monday at midnight UTC
+    if last_weekly_summary == week_str or now.weekday() != 0 or now.hour != 0:
+        return
+    last_weekly_summary = week_str
+    pnl = fetch_mexc_weekly_pnl()
+    telegram(build_weekly_message(pnl, balance))
+    log.info(f"📊 Weekly summary sent for {week_str}")
+
+
+# ── Telegram command listener ──────────────────────────────────
+
+def listen_for_commands(balance: float):
+    """
+    Poll Telegram for incoming messages.
+    Supports: /pnl — sends weekly P&L on demand
+              /status — sends current trade status
+    """
+    global last_telegram_update
+    try:
+        params = {"timeout": 0, "limit": 5}
+        if last_telegram_update:
+            params["offset"] = last_telegram_update + 1
+        data = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params=params, timeout=5
+        ).json()
+
+        for update in data.get("result", []):
+            last_telegram_update = update["update_id"]
+            msg  = update.get("message", {})
+            text = msg.get("text", "").strip().lower()
+            chat = msg.get("chat", {}).get("id")
+
+            # Only respond to your own chat
+            if str(chat) != str(TELEGRAM_CHAT_ID):
+                continue
+
+            if text in ("/pnl", "/pnl@mexcbot"):
+                log.info("📊 /pnl command received")
+                pnl = fetch_mexc_weekly_pnl()
+                telegram(build_weekly_message(pnl, balance))
+
+            elif text in ("/status", "/status@mexcbot"):
+                log.info("📊 /status command received")
+                mode = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
+                lines = [f"📋 <b>Status</b> [{mode}]\n━━━━━━━━━━━━━━━"]
+                for t, name in [(scalper_trade, "Scalper"), (alt_trade, "Alt")]:
+                    if t:
+                        try:
+                            price = float(public_get("/api/v3/ticker/price",
+                                                     {"symbol": t["symbol"]})["price"])
+                            pct = (price - t["entry_price"]) / t["entry_price"] * 100
+                            lines.append(f"{name}: <b>{t['symbol']}</b> | {pct:+.2f}% | "
+                                         f"TP: ${t['tp_price']:.6f} | SL: ${t['sl_price']:.6f}")
+                        except:
+                            lines.append(f"{name}: <b>{t['symbol']}</b> (price unavailable)")
+                    else:
+                        lines.append(f"{name}: scanning...")
+                lines.append(f"Balance: <b>${balance:.2f} USDT</b>")
+                telegram("\n".join(lines))
+
+    except Exception as e:
+        log.debug(f"Telegram poll error: {e}")
+
 # ── Main loop ──────────────────────────────────────────────────
 
 def run():
@@ -717,7 +914,8 @@ def run():
         f"\n🌙 <b>Moonshot</b> (5% budget — shares slot with Reversal)\n"
         f"  TP: +{MOONSHOT_TP*100:.0f}%  |  SL: -{MOONSHOT_SL*100:.0f}%  |  max {MOONSHOT_MAX_HOURS}h\n"
         f"\n🔄 <b>Reversal</b> (5% budget — shares slot with Moonshot)\n"
-        f"  TP: +{REVERSAL_TP*100:.0f}%  |  SL: -{REVERSAL_SL*100:.0f}%  |  max {REVERSAL_MAX_HOURS}h"
+        f"  TP: +{REVERSAL_TP*100:.0f}%  |  SL: -{REVERSAL_SL*100:.0f}%  |  max {REVERSAL_MAX_HOURS}h\n"
+        f"\n<i>Commands: /pnl — weekly P&L | /status — current trades</i>"
     )
 
     scalper_excluded = None
@@ -726,6 +924,7 @@ def run():
     while True:
         try:
             balance = get_available_balance()
+            _load_exchange_info()  # no-op unless 24h has passed
 
             # Only fetch tickers when we actually need to scan
             need_scalper_scan = scalper_trade is None
@@ -774,6 +973,8 @@ def run():
 
             send_heartbeat(balance)
             send_daily_summary(balance)
+            send_weekly_summary(balance)
+            listen_for_commands(balance)
             # Sleep shorter while monitoring active trades, longer when just scanning
             time.sleep(15 if (scalper_trade or alt_trade) else SCAN_INTERVAL)
 
