@@ -53,7 +53,8 @@ REVERSAL_MIN_DROP   = 3.0       # pair must be down at least 3% in 24h
 REVERSAL_MAX_HOURS  = 4         # exit after 4h regardless — bounce or bail
 
 # ── Shared ────────────────────────────────────────────────────
-MIN_PRICE     = 0.001   # ignore coins below this price
+MIN_PRICE         = 0.001  # global floor (moonshot/reversal)
+SCALPER_MIN_PRICE = 0.005   # higher floor for scalper — avoids slippage on ultra-cheap coins
 SCAN_INTERVAL = 60      # seconds between scans when idle
 
 TELEGRAM_TOKEN   = "8729639207:AAGR2ytuX36ocCVagQj-tGBE2QEkvrTiqQo"
@@ -300,7 +301,7 @@ def find_scalper_opportunity(tickers: pd.DataFrame, budget: float,
 
     df = tickers.copy()
     df = df[df["quoteVolume"] >= SCALPER_MIN_VOL]
-    df = df[df["lastPrice"]   >= MIN_PRICE]
+    df = df[df["lastPrice"]   >= SCALPER_MIN_PRICE]
     df = df[df["abs_change"]  >= 0.3]
     if exclude:
         df = df[df["symbol"] != exclude]
@@ -679,25 +680,83 @@ def send_daily_summary(balance: float):
     last_daily_summary = today
 
     mode = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
-    if not trade_history:
-        telegram(f"📅 <b>Daily Summary</b> [{mode}]\n━━━━━━━━━━━━━━━\nNo trades today. Still scanning.")
+
+    if PAPER_TRADE:
+        # Paper mode — use in-memory history
+        if not trade_history:
+            telegram(f"📅 <b>Daily Summary</b> [{mode}]\n━━━━━━━━━━━━━━━\nNo trades today. Still scanning.")
+            return
+
+        def block(label):
+            trades = [t for t in trade_history if t.get("label") == label]
+            if not trades:
+                return ""
+            wins = [t for t in trades if t["pnl_pct"] > 0]
+            return (f"\n<b>{label}</b>: {len(trades)} trades | "
+                    f"Win rate: {len(wins)/len(trades)*100:.0f}% | "
+                    f"P&L: ${sum(t['pnl_usdt'] for t in trades):+.2f}")
+
+        total_pnl = sum(t["pnl_usdt"] for t in trade_history)
+        telegram(
+            f"📅 <b>Daily Summary</b> [{mode}]\n━━━━━━━━━━━━━━━"
+            + block("SCALPER") + block("MOONSHOT") + block("REVERSAL")
+            + f"\n━━━━━━━━━━━━━━━\nTotal P&L: <b>${total_pnl:+.2f}</b>\nBalance: <b>${balance:.2f} USDT</b>"
+        )
         return
 
-    def block(label):
-        trades = [t for t in trade_history if t.get("label") == label]
-        if not trades:
-            return ""
-        wins = [t for t in trades if t["pnl_pct"] > 0]
-        return (f"\n<b>{label}</b>: {len(trades)} trades | "
-                f"Win rate: {len(wins)/len(trades)*100:.0f}% | "
-                f"P&L: ${sum(t['pnl_usdt'] for t in trades):+.2f}")
+    # Live mode — pull directly from MEXC so restarts don't lose history
+    try:
+        now_ms      = int(time.time() * 1000)
+        day_ago_ms  = now_ms - 86400 * 1000
+        data        = private_get("/api/v3/myTrades", {
+            "startTime": day_ago_ms,
+            "limit":     1000,
+        })
 
-    total_pnl = sum(t["pnl_usdt"] for t in trade_history)
-    telegram(
-        f"📅 <b>Daily Summary</b> [{mode}]\n━━━━━━━━━━━━━━━"
-        + block("SCALPER") + block("MOONSHOT") + block("REVERSAL")
-        + f"\n━━━━━━━━━━━━━━━\nTotal P&L: <b>${total_pnl:+.2f}</b>\nBalance: <b>${balance:.2f} USDT</b>"
-    )
+        if not data:
+            telegram(f"📅 <b>Daily Summary</b> [{mode}]\n━━━━━━━━━━━━━━━\nNo trades today. Still scanning.")
+            return
+
+        # Group fills into orders
+        orders = defaultdict(lambda: {"symbol":"","qty":0,"cost":0,"side":"","time":0})
+        for fill in data:
+            oid = fill["orderId"]
+            orders[oid]["symbol"] = fill["symbol"]
+            orders[oid]["side"]   = "BUY" if fill["isBuyer"] else "SELL"
+            orders[oid]["time"]   = fill["time"]
+            orders[oid]["qty"]   += float(fill["qty"])
+            orders[oid]["cost"]  += float(fill["quoteQty"])
+
+        buys  = {o: v for o, v in orders.items() if v["side"] == "BUY"}
+        sells = {o: v for o, v in orders.items() if v["side"] == "SELL"}
+
+        if not buys and not sells:
+            telegram(f"📅 <b>Daily Summary</b> [{mode}]\n━━━━━━━━━━━━━━━\nNo trades today. Still scanning.")
+            return
+
+        total_bought = sum(v["cost"] for v in buys.values())
+        total_sold   = sum(v["cost"] for v in sells.values())
+        net_pnl      = round(total_sold - total_bought, 4)
+        pnl_emoji    = "📈" if net_pnl >= 0 else "📉"
+
+        # Count unique symbols traded
+        symbols = sorted(set(v["symbol"] for v in orders.values()))
+        sym_str = ", ".join(symbols) if len(symbols) <= 5 else f"{len(symbols)} pairs"
+
+        telegram(
+            f"📅 <b>Daily Summary</b> [{mode}]\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"Orders:       <b>{len(buys)} buys / {len(sells)} sells</b>\n"
+            f"Pairs:        <b>{sym_str}</b>\n"
+            f"Total bought: <b>${total_bought:,.2f} USDT</b>\n"
+            f"Total sold:   <b>${total_sold:,.2f} USDT</b>\n"
+            f"Net P&L:      {pnl_emoji} <b>${net_pnl:+.2f} USDT</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"Balance:      <b>${balance:.2f} USDT</b>"
+        )
+    except Exception as e:
+        log.error(f"Daily summary fetch failed: {e}")
+        telegram(f"📅 <b>Daily Summary</b> [{mode}]\n━━━━━━━━━━━━━━━\nCould not fetch data: {str(e)[:200]}")
 
 # ── Weekly P&L ────────────────────────────────────────────────
 
