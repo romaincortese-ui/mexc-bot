@@ -26,22 +26,31 @@ PAPER_TRADE   = False
 PAPER_BALANCE = 50.0
 
 # ── Scalper (max 3 concurrent) ────────────────────────────────
-SCALPER_MAX_TRADES  = 3
-SCALPER_BUDGET_PCT  = 0.30
-SCALPER_TP_ATR_MULT = 3.0       # TP = 3×ATR (vs SL = 1.5×ATR → guaranteed 2:1 R:R)
-SCALPER_TP_LIMIT    = 0.10      # fallback TP if ATR unavailable (+10%)
-SCALPER_TRAIL_ACT   = 0.03      # trailing stop activates at +3% (raised from +2%)
-SCALPER_TRAIL_PCT   = 0.015     # trail 1.5% below highest (raised from 1%)
-SCALPER_ATR_MULT    = 1.5       # SL = 1.5×ATR
-SCALPER_SL          = 0.02      # fallback SL if ATR unavailable (2%)
-SCALPER_FLAT_MINS   = 30
-SCALPER_FLAT_RANGE  = 0.005
-SCALPER_ROTATE_GAP  = 20
-SCALPER_MIN_VOL     = 500_000
-SCALPER_MIN_PRICE   = 0.01
-SCALPER_MIN_CHANGE  = 0.1
-SCALPER_THRESHOLD   = 20
-SCALPER_MAX_RSI     = 70
+SCALPER_MAX_TRADES   = 3
+SCALPER_BUDGET_PCT   = 0.30
+SCALPER_TP_ATR_MULT  = 3.0       # TP = 3×ATR (vs SL = 1.5×ATR → guaranteed 2:1 R:R)
+SCALPER_TP_LIMIT     = 0.10      # fallback TP if ATR unavailable (+10%)
+SCALPER_TRAIL_ACT    = 0.03      # trailing stop activates at +3%
+SCALPER_TRAIL_PCT    = 0.015     # trail 1.5% below highest price
+SCALPER_ATR_MULT     = 1.5       # SL = 1.5×ATR
+SCALPER_ATR_PERIOD   = 21        # ATR period — 21 candles smoother than 14, less SL hunting
+SCALPER_SL           = 0.02      # fallback SL if ATR unavailable (2%)
+SCALPER_FLAT_MINS    = 30
+SCALPER_FLAT_RANGE   = 0.005
+SCALPER_ROTATE_GAP   = 20
+SCALPER_MIN_VOL      = 500_000
+SCALPER_MIN_PRICE    = 0.01
+SCALPER_MIN_CHANGE   = 0.1
+SCALPER_THRESHOLD    = 40        # raised from 20 — only take high-quality entries
+SCALPER_MAX_RSI      = 70
+# Breakeven trail — high-confidence trades (score ≥ this) move SL to entry at +1.5%
+# Locks in a no-loss position before the normal trailing stop activates at +3%
+SCALPER_BREAKEVEN_SCORE = 60     # score threshold for fast breakeven
+SCALPER_BREAKEVEN_ACT   = 0.015  # move SL to entry once trade is up this much (+1.5%)
+SCALPER_MIN_1H_VOL      = 50_000 # min $50k USDT volume in last 12×5m candles (~1h)
+                                  # thin pairs gap hard through SL on market sells
+SCALPER_SYMBOL_COOLDOWN = 1800   # seconds before re-entering a symbol after SL (30 min)
+SCALPER_DAILY_LOSS_PCT  = 0.05   # stop new scalper entries if session down >5% of starting balance
 
 # ── Watchlist — universe of pairs pre-scored every 30 minutes ──
 WATCHLIST_SIZE      = 30        # top N pairs by score to trade from
@@ -326,7 +335,7 @@ def _score_for_watchlist(sym: str) -> dict | None:
     vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
     score     = rsi_score + ma_score + vol_score
 
-    atr     = calc_atr(df5m)
+    atr     = calc_atr(df5m, period=SCALPER_ATR_PERIOD)
     atr_pct = atr / float(close.iloc[-1]) if float(close.iloc[-1]) > 0 else 0.015
 
     return {
@@ -423,8 +432,14 @@ def evaluate_scalper_candidate(sym: str) -> dict | None:
     rsi_score = max(0, 40 - rsi) if rsi < 50 else 0
     ema9      = calc_ema(close, 9)
     ema21     = calc_ema(close, 21)
-    crossed   = (ema9.iloc[-1] > ema21.iloc[-1]) and (ema9.iloc[-2] <= ema21.iloc[-2])
-    ma_score  = 30 if crossed else (15 if ema9.iloc[-1] > ema21.iloc[-1] else 0)
+
+    # Only score full 30pts if crossover happened in the last 2 candles (fresh signal).
+    # A crossover from 40 minutes ago has already played out — only give trending credit.
+    crossed_now    = (ema9.iloc[-1] > ema21.iloc[-1]) and (ema9.iloc[-2] <= ema21.iloc[-2])
+    crossed_recent = (ema9.iloc[-2] > ema21.iloc[-2]) and (ema9.iloc[-3] <= ema21.iloc[-3])
+    crossed        = crossed_now or crossed_recent
+    ma_score       = 30 if crossed else (15 if ema9.iloc[-1] > ema21.iloc[-1] else 0)
+
     avg_vol   = volume.iloc[-20:-1].mean()
     vol_ratio = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
     vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
@@ -433,7 +448,14 @@ def evaluate_scalper_candidate(sym: str) -> dict | None:
     if score < SCALPER_THRESHOLD:
         return None
 
-    atr     = calc_atr(df5m)
+    # Liquidity check — reject thin pairs that gap through SL on market sells.
+    # Sum last 12 candles (~1h) × price = recent USDT volume.
+    recent_vol_usdt = float(volume.iloc[-12:].sum()) * float(close.iloc[-1])
+    if recent_vol_usdt < SCALPER_MIN_1H_VOL:
+        log.debug(f"[SCALPER] Skip {sym} — thin (1h vol ${recent_vol_usdt:,.0f} < ${SCALPER_MIN_1H_VOL:,})")
+        return None
+
+    atr     = calc_atr(df5m, period=SCALPER_ATR_PERIOD)
     atr_pct = atr / float(close.iloc[-1]) if float(close.iloc[-1]) > 0 else 0.015
 
     return {
@@ -455,11 +477,13 @@ def find_scalper_opportunity(budget: float, exclude: set, open_symbols: set) -> 
         log.info("🔍 [SCALPER] Watchlist empty — skipping until next rebuild.")
         return None
 
-    # Filter watchlist: exclude open positions, excluded symbols, blacklist
+    # Filter watchlist: exclude open positions, cooldown symbols, blacklist
+    # exclude is now a dict {symbol: cooldown_until_timestamp}
+    now        = time.time()
     candidates = [
         s for s in _watchlist
         if s["symbol"] not in open_symbols
-        and s["symbol"] not in exclude
+        and now >= exclude.get(s["symbol"], 0)
         and s["symbol"] not in _api_blacklist
     ]
 
@@ -908,28 +932,39 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
         tp_status   = "TP + SL bot-monitored ✅ (direct market sell)"
 
     trade = {
-        "label":         label,
-        "symbol":        symbol,
-        "entry_price":   actual_entry,       # actual fill price, not ticker
-        "entry_ticker":  price,              # pre-order ticker for reference
-        "qty":           qty,
-        "budget_used":   actual_cost,        # actual cost from fills
-        "bought_at_ms":  bought_at_ms,       # used to query fills on close
-        "tp_price":      tp_price,
-        "sl_price":      sl_price,
-        "tp_pct":        used_tp_pct,
-        "sl_pct":        actual_sl,
-        "tp_order_id":   tp_order_id,
-        "highest_price": actual_entry,
-        "max_hours":     max_hours,
-        "opened_at":     datetime.now(timezone.utc).isoformat(),
-        "score":         opp.get("score", 0),
-        "rsi":           opp.get("rsi", 0),
+        "label":          label,
+        "symbol":         symbol,
+        "entry_price":    actual_entry,
+        "entry_ticker":   price,
+        "qty":            qty,
+        "budget_used":    actual_cost,
+        "bought_at_ms":   bought_at_ms,
+        "tp_price":       tp_price,
+        "sl_price":       sl_price,
+        "tp_pct":         used_tp_pct,
+        "sl_pct":         actual_sl,
+        "tp_order_id":    tp_order_id,
+        "highest_price":  actual_entry,
+        "max_hours":      max_hours,
+        "opened_at":      datetime.now(timezone.utc).isoformat(),
+        "score":          opp.get("score", 0),
+        "rsi":            opp.get("rsi", 0),
+        # High-confidence trades get fast breakeven: SL moves to entry at +1.5%
+        # preventing a winner from becoming a loser before the trailing stop kicks in
+        "breakeven_act":  SCALPER_BREAKEVEN_ACT if (
+                              label == "SCALPER" and
+                              opp.get("score", 0) >= SCALPER_BREAKEVEN_SCORE
+                          ) else None,
+        "breakeven_done": False,   # flips True once SL has been moved to entry
     }
 
     mode         = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
     icon         = {"SCALPER":"🟢","MOONSHOT":"🌙","REVERSAL":"🔄"}.get(label,"🟢")
     timeout_line = f"Max hold:    {max_hours}h\n" if max_hours else ""
+
+    breakeven_line = ""
+    if trade.get("breakeven_act"):
+        breakeven_line = f"Breakeven:   +{trade['breakeven_act']*100:.1f}% → SL moves to entry 🔒\n"
 
     slippage_line = ""
     if actual_fills.get("avg_buy_price") and abs(actual_entry - price) > 0.000001:
@@ -953,6 +988,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
         f"{slippage_line}"
         f"{tp_display}"
         f"Stop loss:   <b>${sl_price:.6f}</b>  (-{actual_sl*100:.1f}%) [market]\n"
+        f"{breakeven_line}"
         f"{timeout_line}"
         f"{tp_status}\n"
         f"Score: {opp.get('score',0)} | RSI: {opp.get('rsi','?')} | Vol: {opp.get('vol_ratio','?')}x"
@@ -1028,6 +1064,19 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
 
     # SCALPER-specific exits
     if label == "SCALPER":
+        # ── Breakeven trail (high-confidence trades only) ─────────
+        # If score ≥ SCALPER_BREAKEVEN_SCORE and trade is up SCALPER_BREAKEVEN_ACT,
+        # ratchet SL up to entry price — turns a potential loser into a break-even.
+        # This fires once only, before the normal trailing stop activates.
+        breakeven_act = trade.get("breakeven_act")
+        if breakeven_act and not trade.get("breakeven_done") and pct >= breakeven_act * 100:
+            if trade["sl_price"] < trade["entry_price"]:
+                trade["sl_price"]      = trade["entry_price"]
+                trade["breakeven_done"] = True
+                log.info(f"🔒 [{label}] Breakeven locked: {symbol} | {pct:+.2f}% | "
+                         f"SL moved to entry ${trade['entry_price']:.6f}")
+
+        # ── Trailing stop ─────────────────────────────────────────
         if trade["highest_price"] >= trade["entry_price"] * (1 + SCALPER_TRAIL_ACT):
             if price <= trade["highest_price"] * (1 - SCALPER_TRAIL_PCT):
                 log.info(f"📉 [{label}] Trailing stop: {symbol} | {pct:+.2f}%")
@@ -1235,6 +1284,61 @@ def send_heartbeat(balance: float):
         f"<i>/status · /pnl · /logs · /config · /pause · /resume · /close</i>"
     )
 
+# ── Dust conversion ───────────────────────────────────────────
+
+def convert_dust():
+    """
+    Convert all non-USDT spot balances worth less than $1 into MX token.
+    Runs once per day at midnight alongside the daily summary.
+    Skips safely if PAPER_TRADE, or if nothing qualifies.
+    Rules: max 99 assets per call, each < $5 USDT value, 0.2% fee.
+    """
+    if PAPER_TRADE:
+        return
+    try:
+        balances = private_get("/api/v3/account").get("balances", [])
+        dust = []
+        for b in balances:
+            asset = b["asset"]
+            free  = float(b.get("free", 0))
+            if asset in ("USDT", "MX") or free <= 0:
+                continue
+            try:
+                price = float(public_get("/api/v3/ticker/price",
+                                         {"symbol": f"{asset}USDT"})["price"])
+                value = free * price
+                if 0 < value < 1.0:
+                    dust.append(asset)
+            except:
+                pass  # no USDT pair for this asset — skip
+            time.sleep(0.05)
+
+        if not dust:
+            log.info("🧹 Dust sweep: nothing to convert.")
+            return
+
+        log.info(f"🧹 Dust sweep: converting {len(dust)} assets: {dust}")
+        result   = private_post("/api/v3/capital/convert",
+                                {"asset": ",".join(dust[:99])})
+        success  = result.get("successList", [])
+        failed   = result.get("failedList",  [])
+        total_mx = float(result.get("totalConvert", 0))
+        fee_mx   = float(result.get("convertFee",   0))
+
+        log.info(f"🧹 Dust converted: {len(success)} assets → {total_mx:.6f} MX (fee: {fee_mx:.6f} MX)")
+        if success:
+            telegram(
+                f"🧹 <b>Dust Swept</b>\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"Converted: <b>{', '.join(success[:10])}"
+                f"{'...' if len(success) > 10 else ''}</b>\n"
+                f"Received:  <b>{total_mx:.6f} MX</b>\n"
+                f"Fee:       {fee_mx:.6f} MX"
+                + (f"\nFailed:    {', '.join(failed)}" if failed else "")
+            )
+    except Exception as e:
+        log.debug(f"Dust sweep failed: {e}")
+
 # ── Daily summary ─────────────────────────────────────────────
 
 def send_daily_summary(balance: float):
@@ -1244,6 +1348,9 @@ def send_daily_summary(balance: float):
         return
     last_daily_summary = today
     mode = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
+
+    # Sweep dust at midnight alongside the daily summary
+    convert_dust()
 
     if PAPER_TRADE:
         if not trade_history:
@@ -1519,8 +1626,12 @@ def run():
         f"🚀 <b>MEXC Bot Started</b> [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"Balance: <b>${startup_balance:.2f} USDT</b>\n"
         f"\n🟢 <b>Scalper</b> (max {SCALPER_MAX_TRADES} × {SCALPER_BUDGET_PCT*100:.0f}%)\n"
-        f"  TP: ATR×{SCALPER_TP_ATR_MULT:.0f} (2:1 R:R) | SL: ATR×{SCALPER_ATR_MULT}\n"
+        f"  TP: ATR×{SCALPER_TP_ATR_MULT:.0f} (2:1 R:R) | SL: ATR×{SCALPER_ATR_MULT} (period {SCALPER_ATR_PERIOD})\n"
+        f"  Entry threshold: score ≥ {SCALPER_THRESHOLD} | 1h vol ≥ ${SCALPER_MIN_1H_VOL:,}\n"
         f"  Trail: +{SCALPER_TRAIL_ACT*100:.0f}% → {SCALPER_TRAIL_PCT*100:.1f}% trail\n"
+        f"  Breakeven: score ≥ {SCALPER_BREAKEVEN_SCORE} → lock at +{SCALPER_BREAKEVEN_ACT*100:.1f}%\n"
+        f"  Symbol cooldown: {SCALPER_SYMBOL_COOLDOWN//60}min after SL\n"
+        f"  Daily loss limit: -{SCALPER_DAILY_LOSS_PCT*100:.0f}% of balance → circuit breaker\n"
         f"  Watchlist: top {WATCHLIST_SIZE} pairs, refresh every {WATCHLIST_TTL//60}min\n"
         f"\n🌙 <b>Moonshot</b> (max {ALT_MAX_TRADES} trades, 5% each) [bot-monitored]\n"
         f"  TP: +{MOONSHOT_TP*100:.0f}%  SL: -{MOONSHOT_SL*100:.0f}%  max {MOONSHOT_MAX_HOURS}h\n"
@@ -1530,7 +1641,7 @@ def run():
         f"\n<i>/status · /pnl · /logs · /config · /pause · /resume · /close</i>"
     )
 
-    scalper_excluded = set()
+    scalper_excluded = {}   # {symbol: cooldown_until_ts} — 30min cooldown after SL
     alt_excluded     = set()
 
     while True:
@@ -1558,14 +1669,36 @@ def run():
             tickers             = fetch_tickers() if need_scan else None
 
             # Rebuild watchlist every WATCHLIST_TTL seconds (30 min)
-            # Always fetch fresh tickers for rebuild to ensure accuracy
             if time.time() - _watchlist_at >= WATCHLIST_TTL:
                 log.info("📋 Watchlist TTL expired — rebuilding...")
                 build_watchlist(tickers if tickers is not None else fetch_tickers())
 
+            # ── Daily loss circuit breaker ────────────────────────
+            today        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            daily_pnl    = sum(t["pnl_usdt"] for t in trade_history
+                               if t.get("closed_at","")[:10] == today)
+            loss_limit   = -(startup_balance * SCALPER_DAILY_LOSS_PCT)
+            circuit_open = daily_pnl < loss_limit
+            # Only log circuit state once every 5 minutes to avoid spam at 2s sleep
+            if circuit_open and int(time.time()) % 300 < 3:
+                log.info(f"🛑 Daily loss limit active (${daily_pnl:.2f} < ${loss_limit:.2f}) "
+                         f"— no new scalper entries today")
+            # Send Telegram alert exactly once when limit is first hit
+            if circuit_open and not getattr(run, "_circuit_alerted_today", ""):
+                run._circuit_alerted_today = today
+                telegram(
+                    f"🛑 <b>Daily loss limit hit</b>\n"
+                    f"Session P&L: <b>${daily_pnl:.2f}</b> (limit: ${loss_limit:.2f})\n"
+                    f"No new scalper entries until midnight UTC.\n"
+                    f"Open positions are still monitored."
+                )
+            elif not circuit_open:
+                run._circuit_alerted_today = ""  # reset for tomorrow
+
             # ── Scalper ───────────────────────────────────────
-            budget = round(balance * SCALPER_BUDGET_PCT, 2)  # always defined
-            if not _paused and len(scalper_trades) < SCALPER_MAX_TRADES:
+            budget = round(balance * SCALPER_BUDGET_PCT, 2)  # always defined before both branches
+
+            if not _paused and not circuit_open and len(scalper_trades) < SCALPER_MAX_TRADES:
                 opp = find_scalper_opportunity(budget,
                                                exclude=scalper_excluded,
                                                open_symbols=open_symbols)
@@ -1575,13 +1708,14 @@ def run():
                                            "SCALPER", sl_override_pct=sl_atr)
                     if trade:
                         scalper_trades.append(trade)
-                        scalper_excluded = set()
+                        # Only remove THIS symbol's cooldown — other symbols keep theirs
+                        scalper_excluded.pop(opp["symbol"], None)
             else:
-                # At max capacity — check for rotation but only every ROTATION_SCAN_INTERVAL seconds
+                # At max capacity (or circuit open) — check for rotation every ROTATION_SCAN_INTERVAL
                 now        = time.time()
                 best_opp   = None
                 best_score = 0
-                if now - _last_rotation_scan >= ROTATION_SCAN_INTERVAL:
+                if not circuit_open and now - _last_rotation_scan >= ROTATION_SCAN_INTERVAL:
                     _last_rotation_scan = now
                     best_opp   = find_scalper_opportunity(budget,
                                                           exclude=scalper_excluded,
@@ -1598,7 +1732,13 @@ def run():
 
                     should_exit, reason = check_exit(trade, best_score=s_arg)
                     if should_exit:
-                        scalper_excluded.add(trade["symbol"])
+                        # SL/hard exits: add 30min cooldown. Rotation/TP: no penalty.
+                        if reason in ("STOP_LOSS", "TRAILING_STOP", "FLAT_EXIT"):
+                            scalper_excluded[trade["symbol"]] = (
+                                time.time() + SCALPER_SYMBOL_COOLDOWN
+                            )
+                            log.info(f"⏳ [SCALPER] {trade['symbol']} in cooldown "
+                                     f"for {SCALPER_SYMBOL_COOLDOWN//60}min after {reason}")
                         if close_position(trade, reason):
                             scalper_trades.remove(trade)
                             if reason == "ROTATION" and best_opp:
@@ -1608,7 +1748,7 @@ def run():
                                                        sl_override_pct=sl_atr)
                                 if new_t:
                                     scalper_trades.append(new_t)
-                                    scalper_excluded = set()
+                                    scalper_excluded.pop(best_opp["symbol"], None)
 
             # ── Alt (Moonshot / Reversal) ─────────────────────
             if not _paused and len(alt_trades) < ALT_MAX_TRADES:
@@ -1649,7 +1789,15 @@ def run():
             send_daily_summary(balance)
             send_weekly_summary(balance)
             listen_for_commands(balance)
-            time.sleep(5 if (scalper_trades or alt_trades) else SCAN_INTERVAL)
+            # Scalper checks every 2s (thin altcoins can spike fast)
+            # Alt trades every 5s (longer hold, less time-sensitive)
+            # No open positions: full SCAN_INTERVAL before next scan
+            if scalper_trades:
+                time.sleep(2)
+            elif alt_trades:
+                time.sleep(5)
+            else:
+                time.sleep(SCAN_INTERVAL)
 
         except KeyboardInterrupt:
             log.info("🛑 Stopped.")
