@@ -293,6 +293,49 @@ def pick_tradeable(candidates: list, budget: float, label: str) -> dict | None:
     return None
 
 
+def _score_for_watchlist(sym: str) -> dict | None:
+    """
+    Like evaluate_scalper_candidate but WITHOUT the score threshold cut-off.
+    Used only for building the watchlist — we want a wide pool to monitor.
+    Actual entry decisions re-score the top 5 with evaluate_scalper_candidate,
+    which does apply the threshold.
+    """
+    df_1h = parse_klines(sym, interval="60m", limit=60)
+    if df_1h is None:
+        return None
+    if float(df_1h["close"].iloc[-1]) < calc_ema(df_1h["close"], 50).iloc[-1]:
+        return None
+
+    df5m = parse_klines(sym, interval="5m", limit=60)
+    if df5m is None:
+        return None
+
+    close  = df5m["close"]
+    volume = df5m["volume"]
+    rsi    = calc_rsi(close)
+    if np.isnan(rsi) or rsi > SCALPER_MAX_RSI:
+        return None
+
+    rsi_score = max(0, 40 - rsi) if rsi < 50 else 0
+    ema9      = calc_ema(close, 9)
+    ema21     = calc_ema(close, 21)
+    crossed   = (ema9.iloc[-1] > ema21.iloc[-1]) and (ema9.iloc[-2] <= ema21.iloc[-2])
+    ma_score  = 30 if crossed else (15 if ema9.iloc[-1] > ema21.iloc[-1] else 0)
+    avg_vol   = volume.iloc[-20:-1].mean()
+    vol_ratio = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
+    vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
+    score     = rsi_score + ma_score + vol_score
+
+    atr     = calc_atr(df5m)
+    atr_pct = atr / float(close.iloc[-1]) if float(close.iloc[-1]) > 0 else 0.015
+
+    return {
+        "symbol": sym, "score": round(score, 2), "rsi": round(rsi, 2),
+        "vol_ratio": round(vol_ratio, 2), "price": float(close.iloc[-1]),
+        "atr_pct": round(atr_pct, 6),
+    }
+
+
 def build_watchlist(tickers: pd.DataFrame):
     """
     Score ALL eligible pairs and cache the top WATCHLIST_SIZE scorers.
@@ -321,18 +364,29 @@ def build_watchlist(tickers: pd.DataFrame):
             established.append(sym)
         time.sleep(0.05)
 
-    # Score all in parallel
+    # Score all in parallel.
+    # For watchlist building we use a lower threshold (half of entry threshold) so we
+    # always have a pool of candidates to monitor even in quieter market conditions.
+    # The entry scorer (find_scalper_opportunity) re-evaluates top 5 with fresh data anyway.
+    WATCHLIST_MIN_SCORE = max(5, SCALPER_THRESHOLD // 2)
     scores = []
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(evaluate_scalper_candidate, sym): sym for sym in established}
+        futures = {ex.submit(_score_for_watchlist, sym): sym for sym in established}
         for f in as_completed(futures):
             result = f.result()
-            if result:
+            if result and result["score"] >= WATCHLIST_MIN_SCORE:
                 scores.append(result)
 
     scores.sort(key=lambda x: x["score"], reverse=True)
     _watchlist    = scores[:WATCHLIST_SIZE]
     _watchlist_at = time.time()
+
+    if not _watchlist:
+        # Nothing qualified — retry in 5 min instead of waiting full TTL
+        _watchlist_at = time.time() - WATCHLIST_TTL + 300
+        log.warning("📋 [WATCHLIST] No pairs qualified — retrying in 5 min.")
+        scanner_log("📋 Watchlist empty — will retry in 5min (market conditions)")
+        return
 
     symbols = [s["symbol"] for s in _watchlist]
     log.info(f"📋 [WATCHLIST] {len(_watchlist)} pairs selected: {', '.join(symbols[:8])}{'...' if len(symbols) > 8 else ''}")
