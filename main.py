@@ -7,8 +7,9 @@ MEXC Trading Bot — 3 Strategies
      Moonshot and Reversal share the alt slot.
 """
 
-import time, hmac, hashlib, logging, requests, math, json, os
+import time, hmac, hashlib, logging, requests, math, json, os, threading, collections, re
 import urllib.parse
+from decimal import Decimal, ROUND_DOWN
 import pandas as pd
 import numpy as np
 from collections import defaultdict, Counter
@@ -28,13 +29,10 @@ PAPER_BALANCE = 50.0
 # ── Scalper (max 3 concurrent) ────────────────────────────────
 SCALPER_MAX_TRADES   = 3
 SCALPER_BUDGET_PCT   = 0.30
-SCALPER_TP_ATR_MULT  = 3.0       # TP = 3×ATR (vs SL = 1.5×ATR → guaranteed 2:1 R:R)
-SCALPER_TP_LIMIT     = 0.10      # fallback TP if ATR unavailable (+10%)
 SCALPER_TRAIL_ACT    = 0.03      # trailing stop activates at +3%
 SCALPER_TRAIL_PCT    = 0.015     # trail 1.5% below highest price
-SCALPER_ATR_MULT     = 1.5       # SL = 1.5×ATR
+SCALPER_ATR_MULT     = 1.5       # EMA21 distance fallback multiplier in dynamic SL
 SCALPER_ATR_PERIOD   = 21        # ATR period — 21 candles smoother than 14, less SL hunting
-SCALPER_SL           = 0.02      # fallback SL if ATR unavailable (2%)
 SCALPER_FLAT_MINS    = 30
 SCALPER_FLAT_RANGE   = 0.005
 SCALPER_ROTATE_GAP   = 20
@@ -43,6 +41,7 @@ SCALPER_MIN_PRICE    = 0.01
 SCALPER_MIN_CHANGE   = 0.1
 SCALPER_THRESHOLD    = 40        # raised from 20 — only take high-quality entries
 SCALPER_MAX_RSI      = 70
+WATCHLIST_MIN_SCORE  = max(5, SCALPER_THRESHOLD // 2)  # wide net for watchlist candidates
 # Breakeven trail — high-confidence trades (score ≥ this) move SL to entry at +1.5%
 # Locks in a no-loss position before the normal trailing stop activates at +3%
 SCALPER_BREAKEVEN_SCORE = 60     # score threshold for fast breakeven
@@ -51,6 +50,25 @@ SCALPER_MIN_1H_VOL      = 50_000 # min $50k USDT volume in last 12×5m candles (
                                   # thin pairs gap hard through SL on market sells
 SCALPER_SYMBOL_COOLDOWN = 1800   # seconds before re-entering a symbol after SL (30 min)
 SCALPER_DAILY_LOSS_PCT  = 0.05   # stop new scalper entries if session down >5% of starting balance
+
+# ── Dynamic TP — signal-aware, reality-capped ─────────────────
+# Multiplier varies by what's driving the entry signal
+SCALPER_TP_MULT_CROSSOVER = 2.5  # fresh EMA crossover — early in the move, room to run
+SCALPER_TP_MULT_VOL_SPIKE = 1.8  # large vol spike — strong but often exhausts fast
+SCALPER_TP_MULT_OVERSOLD  = 2.2  # RSI oversold bounce — moderate mean-reversion target
+SCALPER_TP_MULT_DEFAULT   = 2.0  # trending entry, no dominant single signal
+SCALPER_TP_CANDLE_MULT    = 4.0  # cap = N × avg candle body (reality check)
+SCALPER_TP_MIN            = 0.015 # floor 1.5% — anything tighter isn't worth fees
+SCALPER_TP_MAX            = 0.08  # ceiling 8% — replaces the old 10% hard cap
+
+# ── Dynamic SL — signal-aware, noise-floored ──────────────────
+SCALPER_SL_MULT_VOL_SPIKE = 1.0  # tight — cut fast if vol spike turns fake
+SCALPER_SL_MULT_OVERSOLD  = 1.0  # tight — oversold can always deepen
+SCALPER_SL_MULT_HIGH_CONF = 1.8  # high-confidence multi-signal — give it room
+SCALPER_SL_MULT_DEFAULT   = 1.3  # standard trending entry
+SCALPER_SL_NOISE_MULT     = 2.0  # SL must be ≥ N × avg candle body (noise floor)
+SCALPER_SL_MAX            = 0.04  # hard ceiling 4% — never risk more than this
+SCALPER_SL_MIN            = 0.008 # hard floor 0.8% — fees kill anything tighter
 
 # ── Watchlist — universe of pairs pre-scored every 30 minutes ──
 WATCHLIST_SIZE      = 30        # top N pairs by score to trade from
@@ -65,28 +83,79 @@ MOONSHOT_MAX_VOL    = 500_000
 MOONSHOT_MIN_VOL    = 5_000
 MOONSHOT_MIN_1H     = 5.0
 MOONSHOT_MIN_SCORE  = 20
-MOONSHOT_MAX_HOURS  = 1
+MOONSHOT_MAX_HOURS  = 2   # absolute ceiling — matches MOONSHOT_TIMEOUT_MAX_MINS
 MOONSHOT_MIN_DAYS   = 2
 MOONSHOT_NEW_DAYS   = 14
 MOONSHOT_MIN_VOL_BURST = 2.5
 
+# ── Moonshot graduated timeout ─────────────────────────────────
+# Hard clock replaced with P&L-aware timeouts:
+MOONSHOT_TIMEOUT_FLAT_MINS   = 30    # exit if pct < 0.5% after this many minutes
+MOONSHOT_TIMEOUT_MARGINAL_MINS= 60   # exit if pct < 3.0% after this many minutes
+MOONSHOT_TIMEOUT_MAX_MINS    = 120   # absolute ceiling regardless of P&L
+# Mid-hold vol re-check — if volume collapses the pump is over
+MOONSHOT_VOL_CHECK_MINS      = 15    # start checking vol after this many minutes held
+MOONSHOT_VOL_COLLAPSE_RATIO  = 0.5   # exit if current vol < 50% of avg AND trade barely up
+# Partial TP — capture first leg reliably, let remainder run to full target
+MOONSHOT_PARTIAL_TP_PCT      = 0.06  # sell first half at +6%
+MOONSHOT_PARTIAL_TP_RATIO    = 0.50  # fraction to sell at stage 1 (50%)
+
 # ── Reversal ──────────────────────────────────────────────────
-REVERSAL_TP         = 0.040     # +4% (was +3% — better R:R at 2:1)
-REVERSAL_SL         = 0.020     # -2% unchanged
-REVERSAL_MIN_VOL    = 100_000
-REVERSAL_MAX_RSI    = 32
-REVERSAL_MIN_DROP   = 3.0
-REVERSAL_MAX_HOURS  = 2         # tightened from 4h — if no bounce in 2h, exit
+REVERSAL_TP              = 0.040  # +4%
+REVERSAL_SL              = 0.020  # -2% fallback (overridden by cap-candle anchor)
+REVERSAL_MIN_VOL         = 100_000
+REVERSAL_MAX_RSI         = 32
+REVERSAL_MIN_DROP        = 3.0
+REVERSAL_MAX_HOURS       = 2
+REVERSAL_BOUNCE_RECOVERY = 0.30   # current candle must reclaim ≥30% of prior red candle body
+REVERSAL_VOL_RECOVERY    = 1.20   # bounce candle volume must be ≥ 1.2× 20-candle avg
+                                   # (confirms buyers stepping in, not just dead-cat)
+REVERSAL_CAP_SL_BUFFER   = 0.005  # place SL 0.5% below capitulation candle low
+# Partial TP — capture reliable first bounce leg, protect remainder at breakeven
+REVERSAL_PARTIAL_TP_PCT  = 0.025  # sell first half at +2.5%
+REVERSAL_PARTIAL_TP_RATIO= 0.50   # fraction to sell at stage 1 (50%)
 
 # ── Shared ────────────────────────────────────────────────────
 MIN_PRICE         = 0.001
 SCAN_INTERVAL     = 60
-# MIN_ALT_BUDGET is calculated at startup from actual balance (10% of starting balance)
-# e.g. $50 account → $5 minimum, $200 account → $20 minimum
-MIN_ALT_BUDGET    = None  # set in run() after fetching balance
+STATE_FILE        = "state.json"  # persists open positions + history across restarts
 
 TELEGRAM_TOKEN   = "8729639207:AAGR2ytuX36ocCVagQj-tGBE2QEkvrTiqQo"
 TELEGRAM_CHAT_ID = "7058246374"
+
+# ── HTTP reliability ───────────────────────────────────────────
+HTTP_RETRIES           = 3        # retry GET requests this many times
+HTTP_RETRY_DELAY       = 1.0     # base backoff seconds (doubles each retry)
+HTTP_TRANSIENT_CODES   = {429, 500, 502, 503, 504}  # retry on these
+KLINE_CACHE_TTL        = 30      # seconds to cache kline data — avoids duplicate
+                                  # fetches when evaluate and score run close together
+MAX_KLINE_CACHE        = 500     # evict stale entries when cache exceeds this size
+
+# ── API health ─────────────────────────────────────────────────
+API_FAIL_THRESHOLD     = 5       # consecutive failures before escalating sleep
+API_FAIL_SLEEP_BASE    = 30      # base sleep seconds on repeated API failure
+API_FAIL_SLEEP_MAX     = 300     # max sleep seconds (5 min cap)
+FILL_QTY_TOLERANCE     = 1.02   # sell qty capped at buy qty × this (2% for fee rounding)
+
+# ── Entry quality gates ────────────────────────────────────────
+SCALPER_MAX_SPREAD     = 0.004   # skip pair if bid/ask spread > 0.4% (slippage risk)
+SCALPER_MAX_CORRELATION= 0.85    # skip if 20-candle return correlation with open
+                                  # position > 0.85 (avoids correlated simultaneous SLs)
+SCALPER_MIN_ATR_PCT    = 0.003   # skip pair if ATR/price < 0.3% — choppy, TP unreachable
+MAX_CONSECUTIVE_LOSSES = 3       # pause scalper entries after this many SLs in a row
+WIN_RATE_CB_WINDOW     = 10      # look back this many full (non-partial) trades
+WIN_RATE_CB_THRESHOLD  = 0.30    # pause all entries if win rate < 30% over that window
+WIN_RATE_CB_PAUSE_MINS = 60      # how long to pause (minutes)
+MAX_EXPOSURE_PCT       = 0.80    # skip new entries if open positions > 80% of balance
+MOONSHOT_MAX_SPREAD    = 0.008   # skip moonshot if spread > 0.8% — pump entries fill worse
+
+# ── BTC regime filter ──────────────────────────────────────────
+# If BTC drops sharply in the last 5m candle the whole market is risk-off.
+# Entering a scalper position in that window almost guarantees an SL trigger.
+BTC_REGIME_DROP        = 0.02    # pause if BTC last 5m candle < -2%
+BTC_REGIME_EMA_PERIOD  = 20      # also pause if price is below this EMA (micro-downtrend)
+BTC_REGIME_VOL_MULT    = 2.0     # also pause if BTC ATR > N× its own 20-candle average
+                                  # (volatility spike — unpredictable whipsaws)
 
 # ── AI Sentiment ──────────────────────────────────────────────
 # Claude Haiku searches for latest news and returns a score -1.0 to +1.0.
@@ -124,8 +193,7 @@ _symbol_rules         = {}
 _symbol_rules_fetched = False
 _symbol_rules_at      = 0
 _api_blacklist        = set()
-_scanner_log_buffer   = []
-_MAX_SCANNER_LOGS     = 5
+_scanner_log_buffer   = collections.deque(maxlen=5)  # rolling window, auto-evicts oldest
 _paused               = False
 
 # Rotation scan cooldown — don't hammer 40+ API calls every 5s
@@ -142,27 +210,123 @@ NEW_LISTINGS_CACHE_TTL = 300  # seconds
 _watchlist             = []   # list of scored candidate dicts
 _watchlist_at          = 0.0  # timestamp of last full rebuild
 
-# Sentiment cache — {symbol: (score_float, fetched_at_timestamp)}
-# Avoids calling Claude API on every scan cycle for the same coin
+# Sentiment cache — {symbol: (score_float, summary, fetched_at_timestamp)}
 _sentiment_cache: dict = {}
+_sentiment_lock        = threading.Lock()  # protects writes; reads are safe without lock
+
+# Kline cache — {(symbol, interval, limit): (df, fetched_at)}
+# Short TTL so evaluate + score don't double-fetch the same data
+_kline_cache: dict = {}
+_kline_cache_lock  = threading.Lock()  # protects writes from 8-thread watchlist builder
+
+# Thread-local HTTP sessions — requests.Session is NOT thread-safe.
+# Each thread gets its own session for connection pooling without contention.
+_thread_local = threading.local()
+
+# API health tracking — detect sustained outages and escalate sleep
+_api_fail_count   = 0    # consecutive public_get failures (reset on success)
+_api_fail_alerted = False # True once we've sent the "MEXC down?" Telegram message
+
+# Consecutive loss streak — pause scalper entries after MAX_CONSECUTIVE_LOSSES SLs
+# Complements daily circuit breaker: catches short bad-regime windows, not just daily limit
+_consecutive_losses   = 0
+_win_rate_pause_until = 0.0  # epoch ts; all entries blocked until this if win rate too low
+
+# Semaphore for moonshot parallel scan — limits concurrent kline fetches to avoid 429s
+_moonshot_scan_sem = threading.Semaphore(5)
+
+# Exclusion dicts — module-level so save_state() always has access to current values
+# without needing them passed as arguments from run()
+_scalper_excluded: dict = {}  # {symbol: cooldown_until_ts}
+_alt_excluded:     set  = set()
+
+# ── State persistence ──────────────────────────────────────────
+
+def save_state():
+    """
+    Atomically persist all runtime state to STATE_FILE.
+    Called after every open_position, execute_partial_tp, close_position, and on shutdown.
+    On restart, load_state() re-hydrates from this file so monitoring continues.
+    """
+    try:
+        payload = {
+            "scalper_trades":       scalper_trades,
+            "alt_trades":           alt_trades,
+            "trade_history":        trade_history,
+            "consecutive_losses":   _consecutive_losses,
+            "win_rate_pause_until": _win_rate_pause_until,
+            "scalper_excluded":     _scalper_excluded,
+            "alt_excluded":         list(_alt_excluded),
+            "saved_at":             datetime.now(timezone.utc).isoformat(),
+        }
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, default=str)
+        os.replace(tmp, STATE_FILE)  # atomic on POSIX; avoids corrupt half-writes
+    except Exception as e:
+        log.warning(f"State save failed: {e}")
+
+
+def load_state() -> tuple[list, list, list, int, float, dict, set]:
+    """
+    Load persisted state from STATE_FILE.
+    Returns (scalper_trades, alt_trades, trade_history,
+             consecutive_losses, win_rate_pause_until,
+             scalper_excluded, alt_excluded).
+    Returns empty defaults if file is missing or unreadable.
+    """
+    try:
+        if not os.path.exists(STATE_FILE):
+            return [], [], [], 0, 0.0, {}, set()
+        with open(STATE_FILE) as f:
+            d = json.load(f)
+        age = (datetime.now(timezone.utc) -
+               datetime.fromisoformat(d.get("saved_at", "2000-01-01T00:00:00+00:00"))
+               ).total_seconds()
+        log.info(f"📂 Loading state (saved {age/60:.0f}min ago): "
+                 f"{len(d.get('scalper_trades',[]))} scalper, "
+                 f"{len(d.get('alt_trades',[]))} alt trades, "
+                 f"{len(d.get('trade_history',[]))} history entries")
+        return (
+            d.get("scalper_trades",       []),
+            d.get("alt_trades",           []),
+            d.get("trade_history",        []),
+            d.get("consecutive_losses",   0),
+            d.get("win_rate_pause_until", 0.0),
+            d.get("scalper_excluded",     {}),
+            set(d.get("alt_excluded",     [])),
+        )
+    except Exception as e:
+        log.warning(f"State load failed ({e}) — starting fresh")
+        return [], [], [], 0, 0.0, {}, set()
+
+def _get_session() -> requests.Session:
+    """Return a thread-local requests.Session, creating one if needed."""
+    if not hasattr(_thread_local, "session"):
+        s = requests.Session()
+        s.headers.update({"Accept": "application/json"})
+        _thread_local.session = s
+    return _thread_local.session
 
 # ── Telegram ───────────────────────────────────────────────────
 
 def telegram(msg: str):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=8,
-        )
-    except Exception as e:
-        log.warning(f"Telegram send failed: {e}")
+    """Send a Telegram message. Uses thread-local session + one retry on failure."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+    for attempt in range(2):  # one retry — Telegram occasionally drops messages
+        try:
+            _get_session().post(url, json=payload, timeout=8)
+            return
+        except Exception as e:
+            if attempt == 0:
+                log.debug(f"Telegram send failed, retrying: {e}")
+                time.sleep(1)
+            else:
+                log.warning(f"Telegram send failed after retry: {e}")
 
 def scanner_log(msg: str):
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    _scanner_log_buffer.append(f"[{ts}] {msg}")
-    while len(_scanner_log_buffer) > _MAX_SCANNER_LOGS:
-        _scanner_log_buffer.pop(0)
+    _scanner_log_buffer.append(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {msg}")
     log.info(msg)
 
 
@@ -193,7 +357,7 @@ def get_sentiment(symbol: str) -> tuple[float | None, str]:
 
     coin = symbol.replace("USDT", "").strip()
     try:
-        response = requests.post(
+        response = _get_session().post(
             "https://api.anthropic.com/v1/messages",
             headers={
                 "x-api-key":         ANTHROPIC_API_KEY,
@@ -233,14 +397,26 @@ def get_sentiment(symbol: str) -> tuple[float | None, str]:
         if not text:
             return None, ""
 
-        # Strip any accidental markdown fences
+        # Strip markdown fences, then use regex to find the first {...} JSON object.
+        # This handles preamble text like "Here is the sentiment: {...}" that breaks
+        # a direct json.loads() call even after stripping fences.
         text = text.replace("```json", "").replace("```", "").strip()
-        parsed  = json.loads(text)
+        m = re.search(r'\{[^{}]+\}', text, re.DOTALL)
+        if not m:
+            log.debug(f"🧠 No JSON object found in sentiment response [{coin}]: {text[:120]}")
+            return None, ""
+        try:
+            parsed = json.loads(m.group())
+        except json.JSONDecodeError:
+            log.debug(f"🧠 Bad sentiment JSON from Haiku [{coin}]: {m.group()[:120]}")
+            return None, ""
+
         score   = float(parsed["score"])
         summary = str(parsed.get("summary", ""))
         score   = max(-1.0, min(1.0, score))  # clamp to valid range
 
-        _sentiment_cache[symbol] = (score, summary, time.time())
+        with _sentiment_lock:
+            _sentiment_cache[symbol] = (score, summary, time.time())
         log.info(f"🧠 Sentiment [{coin}]: {score:+.2f} — {summary}")
         return score, summary
 
@@ -270,23 +446,99 @@ def sentiment_score_adjustment(symbol: str) -> tuple[float, str]:
     return delta, label
 
 def public_get(path, params=None):
-    r = requests.get(BASE_URL + path, params=params or {}, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    """GET with retry on transient errors (5xx, 429, network timeouts).
+    Tracks consecutive failures and escalates sleep + sends Telegram on sustained outage."""
+    global _api_fail_count, _api_fail_alerted
+    url = BASE_URL + path
+    for attempt in range(HTTP_RETRIES):
+        try:
+            r = _get_session().get(url, params=params or {}, timeout=10)
+            if r.status_code in HTTP_TRANSIENT_CODES:
+                if attempt < HTTP_RETRIES - 1:
+                    wait = (2 ** attempt) * HTTP_RETRY_DELAY
+                    if r.status_code == 429:
+                        wait = max(wait, float(r.headers.get("Retry-After", wait)))
+                    log.debug(f"HTTP {r.status_code} on GET {path} — retry {attempt+1} in {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+            r.raise_for_status()
+            # Success — reset failure tracking
+            if _api_fail_count > 0:
+                log.info(f"✅ MEXC API recovered after {_api_fail_count} failures")
+            _api_fail_count   = 0
+            _api_fail_alerted = False
+            return r.json()
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if attempt < HTTP_RETRIES - 1:
+                wait = (2 ** attempt) * HTTP_RETRY_DELAY
+                log.debug(f"Network error on GET {path} — retry {attempt+1} in {wait:.1f}s: {e}")
+                time.sleep(wait)
+            else:
+                _api_fail_count += 1
+                sleep_secs = min(API_FAIL_SLEEP_BASE * _api_fail_count, API_FAIL_SLEEP_MAX)
+                log.warning(f"⚠️ MEXC API fail #{_api_fail_count} — sleeping {sleep_secs}s")
+                if _api_fail_count >= API_FAIL_THRESHOLD and not _api_fail_alerted:
+                    _api_fail_alerted = True
+                    telegram(
+                        f"⚠️ <b>MEXC API unreachable</b>\n"
+                        f"{_api_fail_count} consecutive failures on {path}\n"
+                        f"Bot is pausing between retries. Open positions still monitored."
+                    )
+                time.sleep(sleep_secs)
+                raise
+    raise requests.RequestException(f"GET {path} failed after {HTTP_RETRIES} attempts")
 
-def private_request(method, path, params=None):
-    params = params or {}
-    params["timestamp"] = int(time.time() * 1000)
-    qs        = urllib.parse.urlencode(params)
-    signature = hmac.new(MEXC_API_SECRET.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
+def _sign_request(params: dict, path: str) -> tuple[str, dict]:
+    """Build a signed URL + headers for a private MEXC endpoint. Always uses fresh timestamp."""
+    p         = {**params, "timestamp": int(time.time() * 1000)}  # never mutate caller's dict
+    qs        = urllib.parse.urlencode(p)
+    signature = hmac.new(MEXC_API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
     url       = f"{BASE_URL}{path}?{qs}&signature={signature}"
     headers   = {"X-MEXC-APIKEY": MEXC_API_KEY}
-    if   method == "GET":    r = requests.get(url,    headers=headers, timeout=10)
-    elif method == "POST":   r = requests.post(url,   headers=headers, timeout=10)
-    elif method == "DELETE": r = requests.delete(url, headers=headers, timeout=10)
-    else: raise ValueError(f"Unsupported method: {method}")
-    r.raise_for_status()
-    return r.json()
+    return url, headers
+
+def private_request(method, path, params=None):
+    """
+    Signed MEXC API request.
+    GET: retries with fresh timestamp on transient errors (safe — read-only).
+    POST/DELETE: single attempt — order actions must never be duplicated.
+    """
+    params  = params or {}
+    session = _get_session()
+
+    if method == "GET":
+        for attempt in range(HTTP_RETRIES):
+            url, headers = _sign_request(params, path)
+            try:
+                r = session.get(url, headers=headers, timeout=10)
+                if r.status_code in HTTP_TRANSIENT_CODES and attempt < HTTP_RETRIES - 1:
+                    wait = (2 ** attempt) * HTTP_RETRY_DELAY
+                    if r.status_code == 429:
+                        wait = max(wait, float(r.headers.get("Retry-After", wait)))
+                    log.debug(f"HTTP {r.status_code} on private GET {path} — retry in {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                return r.json()
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt < HTTP_RETRIES - 1:
+                    wait = (2 ** attempt) * HTTP_RETRY_DELAY
+                    log.debug(f"Network error on private GET {path} — retry in {wait:.1f}s: {e}")
+                    time.sleep(wait)
+                else:
+                    raise
+    elif method == "POST":
+        url, headers = _sign_request(params, path)
+        r = session.post(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    elif method == "DELETE":
+        url, headers = _sign_request(params, path)
+        r = session.delete(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    else:
+        raise ValueError(f"Unsupported method: {method}")
 
 def private_get(path, params=None):    return private_request("GET",    path, params)
 def private_post(path, params=None):   return private_request("POST",   path, params)
@@ -331,18 +583,31 @@ def get_symbol_rules(symbol):
     return 1.0, 1.0, 1.0, None
 
 def round_price_to_tick(price: float, tick_size) -> float:
+    """Round price down to nearest tick using Decimal to avoid float precision errors."""
     if not tick_size or float(tick_size) == 0:
         return round(price, 8)
-    tick_str = tick_size.rstrip("0") or "1"
-    decimals = len(tick_str.split(".")[1]) if "." in tick_str else 0
-    return round(int(price / float(tick_size)) * float(tick_size), decimals)
+    d_price = Decimal(str(price))
+    d_tick  = Decimal(str(tick_size))
+    rounded = (d_price / d_tick).to_integral_value(rounding=ROUND_DOWN) * d_tick
+    # Derive decimal places directly from the Decimal exponent — handles all representations
+    # including scientific notation (e.g. 1e-6) and trailing zeros (e.g. 0.00000100)
+    decimals = max(0, -rounded.normalize().as_tuple().exponent)
+    return round(float(rounded), decimals)
 
 def calc_qty(budget: float, price: float, step_size: float) -> float:
-    raw      = budget / price
-    floored  = math.floor(raw / step_size) * step_size
-    step_str = str(step_size).rstrip("0")
-    decimals = len(step_str.split(".")[1]) if "." in step_str else 0
-    return round(floored, decimals)
+    """
+    Calculate floored quantity using Decimal to avoid float representation errors.
+    e.g. math.floor(100.0 / 0.1) = floor(999.999...) = 999 due to float imprecision.
+    Decimal("100.0") / Decimal("0.1") = exactly 1000.
+    """
+    if price <= 0 or step_size <= 0:
+        return 0.0
+    d_budget = Decimal(str(budget))
+    d_price  = Decimal(str(price))
+    d_step   = Decimal(str(step_size))
+    raw      = d_budget / d_price
+    floored  = (raw / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step
+    return float(floored)
 
 # ── Balance ────────────────────────────────────────────────────
 
@@ -373,6 +638,8 @@ def calc_ema(series, span) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 def calc_atr(df: pd.DataFrame, period=14) -> float:
+    """True Range with Wilder's smoothing (EWM alpha=1/period).
+    Adapts faster than simple rolling mean — tighter SLs after pump exhaustion."""
     high       = df["high"]
     low        = df["low"]
     prev_close = df["close"].shift(1)
@@ -381,13 +648,25 @@ def calc_atr(df: pd.DataFrame, period=14) -> float:
         (high - prev_close).abs(),
         (low  - prev_close).abs(),
     ], axis=1).max(axis=1)
-    atr = tr.rolling(period).mean().iloc[-1]
+    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean().iloc[-1]
     return float(atr) if not np.isnan(atr) else 0.0
 
 def parse_klines(symbol, interval="5m", limit=60, min_len=30) -> pd.DataFrame | None:
+    # Short-TTL cache — avoids duplicate fetches when evaluate and score
+    # run within seconds of each other on the same symbol
+    cache_key = (symbol, interval, limit)
+    cached    = _kline_cache.get(cache_key)
+    if cached:
+        df_cached, fetched_at = cached
+        if time.time() - fetched_at < KLINE_CACHE_TTL:
+            return df_cached if (df_cached is not None and len(df_cached) >= min_len) else None
+
+    df = None
     try:
         data = public_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
         if not data:
+            with _kline_cache_lock:
+                _kline_cache[cache_key] = (None, time.time())
             return None
         df = pd.DataFrame(data)
         df.columns = range(len(df.columns))
@@ -395,10 +674,27 @@ def parse_klines(symbol, interval="5m", limit=60, min_len=30) -> pd.DataFrame | 
         for col in ["open","high","low","close","volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["close","volume"])
-        return df if len(df) >= min_len else None
+        if len(df) < min_len:
+            df = None
     except Exception as e:
         log.debug(f"Klines error {symbol}/{interval}: {e}")
-        return None
+        df = None
+
+    with _kline_cache_lock:
+        # Evict stale entries if cache is too large — prefer eviction over blind clear
+        # so that still-valid entries survive
+        if len(_kline_cache) >= MAX_KLINE_CACHE:
+            now        = time.time()
+            stale_keys = [k for k, (_, t) in _kline_cache.items()
+                          if now - t > KLINE_CACHE_TTL]
+            for k in stale_keys:
+                del _kline_cache[k]
+            # If nothing was stale (all fresh), clear half to prevent runaway growth
+            if len(_kline_cache) >= MAX_KLINE_CACHE:
+                for k in list(_kline_cache.keys())[:MAX_KLINE_CACHE // 2]:
+                    del _kline_cache[k]
+        _kline_cache[cache_key] = (df, time.time())
+    return df
 
 def fetch_tickers() -> pd.DataFrame:
     data = public_get("/api/v3/ticker/24hr")
@@ -421,12 +717,13 @@ def pick_tradeable(candidates: list, budget: float, label: str) -> dict | None:
     return None
 
 
-def _score_for_watchlist(sym: str) -> dict | None:
+def _score_scalper(sym: str, strict: bool = False) -> dict | None:
     """
-    Like evaluate_scalper_candidate but WITHOUT the score threshold cut-off.
-    Used only for building the watchlist — we want a wide pool to monitor.
-    Actual entry decisions re-score the top 5 with evaluate_scalper_candidate,
-    which does apply the threshold.
+    Score a symbol for scalper consideration.
+
+    strict=False (watchlist): lower threshold, no sentiment, no volatility filter.
+    strict=True  (entry):     full filters — threshold, sentiment, ATR check.
+    Both paths return the same dict shape.
     """
     df_1h = parse_klines(sym, interval="60m", limit=60)
     if df_1h is None:
@@ -444,24 +741,70 @@ def _score_for_watchlist(sym: str) -> dict | None:
     if np.isnan(rsi) or rsi > SCALPER_MAX_RSI:
         return None
 
-    rsi_score = max(0, 40 - rsi) if rsi < 50 else 0
-    ema9      = calc_ema(close, 9)
-    ema21     = calc_ema(close, 21)
-    crossed   = (ema9.iloc[-1] > ema21.iloc[-1]) and (ema9.iloc[-2] <= ema21.iloc[-2])
-    ma_score  = 30 if crossed else (15 if ema9.iloc[-1] > ema21.iloc[-1] else 0)
-    avg_vol   = volume.iloc[-20:-1].mean()
-    vol_ratio = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
-    vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
-    score     = rsi_score + ma_score + vol_score
+    rsi_score      = max(0, 40 - rsi) if rsi < 50 else 0
+    ema9           = calc_ema(close, 9)
+    ema21          = calc_ema(close, 21)
+    crossed_now    = (ema9.iloc[-1] > ema21.iloc[-1]) and (ema9.iloc[-2] <= ema21.iloc[-2])
+    crossed_recent = (ema9.iloc[-2] > ema21.iloc[-2]) and (ema9.iloc[-3] <= ema21.iloc[-3])
+    crossed        = crossed_now or crossed_recent
+    ma_score       = 30 if crossed else (15 if ema9.iloc[-1] > ema21.iloc[-1] else 0)
+    avg_vol        = volume.iloc[-20:-1].mean()
+    vol_ratio      = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
+    vol_score      = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
+    score          = rsi_score + ma_score + vol_score
+
+    threshold = SCALPER_THRESHOLD if strict else max(5, SCALPER_THRESHOLD // 2)
+    if score < threshold:
+        return None
+
+    sentiment_delta = 0.0
+    if strict:
+        recent_vol_usdt = float(volume.iloc[-12:].sum()) * float(close.iloc[-1])
+        if recent_vol_usdt < SCALPER_MIN_1H_VOL:
+            log.debug(f"[SCALPER] Skip {sym} — thin "
+                      f"(1h vol ${recent_vol_usdt:,.0f} < ${SCALPER_MIN_1H_VOL:,})")
+            return None
+        sentiment_delta, sentiment_label = sentiment_score_adjustment(sym)
+        score = round(score + sentiment_delta, 2)
+        if sentiment_delta != 0:
+            log.info(f"[SCALPER] {sym} sentiment: {sentiment_label} → score {score}")
+        if score < SCALPER_THRESHOLD:
+            log.info(f"[SCALPER] Skip {sym} — below threshold after sentiment ({score:.1f})")
+            return None
 
     atr     = calc_atr(df5m, period=SCALPER_ATR_PERIOD)
     atr_pct = atr / float(close.iloc[-1]) if float(close.iloc[-1]) > 0 else 0.015
 
-    return {
-        "symbol": sym, "score": round(score, 2), "rsi": round(rsi, 2),
-        "vol_ratio": round(vol_ratio, 2), "price": float(close.iloc[-1]),
-        "atr_pct": round(atr_pct, 6),
+    if strict and atr_pct < SCALPER_MIN_ATR_PCT:
+        log.debug(f"[SCALPER] Skip {sym} — low volatility "
+                  f"(ATR {atr_pct*100:.3f}% < {SCALPER_MIN_ATR_PCT*100:.1f}%)")
+        return None
+
+    curr_close     = float(close.iloc[-1])
+    ema21_dist_pct = max(0.0, (curr_close - float(ema21.iloc[-1])) / curr_close) if curr_close > 0 else 0.0
+    opens          = df5m["open"]
+    safe_close     = close.replace(0, np.nan)
+    raw_candle_pct = ((close - opens).abs() / safe_close).iloc[-10:].mean()
+    avg_candle_pct = float(raw_candle_pct) if not np.isnan(raw_candle_pct) else atr_pct
+
+    result = {
+        "symbol":        sym,
+        "score":         round(score, 2),
+        "rsi":           round(rsi, 2),
+        "vol_ratio":     round(vol_ratio, 2),
+        "price":         curr_close,
+        "atr_pct":       round(atr_pct, 6),
+        "crossed_now":   crossed_now,
+        "ema21_dist_pct":round(ema21_dist_pct, 6),
+        "avg_candle_pct":round(avg_candle_pct, 6),
     }
+    if strict:
+        result["sentiment"] = sentiment_delta if sentiment_delta != 0 else None
+    return result
+
+
+def _score_for_watchlist(sym: str)       -> dict | None: return _score_scalper(sym, strict=False)
+def evaluate_scalper_candidate(sym: str) -> dict | None: return _score_scalper(sym, strict=True)
 
 
 def build_watchlist(tickers: pd.DataFrame):
@@ -481,29 +824,26 @@ def build_watchlist(tickers: pd.DataFrame):
 
     log.info(f"📋 [WATCHLIST] Building from {len(candidates)} candidates (full rescore)...")
 
-    # Age filter — batch check new listings
-    established = []
-    for sym in candidates:
-        try:
-            data = public_get("/api/v3/klines", {"symbol": sym, "interval": "1d", "limit": 7})
-            if len(data) >= 7:
-                established.append(sym)
-        except:
-            established.append(sym)
-        time.sleep(0.05)
+    # Age filter — exclude symbols that are too new for scalping.
+    # Reuse the moonshot new-listings cache (already populated) rather than
+    # fetching 120 daily klines one by one, which blocks for ~6 seconds.
+    new_listing_syms = {n["symbol"] for n in _new_listings_cache}
+    established = [s for s in candidates if s not in new_listing_syms]
+    log.info(f"📋 [WATCHLIST] {len(established)} established pairs after age filter "
+             f"({len(candidates) - len(established)} new listings excluded)")
 
-    # Score all in parallel.
-    # For watchlist building we use a lower threshold (half of entry threshold) so we
-    # always have a pool of candidates to monitor even in quieter market conditions.
-    # The entry scorer (find_scalper_opportunity) re-evaluates top 5 with fresh data anyway.
-    WATCHLIST_MIN_SCORE = max(5, SCALPER_THRESHOLD // 2)
+    # Score all in parallel — entry scorer re-evaluates top 5 with fresh data anyway
     scores = []
     with ThreadPoolExecutor(max_workers=8) as ex:
         futures = {ex.submit(_score_for_watchlist, sym): sym for sym in established}
         for f in as_completed(futures):
-            result = f.result()
-            if result and result["score"] >= WATCHLIST_MIN_SCORE:
-                scores.append(result)
+            try:
+                result = f.result()
+                if result and result["score"] >= WATCHLIST_MIN_SCORE:
+                    scores.append(result)
+            except Exception as e:
+                sym = futures[f]
+                log.debug(f"[WATCHLIST] Score failed for {sym}: {e}")
 
     scores.sort(key=lambda x: x["score"], reverse=True)
     _watchlist    = scores[:WATCHLIST_SIZE]
@@ -530,70 +870,6 @@ def build_watchlist(tickers: pd.DataFrame):
     )
 
 # ── Scanner: Scalper ───────────────────────────────────────────
-
-def evaluate_scalper_candidate(sym: str) -> dict | None:
-    df_1h = parse_klines(sym, interval="60m", limit=60)
-    if df_1h is None:
-        return None
-    if float(df_1h["close"].iloc[-1]) < calc_ema(df_1h["close"], 50).iloc[-1]:
-        return None
-
-    df5m = parse_klines(sym, interval="5m", limit=60)
-    if df5m is None:
-        return None
-
-    close  = df5m["close"]
-    volume = df5m["volume"]
-    rsi    = calc_rsi(close)
-    if np.isnan(rsi) or rsi > SCALPER_MAX_RSI:
-        return None
-
-    rsi_score = max(0, 40 - rsi) if rsi < 50 else 0
-    ema9      = calc_ema(close, 9)
-    ema21     = calc_ema(close, 21)
-
-    # Only score full 30pts if crossover happened in the last 2 candles (fresh signal).
-    # A crossover from 40 minutes ago has already played out — only give trending credit.
-    crossed_now    = (ema9.iloc[-1] > ema21.iloc[-1]) and (ema9.iloc[-2] <= ema21.iloc[-2])
-    crossed_recent = (ema9.iloc[-2] > ema21.iloc[-2]) and (ema9.iloc[-3] <= ema21.iloc[-3])
-    crossed        = crossed_now or crossed_recent
-    ma_score       = 30 if crossed else (15 if ema9.iloc[-1] > ema21.iloc[-1] else 0)
-
-    avg_vol   = volume.iloc[-20:-1].mean()
-    vol_ratio = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
-    vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
-    score     = rsi_score + ma_score + vol_score
-
-    if score < SCALPER_THRESHOLD:
-        return None
-
-    # Liquidity check — reject thin pairs that gap through SL on market sells.
-    # Sum last 12 candles (~1h) × price = recent USDT volume.
-    recent_vol_usdt = float(volume.iloc[-12:].sum()) * float(close.iloc[-1])
-    if recent_vol_usdt < SCALPER_MIN_1H_VOL:
-        log.debug(f"[SCALPER] Skip {sym} — thin (1h vol ${recent_vol_usdt:,.0f} < ${SCALPER_MIN_1H_VOL:,})")
-        return None
-
-    # Sentiment adjustment — applied after technical filters pass so we only
-    # call the API on genuinely interesting candidates (saves cost + latency).
-    sentiment_delta, sentiment_label = sentiment_score_adjustment(sym)
-    score = round(score + sentiment_delta, 2)
-    if sentiment_delta != 0:
-        log.info(f"[SCALPER] {sym} sentiment adjusted: {sentiment_label} → final score {score}")
-    # Re-check threshold after sentiment adjustment
-    if score < SCALPER_THRESHOLD:
-        log.info(f"[SCALPER] Skip {sym} — score dropped below threshold after sentiment ({score:.1f})")
-        return None
-
-    atr     = calc_atr(df5m, period=SCALPER_ATR_PERIOD)
-    atr_pct = atr / float(close.iloc[-1]) if float(close.iloc[-1]) > 0 else 0.015
-
-    return {
-        "symbol":    sym, "score": score, "rsi": round(rsi, 2),
-        "vol_ratio": round(vol_ratio, 2), "price": float(close.iloc[-1]),
-        "atr_pct":   round(atr_pct, 6),
-        "sentiment": sentiment_delta if sentiment_delta != 0 else None,
-    }
 
 
 def find_scalper_opportunity(budget: float, exclude: set, open_symbols: set) -> dict | None:
@@ -644,22 +920,42 @@ def find_scalper_opportunity(budget: float, exclude: set, open_symbols: set) -> 
                 f"RSI: {best['rsi']} | ATR: {best['atr_pct']*100:.2f}% | "
                 f"watchlist age: {age_mins:.0f}min")
 
+    # 🟢 Correlation filter — skip candidate if its returns are highly correlated
+    # with an already-open scalper position. Correlated positions SL simultaneously
+    # when BTC dumps, concentrating drawdown. Only check if we have open trades.
+    if scalper_trades and len(refreshed) > 0:
+        filtered = []
+        for cand in refreshed:
+            try:
+                df_cand = parse_klines(cand["symbol"], interval="5m", limit=25, min_len=20)
+                if df_cand is None:
+                    filtered.append(cand)
+                    continue
+                cand_returns = df_cand["close"].pct_change().dropna().iloc[-20:]
+                too_correlated = False
+                for open_trade in scalper_trades:
+                    df_open = parse_klines(open_trade["symbol"], interval="5m", limit=25, min_len=20)
+                    if df_open is None:
+                        continue
+                    open_returns = df_open["close"].pct_change().dropna().iloc[-20:]
+                    # Align by length in case of small differences
+                    n   = min(len(cand_returns), len(open_returns))
+                    corr = float(np.corrcoef(cand_returns.iloc[-n:], open_returns.iloc[-n:])[0, 1])
+                    if not np.isnan(corr) and corr > SCALPER_MAX_CORRELATION:
+                        log.info(f"[SCALPER] Skip {cand['symbol']} — corr {corr:.2f} "
+                                 f"with open {open_trade['symbol']}")
+                        too_correlated = True
+                        break
+                if not too_correlated:
+                    filtered.append(cand)
+            except Exception:
+                filtered.append(cand)  # on any error, don't block the candidate
+
+        refreshed = filtered if filtered else refreshed  # fallback if all correlated
+
     return pick_tradeable(refreshed, budget, "SCALPER")
 
 # ── Scanner: Moonshot ──────────────────────────────────────────
-
-def get_1h_change(symbol: str) -> float | None:
-    try:
-        # ⚠️ MEXC requires "60m" not "1h"
-        df = parse_klines(symbol, interval="60m", limit=3, min_len=2)
-        if df is None:
-            return None
-        prev = float(df["close"].iloc[-2])
-        curr = float(df["close"].iloc[-1])
-        return (curr - prev) / prev * 100 if prev > 0 else None
-    except:
-        return None
-
 
 def find_new_listings(tickers: pd.DataFrame, exclude: set, open_symbols: set) -> list:
     global _new_listings_cache, _new_listings_cache_at
@@ -701,7 +997,12 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
     df = df[df["quoteVolume"] <= MOONSHOT_MAX_VOL]
     df = df[df["lastPrice"]   >= MIN_PRICE]
     df = df[~df["symbol"].isin(open_symbols | exclude | _api_blacklist)]
-    momentum_candidates = df.sort_values("priceChangePercent", ascending=False).head(40)["symbol"].tolist()
+
+    # Pre-filter using priceChangePercent already in tickers — avoids a kline fetch per symbol.
+    # priceChangePercent is 24h change; use it as a proxy for momentum (not the same as 1h
+    # but eliminates flat/declining coins before the expensive per-symbol kline scan).
+    df_momentum = df[df["priceChangePercent"] >= MOONSHOT_MIN_1H]
+    momentum_candidates = df_momentum.sort_values("priceChangePercent", ascending=False).head(20)["symbol"].tolist()
 
     new_listings = find_new_listings(tickers, exclude=exclude, open_symbols=open_symbols)
     new_symbols  = [n["symbol"] for n in new_listings]
@@ -711,53 +1012,57 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
     if not all_candidates:
         return None
 
-    scores = []
-    for sym in all_candidates:
-        change_1h = get_1h_change(sym)
-        is_new    = sym in new_symbols
-
-        if is_new:
-            if change_1h is not None and change_1h < 0:
-                time.sleep(0.1); continue
-        else:
-            if change_1h is None or change_1h < MOONSHOT_MIN_1H:
-                time.sleep(0.1); continue
-
-        # ⚠️ MEXC requires "60m" not "1h"
-        interval = "60m" if is_new else "15m"
-        df_k     = parse_klines(sym, interval=interval, limit=60)
-        if df_k is None:
-            time.sleep(0.1); continue
-
-        close     = df_k["close"]
-        volume    = df_k["volume"]
-        rsi       = calc_rsi(close)
-        if np.isnan(rsi):
-            time.sleep(0.1); continue
-
-        rsi_score = max(0, 40 - rsi) if rsi < 50 else 0
-        ema9      = calc_ema(close, 9); ema21 = calc_ema(close, 21)
-        crossed   = (ema9.iloc[-1] > ema21.iloc[-1]) and (ema9.iloc[-2] <= ema21.iloc[-2])
-        ma_score  = 30 if crossed else (15 if ema9.iloc[-1] > ema21.iloc[-1] else 0)
-        avg_vol   = volume.iloc[-20:-1].mean()
-        vol_ratio = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
-        vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
-        score     = rsi_score + ma_score + vol_score
-
-        if score >= MOONSHOT_MIN_SCORE:
-            # Apply sentiment adjustment to qualifying moonshot candidates
+    # Score candidates in parallel with a Semaphore to avoid MEXC rate-limit (429).
+    # Max 5 concurrent kline fetches — aggressive enough to be fast, gentle on the API.
+    def _score_moonshot(sym: str) -> dict | None:
+        with _moonshot_scan_sem:
+            is_new = sym in new_symbols
+            interval = "60m" if is_new else "15m"
+            df_k = parse_klines(sym, interval=interval, limit=60)
+            if df_k is None:
+                return None
+            close  = df_k["close"]
+            volume = df_k["volume"]
+            rsi    = calc_rsi(close)
+            if np.isnan(rsi):
+                return None
+            rsi_score = max(0, 40 - rsi) if rsi < 50 else 0
+            ema9  = calc_ema(close, 9)
+            ema21 = calc_ema(close, 21)
+            crossed   = (ema9.iloc[-1] > ema21.iloc[-1]) and (ema9.iloc[-2] <= ema21.iloc[-2])
+            ma_score  = 30 if crossed else (15 if ema9.iloc[-1] > ema21.iloc[-1] else 0)
+            avg_vol   = volume.iloc[-20:-1].mean()
+            vol_ratio = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
+            vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
+            score     = rsi_score + ma_score + vol_score
+            if score < MOONSHOT_MIN_SCORE:
+                return None
             sentiment_delta, _ = sentiment_score_adjustment(sym)
             final_score = round(score + sentiment_delta, 2)
             if final_score < MOONSHOT_MIN_SCORE:
-                log.info(f"[MOONSHOT] Skip {sym} — score dropped after sentiment ({final_score:.1f})")
-                time.sleep(0.1); continue
-            scores.append({
+                return None
+            # 1h change: use tickers if available, else last 2 closes
+            row = df[df["symbol"] == sym]
+            change_1h = float(row["priceChangePercent"].iloc[0]) if not row.empty else None
+            if not is_new and (change_1h is None or change_1h < MOONSHOT_MIN_1H):
+                return None
+            return {
                 "symbol": sym, "score": final_score, "rsi": round(rsi, 2),
                 "vol_ratio": round(vol_ratio, 2), "price": float(close.iloc[-1]),
                 "_df": df_k, "_is_new": is_new, "_1h_chg": round(change_1h or 0, 2),
                 "sentiment": sentiment_delta if sentiment_delta != 0 else None,
-            })
-        time.sleep(0.1)
+            }
+
+    scores = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(_score_moonshot, sym): sym for sym in all_candidates}
+        for f in as_completed(futures):
+            try:
+                result = f.result()
+                if result:
+                    scores.append(result)
+            except Exception as e:
+                log.debug(f"[MOONSHOT] Score failed for {futures[f]}: {e}")
 
     if not scores:
         scanner_log("🌙 [MOONSHOT] No qualifying candidates.")
@@ -811,22 +1116,69 @@ def evaluate_reversal_candidate(sym: str) -> dict | None:
     if df5m is None:
         return None
 
-    if float(df5m["close"].iloc[-1]) <= float(df5m["open"].iloc[-1]):
-        return None
+    close  = df5m["close"]
+    opens  = df5m["open"]
+    volume = df5m["volume"]
+    lows   = df5m["low"]
 
-    volume   = df5m["volume"]
-    avg_vol  = float(volume.iloc[-20:-2].mean())
-    prev_vol = float(volume.iloc[-2])
-    if avg_vol > 0 and prev_vol < avg_vol * 1.5:
-        return None
-
-    rsi = calc_rsi(df5m["close"])
+    # ── RSI oversold filter ───────────────────────────────────
+    rsi = calc_rsi(close)
     if np.isnan(rsi) or rsi > REVERSAL_MAX_RSI:
         return None
 
+    # ── Capitulation candle check (prior candle) ──────────────
+    # Must be a significant red candle with elevated volume (the sell climax)
+    cap_open  = float(opens.iloc[-2])
+    cap_close = float(close.iloc[-2])
+    cap_low   = float(lows.iloc[-2])
+    cap_vol   = float(volume.iloc[-2])
+    avg_vol   = float(volume.iloc[-22:-2].mean())  # 20-candle avg excluding cap + bounce
+
+    if cap_close >= cap_open:
+        return None  # prior candle must be red (the capitulation)
+
+    if avg_vol > 0 and cap_vol < avg_vol * 1.5:
+        return None  # capitulation candle needs elevated volume
+
+    cap_body = cap_open - cap_close  # size of the red candle body
+
+    # ── Bounce candle check (current candle) ──────────────────
+    curr_open  = float(opens.iloc[-1])
+    curr_close = float(close.iloc[-1])
+    curr_vol   = float(volume.iloc[-1])
+
+    if curr_close <= curr_open:
+        return None  # current candle must be green (the bounce started)
+
+    # Must reclaim ≥ REVERSAL_BOUNCE_RECOVERY of the cap candle body
+    recovery = (curr_close - curr_open) / cap_body if cap_body > 0 else 0
+    if recovery < REVERSAL_BOUNCE_RECOVERY:
+        return None  # weak bounce — hasn't reclaimed enough ground
+
+    # Bounce volume must show buyers stepping in (≥ 1.2× avg)
+    # This distinguishes real bounces from dead-cat ticks
+    if avg_vol > 0 and curr_vol < avg_vol * REVERSAL_VOL_RECOVERY:
+        return None  # low bounce volume — not convincing
+
+    # ── Cap-candle SL anchor ──────────────────────────────────
+    # SL goes just below the capitulation candle's low — that's where
+    # the reversal thesis definitively breaks. Store as pct from current price.
+    entry_est   = curr_close
+    cap_sl_pct  = max(
+        REVERSAL_SL,
+        (entry_est - cap_low) / entry_est + REVERSAL_CAP_SL_BUFFER
+    )
+    cap_sl_pct  = min(cap_sl_pct, 0.05)  # never risk more than 5% on a reversal
+
     return {
-        "symbol": sym, "price": float(df5m["close"].iloc[-1]),
-        "rsi": round(rsi, 2), "score": round(rsi, 2),
+        "symbol":      sym,
+        "price":       entry_est,
+        "rsi":         round(rsi, 2),
+        "score":       round(rsi, 2),
+        "recovery":    round(recovery, 3),    # how much of cap body was reclaimed
+        "cap_vol_ratio": round(cap_vol / avg_vol, 2) if avg_vol > 0 else 1.0,
+        "bounce_vol_ratio": round(curr_vol / avg_vol, 2) if avg_vol > 0 else 1.0,
+        "cap_sl_pct":  round(cap_sl_pct, 4), # SL anchored below cap-candle low
     }
 
 
@@ -849,9 +1201,12 @@ def find_reversal_opportunity(tickers: pd.DataFrame, budget: float,
     with ThreadPoolExecutor(max_workers=5) as ex:
         futures = {ex.submit(evaluate_reversal_candidate, sym): sym for sym in candidates}
         for f in as_completed(futures):
-            result = f.result()
-            if result:
-                tradeable.append(result)
+            try:
+                result = f.result()
+                if result:
+                    tradeable.append(result)
+            except Exception as e:
+                log.debug(f"[REVERSAL] Score failed for {futures[f]}: {e}")
 
     if not tradeable:
         scanner_log("🔄 [REVERSAL] No oversold pairs with capitulation + green candle.")
@@ -860,7 +1215,10 @@ def find_reversal_opportunity(tickers: pd.DataFrame, budget: float,
     tradeable.sort(key=lambda x: x["rsi"])
     best = tradeable[0]
     last_top_alt = best
-    scanner_log(f"🔄 [REVERSAL] Top: {best['symbol']} | RSI: {best['rsi']} | ${best['price']:.6f}")
+    scanner_log(f"🔄 [REVERSAL] Top: {best['symbol']} | RSI: {best['rsi']} | "
+                f"Recovery: {best.get('recovery',0)*100:.0f}% | "
+                f"BounceVol: {best.get('bounce_vol_ratio',0):.1f}× | "
+                f"SL: -{best.get('cap_sl_pct',REVERSAL_SL)*100:.1f}%")
 
     return pick_tradeable(tradeable, budget, "REVERSAL")
 
@@ -927,16 +1285,17 @@ def get_open_order_ids(symbol) -> set:
         return set()
 
 
-def get_actual_fills(symbol: str, since_ms: int, retries: int = 3) -> dict:
+def get_actual_fills(symbol: str, since_ms: int, retries: int = 3,
+                     buy_order_id=None, sell_order_ids: set | None = None) -> dict:
     """
     Fetch actual fill data from MEXC myTrades for a symbol since a timestamp.
+
+    When buy_order_id is provided, buy fills are filtered to that order only.
+    When sell_order_ids is provided, sell fills are filtered to those orders only.
+    If neither is provided (legacy fallback), sell qty is capped at buy qty to
+    prevent double-counting when both TP limit and SL market sell fire together.
+
     Retries up to `retries` times with 1s delay to allow fills to settle.
-    Returns:
-        avg_buy_price:  weighted average fill price of buy orders
-        avg_sell_price: weighted average fill price of sell orders
-        fee_usdt:       total fees paid in USDT equivalent
-        cost_usdt:      total cost of buys (qty * price)
-        revenue_usdt:   total revenue from sells (qty * price)
     """
     if PAPER_TRADE:
         return {}
@@ -962,18 +1321,51 @@ def get_actual_fills(symbol: str, since_ms: int, retries: int = 3) -> dict:
                     continue
                 return {}
 
-            buys  = [f for f in fills if     f.get("isBuyer")]
-            sells = [f for f in fills if not f.get("isBuyer")]
+            all_buys  = [f for f in fills if     f.get("isBuyer")]
+            all_sells = [f for f in fills if not f.get("isBuyer")]
+
+            # ── Filter by order ID when available (most precise) ──
+            if buy_order_id:
+                buys = [f for f in all_buys if str(f.get("orderId")) == str(buy_order_id)]
+                if not buys:
+                    buys = all_buys  # fall back if orderId not in response
+            else:
+                buys = all_buys
+
+            if sell_order_ids:
+                sells = [f for f in all_sells if str(f.get("orderId")) in
+                         {str(s) for s in sell_order_ids}]
+                if not sells:
+                    sells = all_sells  # fall back if orderId not in response
+            else:
+                sells = all_sells
+
+            # ── Qty cap safety net ────────────────────────────────
+            # Even with order ID filtering, cap sell qty at buy qty to prevent
+            # double-counting from any race condition (TP limit + SL market sell).
+            qty_bought = sum(float(f["qty"]) for f in buys)
+            if qty_bought > 0:
+                qty_sold_acc = 0.0
+                capped_sells = []
+                for sell in sorted(sells, key=lambda f: int(f.get("time", 0))):
+                    qty_this = float(sell["qty"])
+                    if qty_sold_acc + qty_this <= qty_bought * FILL_QTY_TOLERANCE:
+                        capped_sells.append(sell)
+                        qty_sold_acc += qty_this
+                    else:
+                        log.warning(f"[FILLS] {symbol}: capped extra sell fill "
+                                    f"(qty {qty_this:.4f}, already sold {qty_sold_acc:.4f} "
+                                    f"of {qty_bought:.4f} bought) — likely TP+SL race condition")
+                sells = capped_sells
 
             # Fees — MEXC pays in the received asset, convert to USDT
             fee_usdt = 0.0
-            for f in fills:
+            for f in buys + sells:
                 commission = float(f.get("commission", 0))
                 asset      = f.get("commissionAsset", "")
                 if asset == "USDT":
                     fee_usdt += commission
                 elif commission > 0:
-                    # Approximate: fee in base asset × fill price
                     fee_usdt += commission * float(f.get("price", 0))
 
             result = {
@@ -986,7 +1378,6 @@ def get_actual_fills(symbol: str, since_ms: int, retries: int = 3) -> dict:
                 "sell_count":     len(sells),
             }
 
-            # Only return if we have at least a buy fill
             if result["avg_buy_price"] is not None:
                 return result
 
@@ -998,11 +1389,106 @@ def get_actual_fills(symbol: str, since_ms: int, retries: int = 3) -> dict:
 
     return {}
 
+# ── Dynamic TP / SL calculator ────────────────────────────────
+
+def calc_dynamic_tp_sl(opp: dict) -> tuple[float, float, str, str]:
+    """
+    Calculate signal-aware TP and SL percentages for a SCALPER trade.
+
+    Uses three entry-signal dimensions from the candidate dict:
+      crossed_now    — fresh EMA9/21 crossover (most potent signal)
+      vol_ratio      — volume spike size
+      rsi            — RSI at entry (lower = more oversold = mean-reversion)
+      score          — overall confidence (multi-signal = more room)
+      ema21_dist_pct — EMA21 distance as SL anchor for crossover entries
+      avg_candle_pct — recent average candle body (reality cap for TP, noise
+                       floor for SL)
+
+    Returns (tp_pct, sl_pct, tp_label, sl_label) where labels describe
+    what drove each level — shown in the open trade Telegram message.
+    """
+    atr_pct        = opp.get("atr_pct",        0.015)
+    vol_ratio      = opp.get("vol_ratio",       1.0)
+    rsi            = opp.get("rsi",             50.0)
+    score          = opp.get("score",           0.0)
+    crossed_now    = opp.get("crossed_now",     False)
+    ema21_dist_pct = opp.get("ema21_dist_pct",  atr_pct * SCALPER_ATR_MULT)
+    avg_candle_pct = opp.get("avg_candle_pct",  atr_pct)
+
+    # ── TP ─────────────────────────────────────────────────────
+    if crossed_now:
+        tp_mult  = SCALPER_TP_MULT_CROSSOVER
+        tp_label = f"crossover×{tp_mult}"
+    elif vol_ratio >= 3.0:
+        tp_mult  = SCALPER_TP_MULT_VOL_SPIKE
+        tp_label = f"vol×{tp_mult}"
+    elif rsi < 40:
+        tp_mult  = SCALPER_TP_MULT_OVERSOLD
+        tp_label = f"oversold×{tp_mult}"
+    else:
+        tp_mult  = SCALPER_TP_MULT_DEFAULT
+        tp_label = f"trend×{tp_mult}"
+
+    atr_tp      = atr_pct * tp_mult
+    candle_cap  = avg_candle_pct * SCALPER_TP_CANDLE_MULT
+    tp_pct      = min(atr_tp, candle_cap)             # whichever is more conservative
+    tp_pct      = min(SCALPER_TP_MAX, max(SCALPER_TP_MIN, tp_pct))
+
+    if atr_tp > candle_cap:
+        tp_label += f" (candle-capped {candle_cap*100:.1f}%)"
+
+    # ── SL ─────────────────────────────────────────────────────
+    if vol_ratio >= 3.0:
+        sl_mult  = SCALPER_SL_MULT_VOL_SPIKE
+        sl_label = f"tight×{sl_mult} (vol spike)"
+    elif rsi < 40:
+        sl_mult  = SCALPER_SL_MULT_OVERSOLD
+        sl_label = f"tight×{sl_mult} (oversold)"
+    elif score >= SCALPER_BREAKEVEN_SCORE:
+        sl_mult  = SCALPER_SL_MULT_HIGH_CONF
+        sl_label = f"wide×{sl_mult} (high confidence)"
+    else:
+        sl_mult  = SCALPER_SL_MULT_DEFAULT
+        sl_label = f"standard×{sl_mult}"
+
+    atr_sl      = atr_pct * sl_mult
+
+    # For crossover entries, anchor SL to EMA21 distance — that's where
+    # the thesis actually breaks. Use whichever is larger (EMA21 or ATR-based)
+    # to avoid placing SL inside normal price oscillation.
+    if crossed_now and ema21_dist_pct > 0:
+        sl_pct   = max(atr_sl, ema21_dist_pct)
+        sl_label = f"EMA21 anchor ({ema21_dist_pct*100:.2f}%)"
+    else:
+        sl_pct   = atr_sl
+
+    # Noise floor — SL must be ≥ N average candle bodies wide
+    noise_floor = avg_candle_pct * SCALPER_SL_NOISE_MULT
+    if sl_pct < noise_floor:
+        sl_pct   = noise_floor
+        sl_label += f" (noise-floored {noise_floor*100:.2f}%)"
+
+    sl_pct = min(SCALPER_SL_MAX, max(SCALPER_SL_MIN, sl_pct))
+
+    log.info(f"[SCALPER] Dynamic TP: {tp_pct*100:.2f}% [{tp_label}] | "
+             f"SL: {sl_pct*100:.2f}% [{sl_label}] | "
+             f"R:R {tp_pct/sl_pct:.1f}:1")
+
+    return tp_pct, sl_pct, tp_label, sl_label
+
+
 # ── Trade lifecycle ────────────────────────────────────────────
 
-def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
-                  max_hours=None, sl_override_pct=None):
+def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     symbol                              = opp["symbol"]
+
+    # Last-moment duplicate guard — belt-and-suspenders check before any order is placed.
+    # open_symbols filtering in find_scalper_opportunity handles the normal case;
+    # this catches the rare window where two paths converge on the same symbol.
+    if any(t["symbol"] == symbol for t in scalper_trades + alt_trades):
+        log.warning(f"[{label}] Duplicate guard: {symbol} already in open positions — skipping")
+        return None
+
     min_qty, step_size, min_notional, tick_size = get_symbol_rules(symbol)
 
     try:
@@ -1024,12 +1510,36 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
     # Record timestamp BEFORE placing the order so fills are captured reliably
     bought_at_ms = int(time.time() * 1000)
 
+    # 🟢 Spread / depth check — reject pairs with wide bid/ask before money moves.
+    # SCALPER: tight 0.4% threshold — small TP, spread eats the profit.
+    # MOONSHOT: wider 0.8% threshold — larger TP absorbs more, but still filter thin markets.
+    # Check is advisory — never blocks on error.
+    spread_limit = SCALPER_MAX_SPREAD if label == "SCALPER" else MOONSHOT_MAX_SPREAD
+    if label in ("SCALPER", "MOONSHOT") and not PAPER_TRADE:
+        try:
+            depth    = public_get("/api/v3/depth", {"symbol": symbol, "limit": 5})
+            bids     = depth.get("bids", [])
+            asks     = depth.get("asks", [])
+            if bids and asks:
+                best_bid = float(bids[0][0])
+                best_ask = float(asks[0][0])
+                mid      = (best_bid + best_ask) / 2
+                spread   = (best_ask - best_bid) / mid if mid > 0 else 1.0
+                if spread > spread_limit:
+                    log.info(f"[{label}] Skip {symbol} — spread {spread*100:.3f}% "
+                             f"> {spread_limit*100:.1f}%")
+                    return None
+        except Exception:
+            pass  # spread check is advisory — don't block on error
+
     buy_order = place_market_buy(symbol, qty, label)
     if not buy_order:
         return None
+    buy_order_id = buy_order.get("orderId")  # stored for precise fill filtering
 
     # Fetch actual fill price — more accurate than the pre-order ticker price
-    actual_fills = get_actual_fills(symbol, since_ms=bought_at_ms)
+    actual_fills = get_actual_fills(symbol, since_ms=bought_at_ms,
+                                    buy_order_id=buy_order_id)
     actual_entry = actual_fills.get("avg_buy_price") or price
     actual_cost  = actual_fills.get("cost_usdt")     or notional
     if actual_fills.get("avg_buy_price"):
@@ -1038,19 +1548,25 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
     else:
         log.info(f"[{label}] Using ticker price (myTrades unavailable): ${price:.6f}")
 
-    actual_sl = sl_override_pct if sl_override_pct else sl_pct
-
-    # SCALPER: TP = 3×ATR (same multiplier ratio as SL = 1.5×ATR → guaranteed 2:1 R:R)
-    # MOONSHOT/REVERSAL: fixed pct TP passed in from caller
+    # SCALPER: dynamic signal-aware TP and SL
+    # REVERSAL: SL anchored to cap-candle low stored in opp["cap_sl_pct"]
+    # MOONSHOT: fixed pct TP/SL passed in from caller
     if label == "SCALPER" and opp.get("atr_pct"):
-        atr_tp_pct = opp["atr_pct"] * SCALPER_TP_ATR_MULT
-        # Cap at SCALPER_TP_LIMIT (+10%) and floor at 2% (minimum worth the trade)
-        atr_tp_pct = min(SCALPER_TP_LIMIT, max(0.02, atr_tp_pct))
-        tp_price   = round_price_to_tick(actual_entry * (1 + atr_tp_pct), tick_size)
-        used_tp_pct = atr_tp_pct
-    else:
-        tp_price    = round_price_to_tick(actual_entry * (1 + tp_pct), tick_size)
+        used_tp_pct, actual_sl, tp_label, sl_label = calc_dynamic_tp_sl(opp)
+        tp_price = round_price_to_tick(actual_entry * (1 + used_tp_pct), tick_size)
+    elif label == "REVERSAL" and opp.get("cap_sl_pct"):
         used_tp_pct = tp_pct
+        actual_sl   = opp["cap_sl_pct"]   # cap-candle anchored SL
+        tp_label    = ""
+        sl_label    = f"cap-candle anchor (-{actual_sl*100:.1f}%)"
+        tp_price    = round_price_to_tick(actual_entry * (1 + tp_pct), tick_size)
+    else:
+        # MOONSHOT: fixed pct TP/SL passed in from caller
+        used_tp_pct = tp_pct
+        actual_sl   = sl_pct
+        tp_label    = ""
+        sl_label    = ""
+        tp_price    = round_price_to_tick(actual_entry * (1 + tp_pct), tick_size)
 
     sl_price = round(actual_entry * (1 - actual_sl), 8)
 
@@ -1077,6 +1593,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
         "qty":            qty,
         "budget_used":    actual_cost,
         "bought_at_ms":   bought_at_ms,
+        "buy_order_id":   buy_order_id,   # used to filter fills precisely in close_position
         "tp_price":       tp_price,
         "sl_price":       sl_price,
         "tp_pct":         used_tp_pct,
@@ -1095,6 +1612,21 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
                               opp.get("score", 0) >= SCALPER_BREAKEVEN_SCORE
                           ) else None,
         "breakeven_done": False,   # flips True once SL has been moved to entry
+        # ── Partial TP (MOONSHOT / REVERSAL only) ─────────────
+        # Stage 1: sell partial_tp_ratio of qty at partial_tp_price.
+        # After stage 1: sl_price moves to entry (remainder is risk-free),
+        # qty and budget_used updated to reflect remaining position.
+        "partial_tp_price": (
+            round_price_to_tick(actual_entry * (1 + MOONSHOT_PARTIAL_TP_PCT), tick_size)
+            if label == "MOONSHOT" else
+            round_price_to_tick(actual_entry * (1 + REVERSAL_PARTIAL_TP_PCT), tick_size)
+            if label == "REVERSAL" else None
+        ),
+        "partial_tp_ratio": (
+            MOONSHOT_PARTIAL_TP_RATIO if label == "MOONSHOT" else
+            REVERSAL_PARTIAL_TP_RATIO if label == "REVERSAL" else None
+        ),
+        "partial_tp_hit":   False,   # flips True once stage 1 fires
     }
 
     mode         = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
@@ -1113,13 +1645,29 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
     sentiment_val = opp.get("sentiment")
     sentiment_line = ""
     if sentiment_val is not None:
-        icon = "🟢" if sentiment_val > 0 else "🔴"
-        sentiment_line = f"Sentiment:   {icon} {sentiment_val:+.1f}pts\n"
+        sentiment_icon = "🟢" if sentiment_val > 0 else "🔴"
+        sentiment_line = f"Sentiment:   {sentiment_icon} {sentiment_val:+.1f}pts\n"
 
-    if label == "SCALPER" and opp.get("atr_pct"):
-        tp_display = f"TP (ATR×{SCALPER_TP_ATR_MULT:.0f}): <b>${tp_price:.6f}</b>  (+{used_tp_pct*100:.1f}%)\n"
+    if label == "SCALPER" and tp_label:
+        tp_display = (f"Take profit: <b>${tp_price:.6f}</b>  (+{used_tp_pct*100:.1f}%)"
+                      f"  <i>[{tp_label}]</i>\n")
+        sl_display = (f"Stop loss:   <b>${sl_price:.6f}</b>  (-{actual_sl*100:.1f}%)"
+                      f"  <i>[{sl_label}]</i> [market]\n")
+    elif label == "REVERSAL" and sl_label:
+        tp_display = f"Take profit: <b>${tp_price:.6f}</b>  (+{used_tp_pct*100:.0f}%)\n"
+        sl_display = (f"Stop loss:   <b>${sl_price:.6f}</b>  (-{actual_sl*100:.1f}%)"
+                      f"  <i>[{sl_label}]</i> [market]\n")
     else:
         tp_display = f"Take profit: <b>${tp_price:.6f}</b>  (+{used_tp_pct*100:.0f}%)\n"
+        sl_display = f"Stop loss:   <b>${sl_price:.6f}</b>  (-{actual_sl*100:.1f}%) [market]\n"
+
+    partial_tp_line = ""
+    if trade.get("partial_tp_price") and label in ("MOONSHOT", "REVERSAL"):
+        ratio_pct   = (trade["partial_tp_ratio"] or 0.5) * 100
+        partial_pct = (trade["partial_tp_price"] / actual_entry - 1) * 100
+        partial_tp_line = (f"Partial TP:  {ratio_pct:.0f}% @ "
+                           f"<b>${trade['partial_tp_price']:.6f}</b>"
+                           f"  (+{partial_pct:.1f}%) → SL → entry\n")
 
     log.info(f"{icon} [{label}] Opened {symbol} | ${actual_cost:.2f} | "
              f"Entry: {actual_entry:.6f} | TP: {tp_price:.6f} (+{used_tp_pct*100:.1f}%) | "
@@ -1133,12 +1681,14 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
         f"{slippage_line}"
         f"{sentiment_line}"
         f"{tp_display}"
-        f"Stop loss:   <b>${sl_price:.6f}</b>  (-{actual_sl*100:.1f}%) [market]\n"
+        f"{sl_display}"
+        f"{partial_tp_line}"
         f"{breakeven_line}"
         f"{timeout_line}"
         f"{tp_status}\n"
         f"Score: {opp.get('score',0)} | RSI: {opp.get('rsi','?')} | Vol: {opp.get('vol_ratio','?')}x"
     )
+    save_state()
     return trade
 
 
@@ -1147,15 +1697,26 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
     label       = trade["label"]
     tp_order_id = trade.get("tp_order_id")
 
-    # Timeout
+    # ── Timeout logic ─────────────────────────────────────────
+    # MOONSHOT: graduated — timeout depends on how the trade is performing.
+    #   Flat trade gets cut early; a trade that's working gets more time.
+    # REVERSAL: hard 2h ceiling (short-hold strategy, no accommodation).
+    # SCALPER: no max_hours (uses trailing stop / flat exit instead).
     if trade.get("max_hours"):
-        held_h = (datetime.now(timezone.utc) -
-                  datetime.fromisoformat(trade["opened_at"])).total_seconds() / 3600
-        if held_h >= trade["max_hours"]:
-            log.info(f"⏰ [{label}] Timeout: {symbol}")
-            if not PAPER_TRADE and tp_order_id:
-                cancel_order(symbol, tp_order_id, label)
-            return True, "TIMEOUT"
+        held_min = (datetime.now(timezone.utc) -
+                    datetime.fromisoformat(trade["opened_at"])).total_seconds() / 60
+
+        if label == "MOONSHOT":
+            if held_min >= MOONSHOT_TIMEOUT_MAX_MINS:
+                log.info(f"⏰ [{label}] Max timeout ({MOONSHOT_TIMEOUT_MAX_MINS}min): {symbol}")
+                return True, "TIMEOUT"
+        else:
+            held_h = held_min / 60
+            if held_h >= trade["max_hours"]:
+                log.info(f"⏰ [{label}] Timeout: {symbol}")
+                if not PAPER_TRADE and tp_order_id:
+                    cancel_order(symbol, tp_order_id, label)
+                return True, "TIMEOUT"
 
     try:
         price = float(public_get("/api/v3/ticker/price", {"symbol": symbol})["price"])
@@ -1164,7 +1725,7 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
         return False, ""
 
     pct      = (price - trade["entry_price"]) / trade["entry_price"] * 100
-    held_min = (datetime.now(timezone.utc) -
+    held_min = (datetime.now(timezone.utc) -           # computed once, used by all branches
                 datetime.fromisoformat(trade["opened_at"])).total_seconds() / 60
     trade["highest_price"] = max(trade.get("highest_price", price), price)
 
@@ -1181,6 +1742,16 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
         if not PAPER_TRADE and tp_order_id:
             cancel_order(symbol, tp_order_id, label)
         return True, "STOP_LOSS"
+
+    # ── Partial TP (MOONSHOT / REVERSAL) ──────────────────────
+    # Stage 1: fire when price hits partial_tp_price and stage hasn't fired yet.
+    # After this, execute_partial_tp() sells half, moves SL to entry, trade continues.
+    if (label in ("MOONSHOT", "REVERSAL")
+            and not trade.get("partial_tp_hit")
+            and trade.get("partial_tp_price")
+            and price >= trade["partial_tp_price"]):
+        log.info(f"🎯½ [{label}] Partial TP: {symbol} | {pct:+.2f}%")
+        return True, "PARTIAL_TP"
 
     # ── TP exit logic ─────────────────────────────────────────
     # SCALPER: check if exchange limit order was filled
@@ -1208,7 +1779,38 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             log.info(f"🎯 [{label}] TP: {symbol} | +{pct:.2f}%")
             return True, "TAKE_PROFIT"
 
-    # SCALPER-specific exits
+    # ── MOONSHOT-specific exits ───────────────────────────────
+    if label == "MOONSHOT":
+        # Graduated timeout — give winning trades more time
+        if pct < 0.5 and held_min >= MOONSHOT_TIMEOUT_FLAT_MINS:
+            log.info(f"😴 [{label}] Flat timeout: {symbol} | {pct:+.2f}% after {held_min:.0f}min")
+            return True, "TIMEOUT"
+        if pct < 3.0 and held_min >= MOONSHOT_TIMEOUT_MARGINAL_MINS:
+            log.info(f"⏰ [{label}] Marginal timeout: {symbol} | {pct:+.2f}% after {held_min:.0f}min")
+            return True, "TIMEOUT"
+
+        # Mid-hold volume collapse — pump is over if volume has dried up
+        # Only check after MOONSHOT_VOL_CHECK_MINS to avoid noise on entry
+        if held_min >= MOONSHOT_VOL_CHECK_MINS and pct < 5.0:
+            try:
+                df_vol = parse_klines(symbol, interval="5m", limit=25, min_len=10)
+                if df_vol is not None:
+                    vol       = df_vol["volume"]
+                    avg_vol   = float(vol.iloc[-21:-1].mean())
+                    curr_vol  = float(vol.iloc[-1])
+                    vol_ratio = (curr_vol / avg_vol) if avg_vol > 0 else 1.0
+                    if vol_ratio < MOONSHOT_VOL_COLLAPSE_RATIO:
+                        log.info(f"📉 [{label}] Vol collapse: {symbol} | "
+                                 f"vol {vol_ratio:.2f}× avg | {pct:+.2f}%")
+                        return True, "VOL_COLLAPSE"
+            except Exception:
+                pass  # never block an exit check on a kline failure
+
+    # ── REVERSAL-specific exits ───────────────────────────────
+    if label == "REVERSAL":
+        if held_min >= trade["max_hours"] * 60:
+            log.info(f"⏰ [{label}] Timeout: {symbol}")
+            return True, "TIMEOUT"
     if label == "SCALPER":
         # ── Breakeven trail (high-confidence trades only) ─────────
         # If score ≥ SCALPER_BREAKEVEN_SCORE and trade is up SCALPER_BREAKEVEN_ACT,
@@ -1248,6 +1850,139 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
     return False, ""
 
 
+def execute_partial_tp(trade) -> bool:
+    """
+    Sell partial_tp_ratio of the position at market price (stage 1 TP).
+    Mutates the trade dict in place — the trade stays live with reduced qty.
+
+    After firing:
+      - partial_tp_hit  = True
+      - qty             = remaining qty after partial sell
+      - budget_used     = proportional remaining cost basis
+      - sl_price        = entry_price (remainder is now risk-free)
+      - A partial P&L entry is appended to trade_history
+
+    Returns True if partial sell succeeded, False if it failed hard.
+    """
+    label   = trade["label"]
+    symbol  = trade["symbol"]
+    ratio   = trade.get("partial_tp_ratio", 0.5)
+
+    min_qty, step_size, _, _ = get_symbol_rules(symbol)
+    full_qty = trade["qty"]
+
+    # Use Decimal to avoid float representation errors (same approach as calc_qty)
+    d_full  = Decimal(str(full_qty))
+    d_ratio = Decimal(str(ratio))
+    d_step  = Decimal(str(step_size))
+    partial_qty   = float((d_full * d_ratio / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step)
+    # Floor remaining to step_size as well — prevents lot-size errors on micro-priced coins
+    remaining_qty = float(((d_full - Decimal(str(partial_qty))) / d_step)
+                          .to_integral_value(rounding=ROUND_DOWN) * d_step)
+
+    # Safety: don't fire if either partial or remaining qty would be below min
+    if partial_qty < min_qty or remaining_qty < min_qty:
+        log.warning(f"[{label}] Partial TP skipped — qty too small "
+                    f"(partial={partial_qty}, remaining={remaining_qty}, min={min_qty})")
+        # Skip partial, just let the full TP run
+        trade["partial_tp_hit"] = True   # mark as hit so we don't retry
+        return True
+
+    partial_sell_id  = None
+    partial_sold_at_ms = int(time.time() * 1000)  # record before sell for fill query
+    if not PAPER_TRADE:
+        try:
+            result = private_post("/api/v3/order", {
+                "symbol": symbol, "side": "SELL",
+                "type": "MARKET", "quantity": str(partial_qty),
+            })
+            partial_sell_id = result.get("orderId")
+            log.info(f"✅ [{label}] Partial sell: {partial_qty} {symbol} → {result}")
+        except requests.exceptions.HTTPError as e:
+            try:    body = e.response.json()
+            except: body = {"msg": str(e)}
+            log.error(f"🚨 [{label}] Partial sell failed: {body}")
+            telegram(f"🚨 <b>Partial TP sell failed!</b> [{label}] {symbol}\n"
+                     f"{str(body)[:200]}\nClose manually if needed.")
+            return False
+
+    # Fetch partial fill for accurate P&L
+    # Use partial_sold_at_ms (not original bought_at_ms) so we only see the partial sell
+    partial_fills = {}
+    if not PAPER_TRADE:
+        sell_ids = {partial_sell_id} if partial_sell_id else None
+        partial_fills = get_actual_fills(
+            symbol, since_ms=partial_sold_at_ms, retries=3,
+            buy_order_id=None,          # not filtering buys — we want sell only
+            sell_order_ids=sell_ids,
+        )
+
+    try:
+        ticker_price = float(public_get("/api/v3/ticker/price", {"symbol": symbol})["price"])
+    except:
+        ticker_price = trade["partial_tp_price"]
+
+    actual_entry = partial_fills.get("avg_buy_price")  or trade["entry_price"]
+    actual_exit  = partial_fills.get("avg_sell_price") or ticker_price
+    fee_usdt     = partial_fills.get("fee_usdt", 0.0)
+
+    # Cost basis for partial: proportional share of the full position cost
+    partial_cost = round(trade["budget_used"] * ratio, 4)
+    partial_rev  = round(actual_exit * partial_qty, 4)
+    partial_pnl  = round(partial_rev - partial_cost - fee_usdt, 4)
+    partial_pct  = round(partial_pnl / partial_cost * 100, 4) if partial_cost > 0 else 0.0
+
+    # Record partial close in trade_history as its own entry
+    trade_history.append({
+        **{k: v for k, v in trade.items() if not k.startswith("_")},
+        "qty":           partial_qty,
+        "budget_used":   partial_cost,
+        "exit_price":    actual_exit,
+        "exit_ticker":   ticker_price,
+        "exit_reason":   "PARTIAL_TP",
+        "closed_at":     datetime.now(timezone.utc).isoformat(),
+        "fee_usdt":      fee_usdt,
+        "cost_usdt":     partial_cost,
+        "revenue_usdt":  partial_rev,
+        "pnl_pct":       partial_pct,
+        "pnl_usdt":      partial_pnl,
+        "fills_used":    bool(partial_fills.get("avg_sell_price")),
+        "is_partial":    True,
+    })
+
+    # Mutate trade dict — position continues with reduced qty
+    trade["qty"]               = remaining_qty
+    trade["budget_used"]       = round(trade["budget_used"] * (1 - ratio), 4)
+    trade["sl_price"]          = trade["entry_price"]   # remainder is now risk-free
+    trade["partial_tp_hit"]    = True
+    # close_position uses this as bought_at_ms so fill query only sees remaining fills
+    trade["bought_at_ms"]      = partial_sold_at_ms
+
+    # Save immediately after mutation — minimises the crash window between
+    # "sell confirmed on exchange" and "state reflects reduced position"
+    save_state()
+
+    mode      = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
+    fills_note= "✅ actual fills" if partial_fills.get("avg_sell_price") else "⚠️ estimated"
+    icon      = {"MOONSHOT":"🌙","REVERSAL":"🔄"}.get(label, "🎯")
+
+    log.info(f"🎯½ [{label}] Partial TP {symbol}: sold {partial_qty} @ ${actual_exit:.6f} "
+             f"P&L ${partial_pnl:+.4f} ({partial_pct:+.2f}%) | "
+             f"Remaining: {remaining_qty} @ SL entry")
+    telegram(
+        f"🎯½ <b>Partial TP — {label}</b> [{mode}]\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Pair:      <b>{symbol}</b>\n"
+        f"Sold:      {partial_qty} ({ratio*100:.0f}%) @ <b>${actual_exit:.6f}</b>  [{fills_note}]\n"
+        f"P&L:       <b>{partial_pct:+.2f}%  (${partial_pnl:+.2f})</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Remaining: {remaining_qty} still open\n"
+        f"SL moved:  entry ${trade['entry_price']:.6f} (risk-free 🔒)\n"
+        f"Target:    ${trade['tp_price']:.6f}  (+{trade['tp_pct']*100:.0f}%)"
+    )
+    return True
+
+
 def close_position(trade, reason) -> bool:
     label  = trade["label"]
     symbol = trade["symbol"]
@@ -1257,15 +1992,33 @@ def close_position(trade, reason) -> bool:
     # For SCALPER: TAKE_PROFIT is handled by exchange limit, others need market sell
     needs_sell = (
         (label in ("MOONSHOT", "REVERSAL")) or
-        (label == "SCALPER" and reason in ("STOP_LOSS","TRAILING_STOP","TIMEOUT","FLAT_EXIT","ROTATION"))
+        (label == "SCALPER" and reason in ("STOP_LOSS","TRAILING_STOP","TIMEOUT","FLAT_EXIT","ROTATION","VOL_COLLAPSE"))
     )
 
+    sell_order_id = None
     if needs_sell and not PAPER_TRADE:
+        # For SCALPER: if there's a live TP limit order, cancel it and verify
+        # it's gone before placing the market sell. Without this, the market sell
+        # can fail with "insufficient balance" because funds are still locked in
+        # the open TP order (MEXC processes cancels asynchronously).
+        tp_order_id = trade.get("tp_order_id")
+        if label == "SCALPER" and tp_order_id:
+            cancel_order(symbol, tp_order_id, label)
+            # Brief poll to confirm cancel — up to 3 checks × 0.3s = 0.9s max wait
+            for _ in range(3):
+                time.sleep(0.3)
+                if tp_order_id not in get_open_order_ids(symbol):
+                    break
+            # Clear from trade dict regardless — even if poll timed out,
+            # the cancel request was sent and we proceed with market sell
+            trade["tp_order_id"] = None
+
         try:
             result = private_post("/api/v3/order", {
                 "symbol": symbol, "side": "SELL",
                 "type": "MARKET", "quantity": str(trade["qty"])
             })
+            sell_order_id = result.get("orderId")
             log.info(f"✅ [{label}] Market sell ({reason}): {result}")
         except requests.exceptions.HTTPError as e:
             try:    body = e.response.json()
@@ -1304,10 +2057,21 @@ def close_position(trade, reason) -> bool:
     # ── Fetch actual fill data for accurate P&L ───────────────
     exit_fills = {}
     if not PAPER_TRADE:
-        bought_at_ms = trade.get("bought_at_ms", int(time.time() * 1000) - 86400_000)
-        # For scalper TAKE_PROFIT, exchange limit may take a moment to settle
+        bought_at_ms  = trade.get("bought_at_ms", int(time.time() * 1000) - 86400_000)
+        buy_order_id  = trade.get("buy_order_id")
+        # Collect all sell order IDs we know about (TP limit + any market sell)
+        known_sell_ids = set()
+        if trade.get("tp_order_id"):
+            known_sell_ids.add(trade["tp_order_id"])
+        if sell_order_id:
+            known_sell_ids.add(sell_order_id)
+
         retries    = 5 if (reason == "TAKE_PROFIT" and label == "SCALPER") else 3
-        exit_fills = get_actual_fills(symbol, since_ms=bought_at_ms, retries=retries)
+        exit_fills = get_actual_fills(
+            symbol, since_ms=bought_at_ms, retries=retries,
+            buy_order_id=buy_order_id,
+            sell_order_ids=known_sell_ids or None,
+        )
 
     # Fallback ticker price if fills unavailable
     try:
@@ -1346,9 +2110,40 @@ def close_position(trade, reason) -> bool:
         "fills_used":    bool(exit_fills.get("avg_sell_price")),
     })
 
-    wins      = [t for t in trade_history if t["pnl_pct"] > 0]
-    win_rate  = len(wins) / len(trade_history) * 100 if trade_history else 0
-    total_pnl = sum(t["pnl_usdt"] for t in trade_history)
+    # Track consecutive scalper losses for the streak circuit breaker
+    global _consecutive_losses, _win_rate_pause_until
+    if label == "SCALPER":
+        if pnl_pct <= 0:
+            _consecutive_losses += 1
+        else:
+            _consecutive_losses = 0   # any win resets the streak
+
+    # Win-rate circuit breaker — check after every full (non-partial) close.
+    # Only counts SCALPER trades since the CB only blocks scalper entries.
+    # If the last WIN_RATE_CB_WINDOW scalper trades have win rate below threshold → 1h pause.
+    full_recent = [t for t in trade_history
+                   if not t.get("is_partial")
+                   and t.get("label") == "SCALPER"][-WIN_RATE_CB_WINDOW:]
+    if len(full_recent) >= WIN_RATE_CB_WINDOW:
+        recent_win_rate = sum(1 for t in full_recent if t["pnl_pct"] > 0) / WIN_RATE_CB_WINDOW
+        if recent_win_rate < WIN_RATE_CB_THRESHOLD and time.time() >= _win_rate_pause_until:
+            _win_rate_pause_until = time.time() + WIN_RATE_CB_PAUSE_MINS * 60
+            log.warning(f"🛑 Win-rate CB: {recent_win_rate*100:.0f}% over last "
+                        f"{WIN_RATE_CB_WINDOW} trades — pausing {WIN_RATE_CB_PAUSE_MINS}min")
+            telegram(
+                f"🛑 <b>Win-rate circuit breaker triggered</b>\n"
+                f"Win rate: <b>{recent_win_rate*100:.0f}%</b> over last {WIN_RATE_CB_WINDOW} trades "
+                f"(threshold: {WIN_RATE_CB_THRESHOLD*100:.0f}%)\n"
+                f"All new entries paused for {WIN_RATE_CB_PAUSE_MINS} minutes.\n"
+                f"Open positions still monitored."
+            )
+            save_state()
+
+    # Exclude partial TP entries from win rate — they always show positive and skew the count
+    full_trades = [t for t in trade_history if not t.get("is_partial")]
+    wins        = [t for t in full_trades if t["pnl_pct"] > 0]
+    win_rate    = len(wins) / len(full_trades) * 100 if full_trades else 0
+    total_pnl   = sum(t["pnl_usdt"] for t in trade_history)  # total includes partials
     mode      = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
     icons     = {
         "TAKE_PROFIT":   ("🎯","Take Profit Hit"),
@@ -1357,6 +2152,8 @@ def close_position(trade, reason) -> bool:
         "FLAT_EXIT":     ("😴","Flat Exit"),
         "ROTATION":      ("🔀","Rotated"),
         "TIMEOUT":       ("⏰","Timeout Exit"),
+        "VOL_COLLAPSE":  ("📉","Volume Collapsed"),
+        "PARTIAL_TP":    ("🎯½","Partial Take Profit"),
     }
     emoji, reason_label = icons.get(reason, ("✅", reason))
 
@@ -1372,9 +2169,10 @@ def close_position(trade, reason) -> bool:
         f"P&L:     <b>{pnl_pct:+.2f}%  (${pnl_usdt:+.2f})</b>\n"
         f"{fee_line}"
         f"━━━━━━━━━━━━━━━\n"
-        f"Session: {len(trade_history)} trades | Win: {win_rate:.0f}% | P&L: ${total_pnl:+.2f}"
+        f"Session: {len(full_trades)} trades | Win: {win_rate:.0f}% | P&L: ${total_pnl:+.2f}"
     )
     log.info(f"📈 Closed {symbol} [{reason}] {pnl_pct:+.2f}% | Win:{win_rate:.0f}% P&L:${total_pnl:+.2f}")
+    save_state()
     return True
 
 # ── Heartbeat ─────────────────────────────────────────────────
@@ -1387,7 +2185,9 @@ def send_heartbeat(balance: float):
 
     mode         = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
     today        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    trades_today = len([t for t in trade_history if t.get("closed_at","")[:10] == today])
+    trades_today = len([t for t in trade_history
+                        if t.get("closed_at","")[:10] == today
+                        and not t.get("is_partial")])
 
     scalper_lines = []
     for t in scalper_trades:
@@ -1505,7 +2305,7 @@ def ask_haiku(prompt: str, system: str = "", max_tokens: int = 500) -> str:
         if system:
             body["system"] = system
 
-        r = requests.post(
+        r = _get_session().post(
             "https://api.anthropic.com/v1/messages",
             headers={
                 "x-api-key":         ANTHROPIC_API_KEY,
@@ -1588,6 +2388,34 @@ def generate_daily_journal(today_trades: list, balance: float) -> str:
 
 # ── Daily summary ─────────────────────────────────────────────
 
+# ── Daily summary ─────────────────────────────────────────────
+
+def _fetch_fills_since(symbols: list, since_ms: int) -> dict:
+    """
+    Fetch all myTrades for the given symbols since since_ms.
+    Returns a dict of {orderId: {symbol, side, qty, cost}} aggregated across fills.
+    Shared by send_daily_summary and fetch_mexc_weekly_pnl.
+    """
+    all_fills = []
+    for sym in symbols:
+        try:
+            fills = private_get("/api/v3/myTrades",
+                                {"symbol": sym, "startTime": since_ms, "limit": 1000})
+            if fills:
+                all_fills.extend(fills)
+        except:
+            pass
+        time.sleep(0.1)
+    orders = defaultdict(lambda: {"symbol": "", "qty": 0, "cost": 0, "side": ""})
+    for fill in all_fills:
+        oid = fill["orderId"]
+        orders[oid]["symbol"] = fill["symbol"]
+        orders[oid]["side"]   = "BUY" if fill["isBuyer"] else "SELL"
+        orders[oid]["qty"]   += float(fill["qty"])
+        orders[oid]["cost"]  += float(fill["quoteQty"])
+    return dict(orders)
+
+
 def send_daily_summary(balance: float):
     global last_daily_summary
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1622,23 +2450,10 @@ def send_daily_summary(balance: float):
         if not symbols:
             telegram(f"📅 <b>Daily Summary</b> [{mode}]\n━━━━━━━━━━━━━━━\nNo trades today.")
             return
-        all_fills = []
-        for sym in symbols:
-            try:
-                fills = private_get("/api/v3/myTrades", {"symbol": sym, "startTime": now_ms - 86400_000, "limit": 1000})
-                if fills: all_fills.extend(fills)
-            except: pass
-            time.sleep(0.1)
-        if not all_fills:
+        orders = _fetch_fills_since(symbols, since_ms=now_ms - 86400_000)
+        if not orders:
             telegram(f"📅 <b>Daily Summary</b> [{mode}]\n━━━━━━━━━━━━━━━\nNo trades today.")
             return
-        orders = defaultdict(lambda: {"symbol":"","qty":0,"cost":0,"side":""})
-        for fill in all_fills:
-            oid = fill["orderId"]
-            orders[oid]["symbol"] = fill["symbol"]
-            orders[oid]["side"]   = "BUY" if fill["isBuyer"] else "SELL"
-            orders[oid]["qty"]   += float(fill["qty"])
-            orders[oid]["cost"]  += float(fill["quoteQty"])
         buys  = {o: v for o, v in orders.items() if v["side"] == "BUY"}
         sells = {o: v for o, v in orders.items() if v["side"] == "SELL"}
         bought = sum(v["cost"] for v in buys.values())
@@ -1683,22 +2498,9 @@ def fetch_mexc_weekly_pnl() -> dict:
         symbols = list({t["symbol"] for t in trade_history})
         if not symbols:
             return {"total":0,"buys":0,"sells":0,"pnl_usdt":0.0,"total_bought":0.0,"total_sold":0.0}
-        all_fills = []
-        for sym in symbols:
-            try:
-                fills = private_get("/api/v3/myTrades", {"symbol": sym, "startTime": now_ms - 7*86400_000, "limit": 1000})
-                if fills: all_fills.extend(fills)
-            except: pass
-            time.sleep(0.1)
-        if not all_fills:
+        orders = _fetch_fills_since(symbols, since_ms=now_ms - 7 * 86400_000)
+        if not orders:
             return {"error": "No fills found"}
-        orders = defaultdict(lambda: {"symbol":"","qty":0,"cost":0,"side":""})
-        for fill in all_fills:
-            oid = fill["orderId"]
-            orders[oid]["symbol"] = fill["symbol"]
-            orders[oid]["side"]   = "BUY" if fill["isBuyer"] else "SELL"
-            orders[oid]["qty"]   += float(fill["qty"])
-            orders[oid]["cost"]  += float(fill["quoteQty"])
         buys    = {o: v for o, v in orders.items() if v["side"] == "BUY"}
         sells   = {o: v for o, v in orders.items() if v["side"] == "SELL"}
         bought  = sum(v["cost"] for v in buys.values())
@@ -1826,14 +2628,17 @@ def listen_for_commands(balance: float):
                     f"⚙️ <b>Current Config</b>\n━━━━━━━━━━━━━━━\n"
                     f"🟢 <b>Scalper</b>\n"
                     f"  Max: {SCALPER_MAX_TRADES} × {SCALPER_BUDGET_PCT*100:.0f}%\n"
-                    f"  TP: ATR×{SCALPER_TP_ATR_MULT:.0f} (2:1 R:R, cap {SCALPER_TP_LIMIT*100:.0f}%)\n"
-                    f"  SL: ATR×{SCALPER_ATR_MULT} | Trail: +{SCALPER_TRAIL_ACT*100:.0f}% → {SCALPER_TRAIL_PCT*100:.1f}%\n"
+                    f"  TP: dynamic {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% (signal-aware, candle-capped)\n"
+                    f"  SL: dynamic {SCALPER_SL_MIN*100:.1f}–{SCALPER_SL_MAX*100:.0f}% (noise-floored)\n"
+                    f"  Trail: +{SCALPER_TRAIL_ACT*100:.0f}% → {SCALPER_TRAIL_PCT*100:.1f}%\n"
                     f"  Watchlist: {len(_watchlist)} pairs | age: {(time.time()-_watchlist_at)/60:.0f}min\n"
                     f"\n🌙 <b>Moonshot</b>  [bot-monitored]\n"
                     f"  Max: {ALT_MAX_TRADES} trades | Min budget: ${MIN_ALT_BUDGET:.2f}\n"
-                    f"  TP: +{MOONSHOT_TP*100:.0f}%  SL: -{MOONSHOT_SL*100:.0f}%  Max: {MOONSHOT_MAX_HOURS}h\n"
+                    f"  TP: +{MOONSHOT_TP*100:.0f}%  SL: -{MOONSHOT_SL*100:.0f}%  Max: {MOONSHOT_TIMEOUT_MAX_MINS}min\n"
+                    f"  Partial TP: {MOONSHOT_PARTIAL_TP_RATIO*100:.0f}% sold at +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% → SL moves to entry\n"
                     f"\n🔄 <b>Reversal</b>  [bot-monitored]\n"
-                    f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%  Max: {REVERSAL_MAX_HOURS}h\n"
+                    f"  TP: +{REVERSAL_TP*100:.1f}%  SL: cap-candle anchor  Max: {REVERSAL_MAX_HOURS}h\n"
+                    f"  Partial TP: {REVERSAL_PARTIAL_TP_RATIO*100:.0f}% sold at +{REVERSAL_PARTIAL_TP_PCT*100:.1f}% → SL moves to entry\n"
                     f"\n🧠 Sentiment: {'✅ on' if SENTIMENT_ENABLED else '⚠️ off'}\n"
                     f"\n{'⏸️ PAUSED' if _paused else '▶️ RUNNING'}"
                 )
@@ -1903,32 +2708,141 @@ def listen_for_commands(balance: float):
 # ── Startup reconciliation ─────────────────────────────────────
 
 def reconcile_open_positions():
+    """
+    At startup: verify loaded state against exchange reality.
+
+    Three checks:
+    1. Balance cross-check — each loaded position must still have a non-dust
+       balance on the exchange. If not, the position closed while we were down.
+    2. Untracked holdings — non-dust balances with no state entry (crash mid-buy,
+       manual trades). Flagged via Telegram; bot cannot monitor without entry price.
+    3. Orphan orders — exchange open orders with no matching state entry.
+    """
     if PAPER_TRADE:
+        if scalper_trades or alt_trades:
+            log.info(f"✅ [PAPER] Restored {len(scalper_trades)} scalper + {len(alt_trades)} alt trades.")
         return
     try:
+        # Fetch balances once — used by all three checks below
+        try:
+            balances = {b["asset"]: float(b.get("free", 0)) + float(b.get("locked", 0))
+                        for b in private_get("/api/v3/account").get("balances", [])}
+        except Exception as e:
+            log.warning(f"Balance fetch failed during reconcile: {e}")
+            balances = {}
+
+        # ── 1. Balance cross-check for loaded positions ────────────
+        if scalper_trades or alt_trades:
+
+            stale = []
+            for trade in list(scalper_trades + alt_trades):
+                asset = trade["symbol"].replace("USDT", "")
+                held  = balances.get(asset, 0.0)
+                # Dust threshold: less than 5% of expected qty means position closed on exchange
+                expected_qty = trade.get("qty", 0)
+                if expected_qty > 0 and held < expected_qty * 0.05:
+                    stale.append(trade)
+                    log.warning(f"⚠️  [{trade['label']}] {trade['symbol']}: state says "
+                                f"qty={expected_qty:.4f} but exchange shows {held:.4f} — "
+                                f"position likely closed while bot was down")
+
+            if stale:
+                for trade in stale:
+                    # Remove from active lists and record as unknown exit
+                    if trade in scalper_trades:
+                        scalper_trades.remove(trade)
+                    if trade in alt_trades:
+                        alt_trades.remove(trade)
+                    trade_history.append({
+                        **{k: v for k, v in trade.items() if not k.startswith("_")},
+                        "exit_price":   trade.get("entry_price", 0),
+                        "exit_ticker":  trade.get("entry_price", 0),
+                        "exit_reason":  "UNKNOWN_CLOSED",
+                        "closed_at":    datetime.now(timezone.utc).isoformat(),
+                        "fee_usdt":     0.0,
+                        "cost_usdt":    trade.get("budget_used", 0),
+                        "revenue_usdt": trade.get("budget_used", 0),
+                        "pnl_pct":      0.0,
+                        "pnl_usdt":     0.0,
+                        "fills_used":   False,
+                        "note":         "Closed while bot was offline — P&L unknown",
+                    })
+                save_state()
+                syms = [t["symbol"] for t in stale]
+                telegram(
+                    f"⚠️ <b>Positions closed while bot was offline</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"Symbols: <b>{', '.join(syms)}</b>\n"
+                    f"Recorded as UNKNOWN_CLOSED — check MEXC for actual P&L.\n"
+                    f"Remaining positions are being monitored normally."
+                )
+            elif scalper_trades or alt_trades:
+                log.info(f"✅ Restored {len(scalper_trades)} scalper + {len(alt_trades)} alt trades "
+                         f"— exchange balances confirmed.")
+
+        # ── 2. Untracked holdings scan ─────────────────────────────
+        # Find non-dust balances with no matching bot state.
+        # Use a single batch price fetch rather than N individual calls.
+        if balances:
+            known_assets = {t["symbol"].replace("USDT", "") for t in scalper_trades + alt_trades}
+            candidates   = [a for a, q in balances.items()
+                            if a not in ("USDT", "MX") and a not in known_assets and q > 0]
+            if candidates:
+                try:
+                    all_prices = {p["symbol"]: float(p["price"])
+                                  for p in public_get("/api/v3/ticker/price")}
+                except Exception:
+                    all_prices = {}
+
+                untracked = []
+                for asset in candidates:
+                    price = all_prices.get(f"{asset}USDT", 0.0)
+                    value = balances[asset] * price
+                    if value >= 5.0:
+                        untracked.append(f"{asset}: {balances[asset]:.4f} (~${value:.2f})")
+
+                if untracked:
+                    log.warning(f"⚠️  Untracked holdings: {untracked}")
+                    telegram(
+                        f"⚠️ <b>Untracked holdings detected</b>\n━━━━━━━━━━━━━━━\n"
+                        + "\n".join(untracked) + "\n\n"
+                        f"These are NOT being monitored (no entry price/SL/TP in state).\n"
+                        f"Could be a crash mid-buy or manual trade. Close on MEXC if unwanted."
+                    )
+        # ── 3. Orphan order detection ──────────────────────────────
         open_orders = private_get("/api/v3/openOrders", {})
         if not open_orders:
             return
-        symbols = list({o["symbol"] for o in open_orders})
-        log.warning(f"⚠️  Found {len(open_orders)} open orders at startup: {symbols}")
-        telegram(
-            f"⚠️ <b>Bot restarted with open orders!</b>\n━━━━━━━━━━━━━━━\n"
-            f"Found {len(open_orders)} open order(s): <b>{', '.join(symbols)}</b>\n\n"
-            f"SL is no longer active for these positions.\n"
-            f"👉 Please check MEXC and close any losing positions manually."
-        )
+        known_symbols = {t["symbol"] for t in scalper_trades + alt_trades}
+        orphan_orders = [o for o in open_orders if o["symbol"] not in known_symbols]
+        if orphan_orders:
+            syms = list({o["symbol"] for o in orphan_orders})
+            log.warning(f"⚠️  Found {len(orphan_orders)} orphaned order(s) with no state: {syms}")
+            telegram(
+                f"⚠️ <b>Orphaned orders found at startup!</b>\n━━━━━━━━━━━━━━━\n"
+                f"Found {len(orphan_orders)} order(s) not in saved state: <b>{', '.join(syms)}</b>\n\n"
+                f"These are NOT being monitored. Check MEXC and close manually if needed."
+            )
     except Exception as e:
         log.error(f"Reconcile failed: {e}")
 
 # ── Main loop ──────────────────────────────────────────────────
 
 def run():
-    global scalper_trades, alt_trades, _last_rotation_scan, _watchlist, _watchlist_at, MIN_ALT_BUDGET
+    global scalper_trades, alt_trades, trade_history, _consecutive_losses, \
+           _win_rate_pause_until, _last_rotation_scan, _watchlist, _watchlist_at, \
+           MIN_ALT_BUDGET, _scalper_excluded, _alt_excluded
 
     mode = "📝 PAPER TRADING" if PAPER_TRADE else "💰 LIVE TRADING"
     log.info(f"🚀 MEXC Bot — {mode}")
 
     _load_symbol_rules()
+
+    # ── Restore persisted state ────────────────────────────────
+    (scalper_trades, alt_trades, trade_history,
+     _consecutive_losses, _win_rate_pause_until,
+     _scalper_excluded, _alt_excluded) = load_state()
+
     reconcile_open_positions()
 
     # Build initial watchlist at startup
@@ -1943,12 +2857,13 @@ def run():
         f"🚀 <b>MEXC Bot Started</b> [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"Balance: <b>${startup_balance:.2f} USDT</b>\n"
         f"\n🟢 <b>Scalper</b> (max {SCALPER_MAX_TRADES} × {SCALPER_BUDGET_PCT*100:.0f}%)\n"
-        f"  TP: ATR×{SCALPER_TP_ATR_MULT:.0f} (2:1 R:R) | SL: ATR×{SCALPER_ATR_MULT} (period {SCALPER_ATR_PERIOD})\n"
+        f"  TP/SL: dynamic (signal-aware ATR×mult, candle-capped, noise-floored)\n"
+        f"  TP range: {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% | SL range: {SCALPER_SL_MIN*100:.1f}–{SCALPER_SL_MAX*100:.0f}%\n"
         f"  Entry threshold: score ≥ {SCALPER_THRESHOLD} | 1h vol ≥ ${SCALPER_MIN_1H_VOL:,}\n"
         f"  Trail: +{SCALPER_TRAIL_ACT*100:.0f}% → {SCALPER_TRAIL_PCT*100:.1f}% trail\n"
         f"  Breakeven: score ≥ {SCALPER_BREAKEVEN_SCORE} → lock at +{SCALPER_BREAKEVEN_ACT*100:.1f}%\n"
         f"  Symbol cooldown: {SCALPER_SYMBOL_COOLDOWN//60}min after SL\n"
-        f"  Daily loss limit: -{SCALPER_DAILY_LOSS_PCT*100:.0f}% of balance → circuit breaker\n"
+        f"  Circuit breakers: daily -{SCALPER_DAILY_LOSS_PCT*100:.0f}% | {MAX_CONSECUTIVE_LOSSES} consecutive losses\n"
         f"  Watchlist: top {WATCHLIST_SIZE} pairs, refresh every {WATCHLIST_TTL//60}min\n"
         f"\n🌙 <b>Moonshot</b> (max {ALT_MAX_TRADES} trades, 5% each) [bot-monitored]\n"
         f"  TP: +{MOONSHOT_TP*100:.0f}%  SL: -{MOONSHOT_SL*100:.0f}%  max {MOONSHOT_MAX_HOURS}h\n"
@@ -1960,11 +2875,14 @@ def run():
         f"\n<i>/status · /pnl · /logs · /config · /pause · /resume · /close · /ask</i>"
     )
 
-    scalper_excluded = {}   # {symbol: cooldown_until_ts} — 30min cooldown after SL
-    alt_excluded     = set()
+    balance = get_available_balance()  # initialise before loop for listen_for_commands
 
     while True:
         try:
+            # ── Commands first — ensures /pause and /close respond even
+            # if MEXC API calls later in the loop are slow or timing out
+            listen_for_commands(balance)
+
             balance = get_available_balance()
             _load_symbol_rules()
 
@@ -1981,79 +2899,166 @@ def run():
                 else:
                     total_value += t["budget_used"]
 
+            # ── Circuit breakers ──────────────────────────────────
+            # Three independent gates — all block new scalper entries:
+            # 1. Daily loss:    total session P&L dropped below threshold
+            # 2. Loss streak:   N consecutive SLs regardless of total P&L
+            # 3. Win rate:      last WIN_RATE_CB_WINDOW trades < WIN_RATE_CB_THRESHOLD win rate
+            today        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            daily_pnl    = sum(t["pnl_usdt"] for t in trade_history
+                               if t.get("closed_at","")[:10] == today
+                               and not t.get("is_partial"))
+            loss_limit   = -(startup_balance * SCALPER_DAILY_LOSS_PCT)
+            daily_cb     = daily_pnl < loss_limit
+            streak_cb    = _consecutive_losses >= MAX_CONSECUTIVE_LOSSES
+            win_rate_cb  = time.time() < _win_rate_pause_until
+            circuit_open = daily_cb or streak_cb or win_rate_cb
+
+            if circuit_open and int(time.time()) % 300 < 3:
+                if win_rate_cb:
+                    mins_left = (_win_rate_pause_until - time.time()) / 60
+                    log.info(f"🛑 Win-rate pause active ({mins_left:.0f}min remaining) — no new entries")
+                else:
+                    reason_str = (f"daily P&L ${daily_pnl:.2f}" if daily_cb
+                                  else f"{_consecutive_losses} consecutive losses")
+                    log.info(f"🛑 Circuit open ({reason_str}) — no new scalper entries")
+
+            if daily_cb and not getattr(run, "_circuit_alerted_today", ""):
+                run._circuit_alerted_today = today
+                telegram(
+                    f"🛑 <b>Daily loss limit hit</b>\n"
+                    f"Session P&L: <b>${daily_pnl:.2f}</b> (limit: ${loss_limit:.2f})\n"
+                    f"No new scalper entries until midnight UTC.\n"
+                    f"Open positions still monitored."
+                )
+            elif not daily_cb:
+                run._circuit_alerted_today = ""
+
+            if streak_cb and not getattr(run, "_streak_alerted", False):
+                run._streak_alerted = True
+                telegram(
+                    f"🛑 <b>Loss streak limit hit</b>\n"
+                    f"<b>{_consecutive_losses} consecutive scalper losses.</b>\n"
+                    f"Pausing new entries until a win resets the streak.\n"
+                    f"Open positions still monitored."
+                )
+            elif not streak_cb:
+                run._streak_alerted = False
+
+            # ── Max combined exposure check ───────────────────────
+            # If open positions already consume MAX_EXPOSURE_PCT of balance,
+            # skip new entries this cycle — don't concentrate risk further.
+            open_exposure = sum(t.get("budget_used", 0) for t in scalper_trades + alt_trades)
+            over_exposed  = (open_exposure / balance > MAX_EXPOSURE_PCT) if balance > 0 else False
+            if over_exposed:
+                log.debug(f"⚠️ Over-exposed (${open_exposure:.0f} / ${balance:.0f}) — skipping new entries")
+
             # Fetch tickers only when actively scanning for new entries
-            scalper_needs_entry = not _paused and len(scalper_trades) < SCALPER_MAX_TRADES
-            alt_needs_entry     = not _paused and len(alt_trades) < ALT_MAX_TRADES
+            scalper_needs_entry = (not _paused and not circuit_open and not over_exposed
+                                   and len(scalper_trades) < SCALPER_MAX_TRADES)
+            alt_needs_entry     = not _paused and not over_exposed and len(alt_trades) < ALT_MAX_TRADES
             need_scan           = scalper_needs_entry or alt_needs_entry
-            tickers             = fetch_tickers() if need_scan else None
+            tickers             = None
+            if need_scan:
+                try:
+                    tickers = fetch_tickers()
+                except Exception as e:
+                    log.warning(f"fetch_tickers failed — skipping entry scan this cycle: {e}")
 
             # Rebuild watchlist every WATCHLIST_TTL seconds (30 min)
             if time.time() - _watchlist_at >= WATCHLIST_TTL:
                 log.info("📋 Watchlist TTL expired — rebuilding...")
                 build_watchlist(tickers if tickers is not None else fetch_tickers())
 
-            # ── Daily loss circuit breaker ────────────────────────
-            today        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            daily_pnl    = sum(t["pnl_usdt"] for t in trade_history
-                               if t.get("closed_at","")[:10] == today)
-            loss_limit   = -(startup_balance * SCALPER_DAILY_LOSS_PCT)
-            circuit_open = daily_pnl < loss_limit
-            # Only log circuit state once every 5 minutes to avoid spam at 2s sleep
-            if circuit_open and int(time.time()) % 300 < 3:
-                log.info(f"🛑 Daily loss limit active (${daily_pnl:.2f} < ${loss_limit:.2f}) "
-                         f"— no new scalper entries today")
-            # Send Telegram alert exactly once when limit is first hit
-            if circuit_open and not getattr(run, "_circuit_alerted_today", ""):
-                run._circuit_alerted_today = today
-                telegram(
-                    f"🛑 <b>Daily loss limit hit</b>\n"
-                    f"Session P&L: <b>${daily_pnl:.2f}</b> (limit: ${loss_limit:.2f})\n"
-                    f"No new scalper entries until midnight UTC.\n"
-                    f"Open positions are still monitored."
-                )
-            elif not circuit_open:
-                run._circuit_alerted_today = ""  # reset for tomorrow
-
             # ── Scalper ───────────────────────────────────────
-            budget = round(balance * SCALPER_BUDGET_PCT, 2)  # always defined before both branches
+            budget = round(balance * SCALPER_BUDGET_PCT, 2)
 
-            if not _paused and not circuit_open and len(scalper_trades) < SCALPER_MAX_TRADES:
-                opp = find_scalper_opportunity(budget,
-                                               exclude=scalper_excluded,
-                                               open_symbols=open_symbols)
+            # ── Step 1: Try to open a new scalper entry ───────
+            if scalper_needs_entry:
+                # BTC regime filter — three independent checks.
+                # Any one failing skips entry for this cycle.
+                # Uses already-cached BTCUSDT klines when possible.
+                btc_regime_ok = True
+                try:
+                    df_btc = parse_klines("BTCUSDT", interval="5m", limit=60, min_len=50)
+                    if df_btc is not None:
+                        btc_close = df_btc["close"]
+
+                        # 1. Hard candle drop — last candle worse than -BTC_REGIME_DROP
+                        btc_chg = (float(btc_close.iloc[-1]) /
+                                   float(df_btc["open"].iloc[-1]) - 1)
+                        if btc_chg < -BTC_REGIME_DROP:
+                            btc_regime_ok = False
+                            log.info(f"🔴 BTC regime: hard drop {btc_chg*100:.2f}% — skip entry")
+
+                        # 2. EMA micro-trend — price below 20-candle EMA = downtrend
+                        if btc_regime_ok:
+                            btc_ema = calc_ema(btc_close, BTC_REGIME_EMA_PERIOD)
+                            if float(btc_close.iloc[-1]) < float(btc_ema.iloc[-1]):
+                                btc_regime_ok = False
+                                log.info("🔴 BTC regime: price below EMA20 — skip entry")
+
+                        # 3. Volatility spike — current ATR vs recent ATR average.
+                        # Compute on the full series so ewm has proper warmup history,
+                        # then compare the last value to the mean of the prior 20 values.
+                        if btc_regime_ok:
+                            tr_full = pd.concat([
+                                df_btc["high"] - df_btc["low"],
+                                (df_btc["high"] - df_btc["close"].shift(1)).abs(),
+                                (df_btc["low"]  - df_btc["close"].shift(1)).abs(),
+                            ], axis=1).max(axis=1)
+                            atr_series = tr_full.ewm(alpha=1.0 / 14, adjust=False).mean()
+                            btc_atr_now = float(atr_series.iloc[-1])
+                            btc_atr_avg = float(atr_series.iloc[-41:-1].mean())  # 40-candle avg with proper warmup
+                            if btc_atr_avg > 0 and btc_atr_now > btc_atr_avg * BTC_REGIME_VOL_MULT:
+                                btc_regime_ok = False
+                                log.info(f"🔴 BTC regime: vol spike "
+                                         f"ATR×{btc_atr_now/btc_atr_avg:.1f} — skip entry")
+                except Exception:
+                    pass  # never block entry on a BTC fetch failure
+
+                opp = None
+                if btc_regime_ok:
+                    opp = find_scalper_opportunity(budget,
+                                                   exclude=_scalper_excluded,
+                                                   open_symbols=open_symbols)
                 if opp:
-                    sl_atr = opp["atr_pct"] * SCALPER_ATR_MULT
-                    trade  = open_position(opp, budget, SCALPER_TP_LIMIT, SCALPER_SL,
-                                           "SCALPER", sl_override_pct=sl_atr)
+                    trade  = open_position(opp, budget, 0.0, 0.0, "SCALPER")
                     if trade:
                         scalper_trades.append(trade)
-                        # Only remove THIS symbol's cooldown — other symbols keep theirs
-                        scalper_excluded.pop(opp["symbol"], None)
-            else:
-                # At max capacity (or circuit open) — check for rotation every ROTATION_SCAN_INTERVAL
-                now        = time.time()
+                        _scalper_excluded.pop(opp["symbol"], None)
+
+            # ── Step 2: Check exits on ALL open scalper trades ─
+            # This runs unconditionally — whether we have 1 or 3 trades,
+            # whether we're entering or not, whether circuit is open or not.
+            # Previously this was inside the else-branch only, meaning trades
+            # with 1-2 open positions NEVER had their SL/TP/trail checked.
+            if scalper_trades:
                 best_opp   = None
                 best_score = 0
-                if not circuit_open and now - _last_rotation_scan >= ROTATION_SCAN_INTERVAL:
-                    _last_rotation_scan = now
-                    best_opp   = find_scalper_opportunity(budget,
-                                                          exclude=scalper_excluded,
-                                                          open_symbols=open_symbols)
-                    best_score = best_opp["score"] if best_opp else 0
+                # Only scan for rotation candidate when at max capacity
+                at_max = len(scalper_trades) >= SCALPER_MAX_TRADES
+                if at_max and not circuit_open:
+                    now = time.time()
+                    if now - _last_rotation_scan >= ROTATION_SCAN_INTERVAL:
+                        _last_rotation_scan = now
+                        best_opp   = find_scalper_opportunity(budget,
+                                                              exclude=_scalper_excluded,
+                                                              open_symbols=open_symbols)
+                        best_score = best_opp["score"] if best_opp else 0
 
+                # Compute the worst-performing trade once — used to decide rotation target
+                worst_pct = min((t.get("highest_price", t["entry_price"]) /
+                                 t["entry_price"] - 1) * 100 for t in scalper_trades)
                 for trade in scalper_trades[:]:
                     tpct     = (trade.get("highest_price", trade["entry_price"]) /
                                 trade["entry_price"] - 1) * 100
-                    worst    = min((t.get("highest_price", t["entry_price"]) /
-                                   t["entry_price"] - 1) * 100 for t in scalper_trades)
-                    is_worst = abs(tpct - worst) < 0.01
-                    s_arg    = best_score if is_worst else 0
+                    s_arg    = best_score if abs(tpct - worst_pct) < 0.01 else 0
 
                     should_exit, reason = check_exit(trade, best_score=s_arg)
                     if should_exit:
-                        # SL/hard exits: add 30min cooldown. Rotation/TP: no penalty.
-                        if reason in ("STOP_LOSS", "TRAILING_STOP", "FLAT_EXIT"):
-                            scalper_excluded[trade["symbol"]] = (
+                        if reason in ("STOP_LOSS", "TRAILING_STOP", "FLAT_EXIT", "TIMEOUT"):
+                            _scalper_excluded[trade["symbol"]] = (
                                 time.time() + SCALPER_SYMBOL_COOLDOWN
                             )
                             log.info(f"⏳ [SCALPER] {trade['symbol']} in cooldown "
@@ -2061,53 +3066,62 @@ def run():
                         if close_position(trade, reason):
                             scalper_trades.remove(trade)
                             if reason == "ROTATION" and best_opp:
-                                sl_atr = best_opp["atr_pct"] * SCALPER_ATR_MULT
-                                new_t  = open_position(best_opp, budget, SCALPER_TP_LIMIT,
-                                                       SCALPER_SL, "SCALPER",
-                                                       sl_override_pct=sl_atr)
+                                new_t  = open_position(best_opp, budget, 0.0, 0.0, "SCALPER")
                                 if new_t:
                                     scalper_trades.append(new_t)
-                                    scalper_excluded.pop(best_opp["symbol"], None)
+                                    _scalper_excluded.pop(best_opp["symbol"], None)
 
             # ── Alt (Moonshot / Reversal) ─────────────────────
             if not _paused and len(alt_trades) < ALT_MAX_TRADES:
                 ideal  = round(total_value * MOONSHOT_BUDGET_PCT, 2)
                 budget = min(ideal, balance)
+                # Dynamic floor: 5% of current balance (min $5) — prevents opening
+                # tiny trades as balance shrinks while still allowing trades
+                min_alt = max(5.0, round(balance * 0.05, 2))
 
-                if budget < MIN_ALT_BUDGET:
-                    log.info(f"💰 Alt budget ${budget:.2f} below minimum ${MIN_ALT_BUDGET:.2f} — skipping scan")
+                if budget < min_alt:
+                    log.info(f"💰 Alt budget ${budget:.2f} below floor ${min_alt:.2f} — skipping scan")
+                elif tickers is None:
+                    log.debug("Alt scan skipped — tickers unavailable this cycle")
                 else:
                     log.info(f"💰 Alt budget: ${budget:.2f} "
                              f"(ideal ${ideal:.2f} | free ${balance:.2f} | total ${total_value:.2f})")
                     opp = find_moonshot_opportunity(tickers, budget,
-                                                    exclude=alt_excluded,
+                                                    exclude=_alt_excluded,
                                                     open_symbols=open_symbols)
                     if opp:
                         trade = open_position(opp, budget, MOONSHOT_TP, MOONSHOT_SL,
                                               "MOONSHOT", max_hours=MOONSHOT_MAX_HOURS)
                         if trade:
-                            alt_trades.append(trade); alt_excluded = set()
+                            alt_trades.append(trade); _alt_excluded = set()
+                        else:
+                            _alt_excluded.discard(opp["symbol"])  # don't permanently exclude on failed open
                     else:
                         opp = find_reversal_opportunity(tickers, budget,
-                                                        exclude=alt_excluded,
+                                                        exclude=_alt_excluded,
                                                         open_symbols=open_symbols)
                         if opp:
                             trade = open_position(opp, budget, REVERSAL_TP, REVERSAL_SL,
                                                   "REVERSAL", max_hours=REVERSAL_MAX_HOURS)
                             if trade:
-                                alt_trades.append(trade); alt_excluded = set()
+                                alt_trades.append(trade); _alt_excluded = set()
+                            else:
+                                _alt_excluded.discard(opp["symbol"])
 
             for trade in alt_trades[:]:
                 should_exit, reason = check_exit(trade)
                 if should_exit:
-                    alt_excluded.add(trade["symbol"])
-                    if close_position(trade, reason):
-                        alt_trades.remove(trade)
+                    if reason == "PARTIAL_TP":
+                        # Sell half, update trade in place — do NOT remove from list
+                        execute_partial_tp(trade)
+                    else:
+                        _alt_excluded.add(trade["symbol"])
+                        if close_position(trade, reason):
+                            alt_trades.remove(trade)
 
             send_heartbeat(balance)
             send_daily_summary(balance)
             send_weekly_summary(balance)
-            listen_for_commands(balance)
             # Scalper checks every 2s (thin altcoins can spike fast)
             # Alt trades every 5s (longer hold, less time-sensitive)
             # No open positions: full SCAN_INTERVAL before next scan
@@ -2120,6 +3134,7 @@ def run():
 
         except KeyboardInterrupt:
             log.info("🛑 Stopped.")
+            save_state()
             for t in scalper_trades + alt_trades:
                 log.warning(f"⚠️  Holding {t['symbol']} ({t['label']}) — close manually if live!")
             telegram("🛑 <b>Bot stopped.</b> Check Railway.")
