@@ -1,9 +1,9 @@
 """
 MEXC Trading Bot — 3 Strategies
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  1. SCALPER  — Max 3 trades (30% each) | Trailing Stop | ATR SL | 1H trend aligned
-  2. MOONSHOT — Max 2 trades (5%) | TP +25% | SL -7% | Bot-monitored exits only
-  3. REVERSAL — Max 2 trades (5%) | TP +3%  | SL -2%  | Oversold bounce + volume capitulation
+  1. SCALPER  — Max 3 trades (30% each) | ATR TP (2:1 R:R) | ATR SL | 1H trend | 30min watchlist
+  2. MOONSHOT — Max 2 trades (5%) | TP +15% | SL -5% | Bot-monitored exits only
+  3. REVERSAL — Max 2 trades (5%) | TP +4%  | SL -2% | Oversold bounce + volume capitulation
      Moonshot and Reversal share the alt slot.
 """
 
@@ -28,11 +28,12 @@ PAPER_BALANCE = 50.0
 # ── Scalper (max 3 concurrent) ────────────────────────────────
 SCALPER_MAX_TRADES  = 3
 SCALPER_BUDGET_PCT  = 0.30
-SCALPER_TP_LIMIT    = 0.10
-SCALPER_TRAIL_ACT   = 0.02
-SCALPER_TRAIL_PCT   = 0.01
-SCALPER_ATR_MULT    = 1.5
-SCALPER_SL          = 0.02
+SCALPER_TP_ATR_MULT = 3.0       # TP = 3×ATR (vs SL = 1.5×ATR → guaranteed 2:1 R:R)
+SCALPER_TP_LIMIT    = 0.10      # fallback TP if ATR unavailable (+10%)
+SCALPER_TRAIL_ACT   = 0.03      # trailing stop activates at +3% (raised from +2%)
+SCALPER_TRAIL_PCT   = 0.015     # trail 1.5% below highest (raised from 1%)
+SCALPER_ATR_MULT    = 1.5       # SL = 1.5×ATR
+SCALPER_SL          = 0.02      # fallback SL if ATR unavailable (2%)
 SCALPER_FLAT_MINS   = 30
 SCALPER_FLAT_RANGE  = 0.005
 SCALPER_ROTATE_GAP  = 20
@@ -42,33 +43,38 @@ SCALPER_MIN_CHANGE  = 0.1
 SCALPER_THRESHOLD   = 20
 SCALPER_MAX_RSI     = 70
 
+# ── Watchlist — universe of pairs pre-scored every 30 minutes ──
+WATCHLIST_SIZE      = 30        # top N pairs by score to trade from
+WATCHLIST_TTL       = 1800      # seconds between full rescores (30 min)
+
 # ── Moonshot ──────────────────────────────────────────────────
-# Max 2 concurrent — enough exposure without over-concentrating on thin markets
 ALT_MAX_TRADES      = 2
 MOONSHOT_BUDGET_PCT = 0.05
-MOONSHOT_TP         = 0.25      # +25%
-MOONSHOT_SL         = 0.07      # -7% (tightened from -10% — less bleed on failures)
+MOONSHOT_TP         = 0.15      # +15% (was +25% — more achievable in 1h)
+MOONSHOT_SL         = 0.05      # -5% (tightened from -7% — 1h window, cut fast)
 MOONSHOT_MAX_VOL    = 500_000
 MOONSHOT_MIN_VOL    = 5_000
-MOONSHOT_MIN_1H     = 5.0       # min 5% move in last 1h
-MOONSHOT_MIN_SCORE  = 20        # tightened from 15 — higher quality entries only
+MOONSHOT_MIN_1H     = 5.0
+MOONSHOT_MIN_SCORE  = 20
 MOONSHOT_MAX_HOURS  = 1
 MOONSHOT_MIN_DAYS   = 2
 MOONSHOT_NEW_DAYS   = 14
-MOONSHOT_MIN_VOL_BURST = 2.5    # min volume burst ratio (tightened from 2.0 for new, 3.0 for existing)
+MOONSHOT_MIN_VOL_BURST = 2.5
 
 # ── Reversal ──────────────────────────────────────────────────
-REVERSAL_BUDGET_PCT = 0.05
-REVERSAL_TP         = 0.030
-REVERSAL_SL         = 0.020
+REVERSAL_TP         = 0.040     # +4% (was +3% — better R:R at 2:1)
+REVERSAL_SL         = 0.020     # -2% unchanged
 REVERSAL_MIN_VOL    = 100_000
 REVERSAL_MAX_RSI    = 32
 REVERSAL_MIN_DROP   = 3.0
-REVERSAL_MAX_HOURS  = 4
+REVERSAL_MAX_HOURS  = 2         # tightened from 4h — if no bounce in 2h, exit
 
 # ── Shared ────────────────────────────────────────────────────
-MIN_PRICE     = 0.001
-SCAN_INTERVAL = 60
+MIN_PRICE         = 0.001
+SCAN_INTERVAL     = 60
+# MIN_ALT_BUDGET is calculated at startup from actual balance (10% of starting balance)
+# e.g. $50 account → $5 minimum, $200 account → $20 minimum
+MIN_ALT_BUDGET    = None  # set in run() after fetching balance
 
 TELEGRAM_TOKEN   = "8729639207:AAGR2ytuX36ocCVagQj-tGBE2QEkvrTiqQo"
 TELEGRAM_CHAT_ID = "7058246374"
@@ -101,6 +107,20 @@ _api_blacklist        = set()
 _scanner_log_buffer   = []
 _MAX_SCANNER_LOGS     = 5
 _paused               = False
+
+# Rotation scan cooldown — don't hammer 40+ API calls every 5s
+_last_rotation_scan    = 0.0
+ROTATION_SCAN_INTERVAL = 30  # seconds between rotation scans
+
+# New listings cache — scanning 60 symbols takes 3+ seconds, cache for 5 min
+_new_listings_cache    = []
+_new_listings_cache_at = 0.0
+NEW_LISTINGS_CACHE_TTL = 300  # seconds
+
+# Watchlist — top WATCHLIST_SIZE pairs pre-scored every WATCHLIST_TTL seconds
+# During normal scans we only evaluate these, saving hundreds of API calls per hour
+_watchlist             = []   # list of scored candidate dicts
+_watchlist_at          = 0.0  # timestamp of last full rebuild
 
 # ── Telegram ───────────────────────────────────────────────────
 
@@ -136,6 +156,7 @@ def private_request(method, path, params=None):
     if   method == "GET":    r = requests.get(url,    headers=headers, timeout=10)
     elif method == "POST":   r = requests.post(url,   headers=headers, timeout=10)
     elif method == "DELETE": r = requests.delete(url, headers=headers, timeout=10)
+    else: raise ValueError(f"Unsupported method: {method}")
     r.raise_for_status()
     return r.json()
 
@@ -271,6 +292,61 @@ def pick_tradeable(candidates: list, budget: float, label: str) -> dict | None:
     log.info(f"[{label}] All candidates failed notional/qty checks.")
     return None
 
+
+def build_watchlist(tickers: pd.DataFrame):
+    """
+    Score ALL eligible pairs and cache the top WATCHLIST_SIZE scorers.
+    Called every WATCHLIST_TTL seconds (30 min) — this is the expensive scan.
+    Between rebuilds, the scalper only evaluates pairs already on the watchlist.
+    """
+    global _watchlist, _watchlist_at
+
+    df = tickers.copy()
+    df = df[df["quoteVolume"] >= SCALPER_MIN_VOL]
+    df = df[df["lastPrice"]   >= SCALPER_MIN_PRICE]
+    df = df[df["abs_change"]  >= SCALPER_MIN_CHANGE]
+    df = df[~df["symbol"].isin(_api_blacklist)]
+    candidates = df.sort_values("quoteVolume", ascending=False).head(120)["symbol"].tolist()
+
+    log.info(f"📋 [WATCHLIST] Building from {len(candidates)} candidates (full rescore)...")
+
+    # Age filter — batch check new listings
+    established = []
+    for sym in candidates:
+        try:
+            data = public_get("/api/v3/klines", {"symbol": sym, "interval": "1d", "limit": 7})
+            if len(data) >= 7:
+                established.append(sym)
+        except:
+            established.append(sym)
+        time.sleep(0.05)
+
+    # Score all in parallel
+    scores = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(evaluate_scalper_candidate, sym): sym for sym in established}
+        for f in as_completed(futures):
+            result = f.result()
+            if result:
+                scores.append(result)
+
+    scores.sort(key=lambda x: x["score"], reverse=True)
+    _watchlist    = scores[:WATCHLIST_SIZE]
+    _watchlist_at = time.time()
+
+    symbols = [s["symbol"] for s in _watchlist]
+    log.info(f"📋 [WATCHLIST] {len(_watchlist)} pairs selected: {', '.join(symbols[:8])}{'...' if len(symbols) > 8 else ''}")
+    scanner_log(f"📋 Watchlist rebuilt — top: {symbols[0] if symbols else 'none'} "
+                f"({len(_watchlist)} pairs, next refresh in {WATCHLIST_TTL//60}min)")
+
+    telegram(
+        f"📋 <b>Watchlist Updated</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Top pairs: <b>{', '.join(symbols[:5])}</b>\n"
+        f"{'...' + str(len(symbols)-5) + ' more' if len(symbols) > 5 else ''}\n"
+        f"Next refresh: {WATCHLIST_TTL//60} min"
+    )
+
 # ── Scanner: Scalper ───────────────────────────────────────────
 
 def evaluate_scalper_candidate(sym: str) -> dict | None:
@@ -313,54 +389,53 @@ def evaluate_scalper_candidate(sym: str) -> dict | None:
     }
 
 
-def find_scalper_opportunity(tickers: pd.DataFrame, budget: float,
-                              exclude: set, open_symbols: set) -> dict | None:
+def find_scalper_opportunity(budget: float, exclude: set, open_symbols: set) -> dict | None:
+    """
+    Find the best scalper entry from the pre-built watchlist.
+    The watchlist is rebuilt every WATCHLIST_TTL seconds with full scoring.
+    Between rebuilds we just filter the cached list — very cheap.
+    """
     global last_top_scalper
 
-    df = tickers.copy()
-    df = df[df["quoteVolume"] >= SCALPER_MIN_VOL]
-    df = df[df["lastPrice"]   >= SCALPER_MIN_PRICE]
-    df = df[df["abs_change"]  >= SCALPER_MIN_CHANGE]
-    df = df[~df["symbol"].isin(open_symbols | exclude | _api_blacklist)]
-    candidates = df.sort_values("quoteVolume", ascending=False).head(80)["symbol"].tolist()[:40]
-
-    log.info(f"🔍 [SCALPER] {len(candidates)} candidates after ticker filters")
-
-    established = []
-    for sym in candidates:
-        try:
-            data = public_get("/api/v3/klines", {"symbol": sym, "interval": "1d", "limit": 7})
-            if len(data) >= 7:
-                established.append(sym)
-            else:
-                log.info(f"[SCALPER] Skip {sym} — new listing ({len(data)} days)")
-        except:
-            established.append(sym)
-        time.sleep(0.05)
-
-    log.info(f"🔍 [SCALPER] Scoring {len(established)} pairs (parallel)...")
-    scores = []
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        futures = {ex.submit(evaluate_scalper_candidate, sym): sym for sym in established}
-        for f in as_completed(futures):
-            result = f.result()
-            if result:
-                scores.append(result)
-
-    if not scores:
-        scanner_log("🔍 [SCALPER] No qualifying pairs.")
+    if not _watchlist:
+        log.info("🔍 [SCALPER] Watchlist empty — skipping until next rebuild.")
         return None
 
-    scores.sort(key=lambda x: x["score"], reverse=True)
-    best = scores[0]
+    # Filter watchlist: exclude open positions, excluded symbols, blacklist
+    candidates = [
+        s for s in _watchlist
+        if s["symbol"] not in open_symbols
+        and s["symbol"] not in exclude
+        and s["symbol"] not in _api_blacklist
+    ]
+
+    if not candidates:
+        log.info("🔍 [SCALPER] All watchlist pairs excluded (open or blacklisted).")
+        return None
+
+    # Re-fetch quick price for the top candidates to make sure score is still valid
+    # Only re-score the top 5 — avoids too many API calls between watchlist rebuilds
+    refreshed = []
+    for s in candidates[:5]:
+        result = evaluate_scalper_candidate(s["symbol"])
+        if result:
+            refreshed.append(result)
+        time.sleep(0.05)
+
+    if not refreshed:
+        # Fall back to cached scores if all re-scores failed
+        refreshed = candidates[:5]
+
+    refreshed.sort(key=lambda x: x["score"], reverse=True)
+    best = refreshed[0]
     last_top_scalper = best
 
-    vol_row  = tickers[tickers["symbol"] == best["symbol"]]
-    best_vol = float(vol_row["quoteVolume"].iloc[0]) if not vol_row.empty else 0
+    age_mins = (time.time() - _watchlist_at) / 60
     scanner_log(f"📊 [SCALPER] Top: {best['symbol']} | Score: {best['score']}/100 | "
-                f"vol: ${best_vol:,.0f} | RSI: {best['rsi']} | ATR: {best['atr_pct']*100:.2f}%")
+                f"RSI: {best['rsi']} | ATR: {best['atr_pct']*100:.2f}% | "
+                f"watchlist age: {age_mins:.0f}min")
 
-    return pick_tradeable(scores, budget, "SCALPER")
+    return pick_tradeable(refreshed, budget, "SCALPER")
 
 # ── Scanner: Moonshot ──────────────────────────────────────────
 
@@ -378,6 +453,13 @@ def get_1h_change(symbol: str) -> float | None:
 
 
 def find_new_listings(tickers: pd.DataFrame, exclude: set, open_symbols: set) -> list:
+    global _new_listings_cache, _new_listings_cache_at
+    # Cache for NEW_LISTINGS_CACHE_TTL seconds — scanning 60 symbols takes 3+ seconds
+    if time.time() - _new_listings_cache_at < NEW_LISTINGS_CACHE_TTL:
+        # Filter cached results to remove any now open or excluded
+        return [n for n in _new_listings_cache
+                if n["symbol"] not in open_symbols and n["symbol"] not in exclude]
+
     df = tickers.copy()
     df = df[df["quoteVolume"] >= MOONSHOT_MIN_VOL]
     df = df[df["lastPrice"]   >= MIN_PRICE]
@@ -395,8 +477,10 @@ def find_new_listings(tickers: pd.DataFrame, exclude: set, open_symbols: set) ->
             pass
         time.sleep(0.05)
 
-    log.info(f"🌙 [MOONSHOT] {len(new)} new listings ({MOONSHOT_MIN_DAYS}-{MOONSHOT_NEW_DAYS} days)")
-    return new
+    _new_listings_cache    = new
+    _new_listings_cache_at = time.time()
+    log.info(f"🌙 [MOONSHOT] {len(new)} new listings ({MOONSHOT_MIN_DAYS}-{MOONSHOT_NEW_DAYS} days) — cached for {NEW_LISTINGS_CACHE_TTL}s")
+    return [n for n in new if n["symbol"] not in open_symbols and n["symbol"] not in exclude]
 
 
 def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
@@ -482,7 +566,8 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
         close  = df_k["close"]; volume = df_k["volume"]; opens = df_k["open"]
         avg_vol     = volume.iloc[-11:-1].mean()
         vol_burst   = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
-        candle_moves= (close - opens).abs() / opens * 100
+        safe_opens  = opens.replace(0, np.nan)  # avoid division by zero on thin pairs
+        candle_moves= (close - opens).abs() / safe_opens * 100
         avg_move    = candle_moves.iloc[-11:-1].mean()
         price_burst = (float(candle_moves.iloc[-1]) / avg_move) if avg_move > 0 else 1.0
         greens      = sum(1 for i in [-2, -1] if close.iloc[i] > opens.iloc[i])
@@ -625,6 +710,78 @@ def get_open_order_ids(symbol) -> set:
         log.debug(f"get_open_order_ids {symbol}: {e}")
         return set()
 
+
+def get_actual_fills(symbol: str, since_ms: int, retries: int = 3) -> dict:
+    """
+    Fetch actual fill data from MEXC myTrades for a symbol since a timestamp.
+    Retries up to `retries` times with 1s delay to allow fills to settle.
+    Returns:
+        avg_buy_price:  weighted average fill price of buy orders
+        avg_sell_price: weighted average fill price of sell orders
+        fee_usdt:       total fees paid in USDT equivalent
+        cost_usdt:      total cost of buys (qty * price)
+        revenue_usdt:   total revenue from sells (qty * price)
+    """
+    if PAPER_TRADE:
+        return {}
+
+    def wavg_price(trades):
+        total_qty  = sum(float(t["qty"])      for t in trades)
+        total_cost = sum(float(t["quoteQty"]) for t in trades)
+        return (total_cost / total_qty) if total_qty > 0 else None
+
+    def total_quote(trades):
+        return sum(float(t["quoteQty"]) for t in trades)
+
+    for attempt in range(retries):
+        try:
+            fills = private_get("/api/v3/myTrades", {
+                "symbol":    symbol,
+                "startTime": since_ms,
+                "limit":     50,
+            })
+            if not fills:
+                if attempt < retries - 1:
+                    time.sleep(1)
+                    continue
+                return {}
+
+            buys  = [f for f in fills if     f.get("isBuyer")]
+            sells = [f for f in fills if not f.get("isBuyer")]
+
+            # Fees — MEXC pays in the received asset, convert to USDT
+            fee_usdt = 0.0
+            for f in fills:
+                commission = float(f.get("commission", 0))
+                asset      = f.get("commissionAsset", "")
+                if asset == "USDT":
+                    fee_usdt += commission
+                elif commission > 0:
+                    # Approximate: fee in base asset × fill price
+                    fee_usdt += commission * float(f.get("price", 0))
+
+            result = {
+                "avg_buy_price":  wavg_price(buys),
+                "avg_sell_price": wavg_price(sells),
+                "cost_usdt":      total_quote(buys),
+                "revenue_usdt":   total_quote(sells),
+                "fee_usdt":       round(fee_usdt, 6),
+                "buy_count":      len(buys),
+                "sell_count":     len(sells),
+            }
+
+            # Only return if we have at least a buy fill
+            if result["avg_buy_price"] is not None:
+                return result
+
+        except Exception as e:
+            log.debug(f"myTrades fetch failed {symbol}: {e}")
+
+        if attempt < retries - 1:
+            time.sleep(1)
+
+    return {}
+
 # ── Trade lifecycle ────────────────────────────────────────────
 
 def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
@@ -648,12 +805,38 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
         log.warning(f"[{label}] {symbol} notional ${notional:.2f} < min ${min_notional:.2f}")
         return None
 
-    if not place_market_buy(symbol, qty, label):
+    # Record timestamp BEFORE placing the order so fills are captured reliably
+    bought_at_ms = int(time.time() * 1000)
+
+    buy_order = place_market_buy(symbol, qty, label)
+    if not buy_order:
         return None
 
+    # Fetch actual fill price — more accurate than the pre-order ticker price
+    actual_fills = get_actual_fills(symbol, since_ms=bought_at_ms)
+    actual_entry = actual_fills.get("avg_buy_price") or price
+    actual_cost  = actual_fills.get("cost_usdt")     or notional
+    if actual_fills.get("avg_buy_price"):
+        log.info(f"[{label}] Actual fill: ${actual_entry:.6f} "
+                 f"(ticker was ${price:.6f}, slippage: {(actual_entry/price-1)*100:+.3f}%)")
+    else:
+        log.info(f"[{label}] Using ticker price (myTrades unavailable): ${price:.6f}")
+
     actual_sl = sl_override_pct if sl_override_pct else sl_pct
-    tp_price  = round_price_to_tick(price * (1 + tp_pct), tick_size)
-    sl_price  = round(price * (1 - actual_sl), 8)
+
+    # SCALPER: TP = 3×ATR (same multiplier ratio as SL = 1.5×ATR → guaranteed 2:1 R:R)
+    # MOONSHOT/REVERSAL: fixed pct TP passed in from caller
+    if label == "SCALPER" and opp.get("atr_pct"):
+        atr_tp_pct = opp["atr_pct"] * SCALPER_TP_ATR_MULT
+        # Cap at SCALPER_TP_LIMIT (+10%) and floor at 2% (minimum worth the trade)
+        atr_tp_pct = min(SCALPER_TP_LIMIT, max(0.02, atr_tp_pct))
+        tp_price   = round_price_to_tick(actual_entry * (1 + atr_tp_pct), tick_size)
+        used_tp_pct = atr_tp_pct
+    else:
+        tp_price    = round_price_to_tick(actual_entry * (1 + tp_pct), tick_size)
+        used_tp_pct = tp_pct
+
+    sl_price = round(actual_entry * (1 - actual_sl), 8)
 
     # ── KEY FIX: SCALPER gets exchange TP limit order ─────────
     # MOONSHOT/REVERSAL: NO limit order — bot-monitored only.
@@ -667,20 +850,23 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
         tp_status = "TP ✅ on exchange" if tp_order_id else "TP monitored by bot"
     else:
         tp_order_id = None
+        used_tp_pct = tp_pct
         tp_status   = "TP + SL bot-monitored ✅ (direct market sell)"
 
     trade = {
         "label":         label,
         "symbol":        symbol,
-        "entry_price":   price,
+        "entry_price":   actual_entry,       # actual fill price, not ticker
+        "entry_ticker":  price,              # pre-order ticker for reference
         "qty":           qty,
-        "budget_used":   notional,
+        "budget_used":   actual_cost,        # actual cost from fills
+        "bought_at_ms":  bought_at_ms,       # used to query fills on close
         "tp_price":      tp_price,
         "sl_price":      sl_price,
-        "tp_pct":        tp_pct,
+        "tp_pct":        used_tp_pct,
         "sl_pct":        actual_sl,
         "tp_order_id":   tp_order_id,
-        "highest_price": price,
+        "highest_price": actual_entry,
         "max_hours":     max_hours,
         "opened_at":     datetime.now(timezone.utc).isoformat(),
         "score":         opp.get("score", 0),
@@ -691,15 +877,27 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
     icon         = {"SCALPER":"🟢","MOONSHOT":"🌙","REVERSAL":"🔄"}.get(label,"🟢")
     timeout_line = f"Max hold:    {max_hours}h\n" if max_hours else ""
 
-    log.info(f"{icon} [{label}] Opened {symbol} | ${notional:.2f} | "
-             f"Entry: {price:.6f} | TP: {tp_price:.6f} | SL: {sl_price:.6f} (-{actual_sl*100:.1f}%)")
+    slippage_line = ""
+    if actual_fills.get("avg_buy_price") and abs(actual_entry - price) > 0.000001:
+        slippage_pct  = (actual_entry / price - 1) * 100
+        slippage_line = f"Slippage:    {slippage_pct:+.3f}%\n"
+
+    if label == "SCALPER" and opp.get("atr_pct"):
+        tp_display = f"TP (ATR×{SCALPER_TP_ATR_MULT:.0f}): <b>${tp_price:.6f}</b>  (+{used_tp_pct*100:.1f}%)\n"
+    else:
+        tp_display = f"Take profit: <b>${tp_price:.6f}</b>  (+{used_tp_pct*100:.0f}%)\n"
+
+    log.info(f"{icon} [{label}] Opened {symbol} | ${actual_cost:.2f} | "
+             f"Entry: {actual_entry:.6f} | TP: {tp_price:.6f} (+{used_tp_pct*100:.1f}%) | "
+             f"SL: {sl_price:.6f} (-{actual_sl*100:.1f}%)")
     telegram(
         f"{icon} <b>Trade Opened — {label}</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Pair:        <b>{symbol}</b>\n"
-        f"Budget:      <b>${notional:.2f} USDT</b>\n"
-        f"Entry:       <b>${price:.6f}</b>\n"
-        f"Take profit: <b>${tp_price:.6f}</b>  (+{tp_pct*100:.0f}%)\n"
+        f"Budget:      <b>${actual_cost:.2f} USDT</b>\n"
+        f"Entry:       <b>${actual_entry:.6f}</b>\n"
+        f"{slippage_line}"
+        f"{tp_display}"
         f"Stop loss:   <b>${sl_price:.6f}</b>  (-{actual_sl*100:.1f}%) [market]\n"
         f"{timeout_line}"
         f"{tp_status}\n"
@@ -754,8 +952,16 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
     if label == "SCALPER":
         if not PAPER_TRADE and tp_order_id:
             if tp_order_id not in get_open_order_ids(symbol):
-                log.info(f"🎯 [{label}] TP limit filled: {symbol}")
-                return True, "TAKE_PROFIT"
+                # Order gone — but was it filled or cancelled?
+                # If price never got close to TP, it was likely cancelled (e.g. restart)
+                if price >= trade["tp_price"] * 0.995:
+                    log.info(f"🎯 [{label}] TP limit filled: {symbol}")
+                    return True, "TAKE_PROFIT"
+                else:
+                    log.warning(f"⚠️ [{label}] TP order vanished but price ${price:.6f} "
+                                f"never reached TP ${trade['tp_price']:.6f} — "
+                                f"order was cancelled not filled. Monitoring manually.")
+                    trade["tp_order_id"] = None  # clear so we fall back to price polling
         if PAPER_TRADE or not tp_order_id:
             if price >= trade["tp_price"]:
                 log.info(f"🎯 [{label}] TP: {symbol} | +{pct:.2f}%")
@@ -814,26 +1020,81 @@ def close_position(trade, reason) -> bool:
             log.info(f"✅ [{label}] Market sell ({reason}): {result}")
         except requests.exceptions.HTTPError as e:
             try:    body = e.response.json()
-            except: body = e.response.text if e.response else "no response"
-            log.error(f"🚨 [{label}] Market sell failed: {body}")
-            telegram(f"🚨 <b>Sell failed!</b> [{label}] {symbol} ({reason})\nClose manually on MEXC.")
-            return False
+            except: body = {"msg": e.response.text if e.response else "no response"}
 
+            code = body.get("code") if isinstance(body, dict) else None
+            msg  = body.get("msg",  body) if isinstance(body, dict) else body
+            log.error(f"🚨 [{label}] Market sell failed (code={code}): {msg}")
+
+            # Code 30005 / -2010 = insufficient balance — position likely already closed
+            # by the TP limit order filling at the same moment SL triggered
+            if code in (30005, -2010) or "insufficient" in str(msg).lower() or "balance" in str(msg).lower():
+                log.warning(f"⚠️ [{label}] {symbol} — position already closed on exchange "
+                            f"(TP limit likely filled just before SL). Checking fills...")
+                telegram(f"⚠️ [{label}] <b>{symbol}</b> ({reason})\n"
+                         f"Market sell returned 'insufficient balance' — "
+                         f"TP limit order may have filled simultaneously.\n"
+                         f"Treating as TAKE_PROFIT and checking actual fills.")
+                # Don't return False — fall through to record P&L from actual fills
+                # The exit fills query below will pick up the TP limit fill
+
+            elif code == 10007 or "not support" in str(msg).lower():
+                _api_blacklist.add(symbol)
+                log.warning(f"⚠️ [{label}] {symbol} not API-tradeable — blacklisted.")
+                telegram(f"🚨 <b>Sell failed!</b> [{label}] {symbol} ({reason})\n"
+                         f"Error: {str(msg)[:200]}\n"
+                         f"Symbol blacklisted — close manually on MEXC.")
+                return False
+
+            else:
+                telegram(f"🚨 <b>Sell failed!</b> [{label}] {symbol} ({reason})\n"
+                         f"Code: {code} — {str(msg)[:200]}\n"
+                         f"Close manually on MEXC.")
+                return False
+
+    # ── Fetch actual fill data for accurate P&L ───────────────
+    exit_fills = {}
+    if not PAPER_TRADE:
+        bought_at_ms = trade.get("bought_at_ms", int(time.time() * 1000) - 86400_000)
+        # For scalper TAKE_PROFIT, exchange limit may take a moment to settle
+        retries    = 5 if (reason == "TAKE_PROFIT" and label == "SCALPER") else 3
+        exit_fills = get_actual_fills(symbol, since_ms=bought_at_ms, retries=retries)
+
+    # Fallback ticker price if fills unavailable
     try:
-        exit_price = float(public_get("/api/v3/ticker/price", {"symbol": symbol})["price"])
+        ticker_price = float(public_get("/api/v3/ticker/price", {"symbol": symbol})["price"])
     except:
-        exit_price = trade["tp_price"] if reason == "TAKE_PROFIT" else trade["sl_price"]
+        ticker_price = trade["tp_price"] if reason == "TAKE_PROFIT" else trade["sl_price"]
 
-    pnl_pct  = (exit_price - trade["entry_price"]) / trade["entry_price"] * 100
-    pnl_usdt = (exit_price - trade["entry_price"]) * trade["qty"]
+    actual_entry  = exit_fills.get("avg_buy_price")   or trade["entry_price"]
+    actual_exit   = exit_fills.get("avg_sell_price")  or ticker_price
+    fee_usdt      = exit_fills.get("fee_usdt",  0.0)
+    cost_usdt     = exit_fills.get("cost_usdt") or (actual_entry * trade["qty"])
+    revenue_usdt  = exit_fills.get("revenue_usdt") or (actual_exit * trade["qty"])
+
+    # True P&L = revenue − cost − fees
+    pnl_usdt = round(revenue_usdt - cost_usdt - fee_usdt, 4)
+    pnl_pct  = round(pnl_usdt / cost_usdt * 100, 4) if cost_usdt > 0 else 0.0
+
+    if exit_fills.get("avg_sell_price"):
+        log.info(f"[{label}] Fills: entry=${actual_entry:.6f} exit=${actual_exit:.6f} "
+                 f"fees=${fee_usdt:.4f} P&L=${pnl_usdt:+.4f} ({pnl_pct:+.2f}%)")
+    else:
+        log.info(f"[{label}] Ticker exit ${ticker_price:.6f} (myTrades unavailable) "
+                 f"P&L=${pnl_usdt:+.4f} ({pnl_pct:+.2f}%)")
 
     trade_history.append({
         **{k: v for k, v in trade.items() if not k.startswith("_")},
-        "exit_price":  exit_price,
-        "exit_reason": reason,
-        "closed_at":   datetime.now(timezone.utc).isoformat(),
-        "pnl_pct":     round(pnl_pct, 4),
-        "pnl_usdt":    round(pnl_usdt, 4),
+        "exit_price":    actual_exit,
+        "exit_ticker":   ticker_price,
+        "exit_reason":   reason,
+        "closed_at":     datetime.now(timezone.utc).isoformat(),
+        "fee_usdt":      fee_usdt,
+        "cost_usdt":     round(cost_usdt, 4),
+        "revenue_usdt":  round(revenue_usdt, 4),
+        "pnl_pct":       pnl_pct,
+        "pnl_usdt":      pnl_usdt,
+        "fills_used":    bool(exit_fills.get("avg_sell_price")),
     })
 
     wins      = [t for t in trade_history if t["pnl_pct"] > 0]
@@ -850,13 +1111,17 @@ def close_position(trade, reason) -> bool:
     }
     emoji, reason_label = icons.get(reason, ("✅", reason))
 
+    fee_line   = f"Fees:    ${fee_usdt:.4f}\n" if fee_usdt > 0 else ""
+    fills_note = "✅ actual fills" if exit_fills.get("avg_sell_price") else "⚠️ estimated"
+
     telegram(
         f"{emoji} <b>{reason_label} — {label}</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Pair:    <b>{symbol}</b>\n"
-        f"Entry:   ${trade['entry_price']:.6f}\n"
-        f"Exit:    <b>${exit_price:.6f}</b>\n"
+        f"Entry:   ${actual_entry:.6f}\n"
+        f"Exit:    <b>${actual_exit:.6f}</b>  [{fills_note}]\n"
         f"P&L:     <b>{pnl_pct:+.2f}%  (${pnl_usdt:+.2f})</b>\n"
+        f"{fee_line}"
         f"━━━━━━━━━━━━━━━\n"
         f"Session: {len(trade_history)} trades | Win: {win_rate:.0f}% | P&L: ${total_pnl:+.2f}"
     )
@@ -1142,13 +1407,13 @@ def listen_for_commands(balance: float):
                 telegram(
                     f"⚙️ <b>Current Config</b>\n━━━━━━━━━━━━━━━\n"
                     f"🟢 <b>Scalper</b>\n"
-                    f"  Max: {SCALPER_MAX_TRADES} × {SCALPER_BUDGET_PCT*100:.0f}% | "
-                    f"TP +{SCALPER_TP_LIMIT*100:.0f}% | ATR ×{SCALPER_ATR_MULT}\n"
-                    f"  Trail: +{SCALPER_TRAIL_ACT*100:.0f}% → {SCALPER_TRAIL_PCT*100:.0f}%\n"
+                    f"  Max: {SCALPER_MAX_TRADES} × {SCALPER_BUDGET_PCT*100:.0f}%\n"
+                    f"  TP: ATR×{SCALPER_TP_ATR_MULT:.0f} (2:1 R:R, cap {SCALPER_TP_LIMIT*100:.0f}%)\n"
+                    f"  SL: ATR×{SCALPER_ATR_MULT} | Trail: +{SCALPER_TRAIL_ACT*100:.0f}% → {SCALPER_TRAIL_PCT*100:.1f}%\n"
+                    f"  Watchlist: {len(_watchlist)} pairs | age: {(time.time()-_watchlist_at)/60:.0f}min\n"
                     f"\n🌙 <b>Moonshot</b>  [bot-monitored]\n"
-                    f"  Max: {ALT_MAX_TRADES} trades\n"
+                    f"  Max: {ALT_MAX_TRADES} trades | Min budget: ${MIN_ALT_BUDGET:.2f}\n"
                     f"  TP: +{MOONSHOT_TP*100:.0f}%  SL: -{MOONSHOT_SL*100:.0f}%  Max: {MOONSHOT_MAX_HOURS}h\n"
-                    f"  Min score: {MOONSHOT_MIN_SCORE} | Min vol burst: {MOONSHOT_MIN_VOL_BURST}x\n"
                     f"\n🔄 <b>Reversal</b>  [bot-monitored]\n"
                     f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%  Max: {REVERSAL_MAX_HOURS}h\n"
                     f"\n{'⏸️ PAUSED' if _paused else '▶️ RUNNING'}"
@@ -1180,7 +1445,7 @@ def reconcile_open_positions():
 # ── Main loop ──────────────────────────────────────────────────
 
 def run():
-    global scalper_trades, alt_trades
+    global scalper_trades, alt_trades, _last_rotation_scan, _watchlist, _watchlist_at, MIN_ALT_BUDGET
 
     mode = "📝 PAPER TRADING" if PAPER_TRADE else "💰 LIVE TRADING"
     log.info(f"🚀 MEXC Bot — {mode}")
@@ -1188,15 +1453,24 @@ def run():
     _load_symbol_rules()
     reconcile_open_positions()
 
+    # Build initial watchlist at startup
+    log.info("📋 Building initial watchlist...")
+    startup_tickers = fetch_tickers()
+    build_watchlist(startup_tickers)
+
     startup_balance = get_available_balance()
-    log.info(f"💰 Starting balance: ${startup_balance:.2f} USDT")
+    MIN_ALT_BUDGET  = round(startup_balance * 0.10, 2)
+    log.info(f"💰 Starting balance: ${startup_balance:.2f} USDT | Min alt budget: ${MIN_ALT_BUDGET:.2f}")
     telegram(
         f"🚀 <b>MEXC Bot Started</b> [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"Balance: <b>${startup_balance:.2f} USDT</b>\n"
         f"\n🟢 <b>Scalper</b> (max {SCALPER_MAX_TRADES} × {SCALPER_BUDGET_PCT*100:.0f}%)\n"
-        f"  TP: +{SCALPER_TP_LIMIT*100:.0f}% limit | ATR ×{SCALPER_ATR_MULT} SL\n"
+        f"  TP: ATR×{SCALPER_TP_ATR_MULT:.0f} (2:1 R:R) | SL: ATR×{SCALPER_ATR_MULT}\n"
+        f"  Trail: +{SCALPER_TRAIL_ACT*100:.0f}% → {SCALPER_TRAIL_PCT*100:.1f}% trail\n"
+        f"  Watchlist: top {WATCHLIST_SIZE} pairs, refresh every {WATCHLIST_TTL//60}min\n"
         f"\n🌙 <b>Moonshot</b> (max {ALT_MAX_TRADES} trades, 5% each) [bot-monitored]\n"
         f"  TP: +{MOONSHOT_TP*100:.0f}%  SL: -{MOONSHOT_SL*100:.0f}%  max {MOONSHOT_MAX_HOURS}h\n"
+        f"  Min budget: ${MIN_ALT_BUDGET:.2f} (10% of balance)\n"
         f"\n🔄 <b>Reversal</b> (5%) [bot-monitored]\n"
         f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%  max {REVERSAL_MAX_HOURS}h\n"
         f"\n<i>/status · /pnl · /logs · /config · /pause · /resume · /close</i>"
@@ -1223,16 +1497,24 @@ def run():
                 else:
                     total_value += t["budget_used"]
 
-            need_scan = ((not _paused and len(scalper_trades) < SCALPER_MAX_TRADES)
-                         or len(alt_trades) < ALT_MAX_TRADES)
-            tickers   = fetch_tickers() if need_scan else None
+            # Fetch tickers only when actively scanning for new entries
+            scalper_needs_entry = not _paused and len(scalper_trades) < SCALPER_MAX_TRADES
+            alt_needs_entry     = not _paused and len(alt_trades) < ALT_MAX_TRADES
+            need_scan           = scalper_needs_entry or alt_needs_entry
+            tickers             = fetch_tickers() if need_scan else None
+
+            # Rebuild watchlist every WATCHLIST_TTL seconds (30 min)
+            # Always fetch fresh tickers for rebuild to ensure accuracy
+            if time.time() - _watchlist_at >= WATCHLIST_TTL:
+                log.info("📋 Watchlist TTL expired — rebuilding...")
+                build_watchlist(tickers if tickers is not None else fetch_tickers())
 
             # ── Scalper ───────────────────────────────────────
+            budget = round(balance * SCALPER_BUDGET_PCT, 2)  # always defined
             if not _paused and len(scalper_trades) < SCALPER_MAX_TRADES:
-                budget = round(balance * SCALPER_BUDGET_PCT, 2)
-                opp    = find_scalper_opportunity(tickers, budget,
-                                                  exclude=scalper_excluded,
-                                                  open_symbols=open_symbols)
+                opp = find_scalper_opportunity(budget,
+                                               exclude=scalper_excluded,
+                                               open_symbols=open_symbols)
                 if opp:
                     sl_atr = opp["atr_pct"] * SCALPER_ATR_MULT
                     trade  = open_position(opp, budget, SCALPER_TP_LIMIT, SCALPER_SL,
@@ -1241,12 +1523,16 @@ def run():
                         scalper_trades.append(trade)
                         scalper_excluded = set()
             else:
-                rot_t      = tickers if tickers is not None else fetch_tickers()
-                budget     = round(balance * SCALPER_BUDGET_PCT, 2)
-                best_opp   = find_scalper_opportunity(rot_t, budget,
-                                                      exclude=scalper_excluded,
-                                                      open_symbols=open_symbols)
-                best_score = best_opp["score"] if best_opp else 0
+                # At max capacity — check for rotation but only every ROTATION_SCAN_INTERVAL seconds
+                now        = time.time()
+                best_opp   = None
+                best_score = 0
+                if now - _last_rotation_scan >= ROTATION_SCAN_INTERVAL:
+                    _last_rotation_scan = now
+                    best_opp   = find_scalper_opportunity(budget,
+                                                          exclude=scalper_excluded,
+                                                          open_symbols=open_symbols)
+                    best_score = best_opp["score"] if best_opp else 0
 
                 for trade in scalper_trades[:]:
                     tpct     = (trade.get("highest_price", trade["entry_price"]) /
@@ -1274,26 +1560,29 @@ def run():
             if not _paused and len(alt_trades) < ALT_MAX_TRADES:
                 ideal  = round(total_value * MOONSHOT_BUDGET_PCT, 2)
                 budget = min(ideal, balance)
-                log.info(f"💰 Alt budget: ${budget:.2f} "
-                         f"(ideal ${ideal:.2f} | free ${balance:.2f} | total ${total_value:.2f})")
 
-                opp = find_moonshot_opportunity(tickers, budget,
-                                                exclude=alt_excluded,
-                                                open_symbols=open_symbols)
-                if opp:
-                    trade = open_position(opp, budget, MOONSHOT_TP, MOONSHOT_SL,
-                                          "MOONSHOT", max_hours=MOONSHOT_MAX_HOURS)
-                    if trade:
-                        alt_trades.append(trade); alt_excluded = set()
+                if budget < MIN_ALT_BUDGET:
+                    log.info(f"💰 Alt budget ${budget:.2f} below minimum ${MIN_ALT_BUDGET:.2f} — skipping scan")
                 else:
-                    opp = find_reversal_opportunity(tickers, budget,
+                    log.info(f"💰 Alt budget: ${budget:.2f} "
+                             f"(ideal ${ideal:.2f} | free ${balance:.2f} | total ${total_value:.2f})")
+                    opp = find_moonshot_opportunity(tickers, budget,
                                                     exclude=alt_excluded,
                                                     open_symbols=open_symbols)
                     if opp:
-                        trade = open_position(opp, budget, REVERSAL_TP, REVERSAL_SL,
-                                              "REVERSAL", max_hours=REVERSAL_MAX_HOURS)
+                        trade = open_position(opp, budget, MOONSHOT_TP, MOONSHOT_SL,
+                                              "MOONSHOT", max_hours=MOONSHOT_MAX_HOURS)
                         if trade:
                             alt_trades.append(trade); alt_excluded = set()
+                    else:
+                        opp = find_reversal_opportunity(tickers, budget,
+                                                        exclude=alt_excluded,
+                                                        open_symbols=open_symbols)
+                        if opp:
+                            trade = open_position(opp, budget, REVERSAL_TP, REVERSAL_SL,
+                                                  "REVERSAL", max_hours=REVERSAL_MAX_HOURS)
+                            if trade:
+                                alt_trades.append(trade); alt_excluded = set()
 
             for trade in alt_trades[:]:
                 should_exit, reason = check_exit(trade)
