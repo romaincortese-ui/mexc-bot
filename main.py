@@ -70,8 +70,8 @@ REVERSAL_MAX_HOURS  = 4
 MIN_PRICE     = 0.001
 SCAN_INTERVAL = 60
 
-TELEGRAM_TOKEN   = "your_telegram_token_here"
-TELEGRAM_CHAT_ID = "your_chat_id_here"
+TELEGRAM_TOKEN   = "8729639207:AAGR2ytuX36ocCVagQj-tGBE2QEkvrTiqQo"
+TELEGRAM_CHAT_ID = "7058246374"
 
 # ═══════════════════════════════════════════════════════════════
 BASE_URL = "https://api.mexc.com"
