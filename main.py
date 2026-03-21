@@ -7,7 +7,7 @@ MEXC Trading Bot — 3 Strategies
      Moonshot and Reversal share the alt slot.
 """
 
-import time, hmac, hashlib, logging, requests, math
+import time, hmac, hashlib, logging, requests, math, json, os
 import urllib.parse
 import pandas as pd
 import numpy as np
@@ -88,6 +88,17 @@ MIN_ALT_BUDGET    = None  # set in run() after fetching balance
 TELEGRAM_TOKEN   = "8729639207:AAGR2ytuX36ocCVagQj-tGBE2QEkvrTiqQo"
 TELEGRAM_CHAT_ID = "7058246374"
 
+# ── AI Sentiment ──────────────────────────────────────────────
+# Claude Haiku searches for latest news and returns a score -1.0 to +1.0.
+# Applied as a score bonus/penalty after technical scoring passes threshold.
+# Set ANTHROPIC_API_KEY as a Railway env var — bot works fine without it.
+ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
+SENTIMENT_ENABLED    = bool(ANTHROPIC_API_KEY)
+SENTIMENT_CACHE_MINS = 30       # reuse result for 30 min per symbol
+SENTIMENT_MAX_BONUS  = 15       # max points added for very bullish sentiment (+1.0)
+SENTIMENT_MAX_PENALTY= 20       # max points removed for very bearish sentiment (-1.0)
+                                 # asymmetric: bad news hurts more than good news helps
+
 # ═══════════════════════════════════════════════════════════════
 BASE_URL = "https://api.mexc.com"
 
@@ -131,6 +142,10 @@ NEW_LISTINGS_CACHE_TTL = 300  # seconds
 _watchlist             = []   # list of scored candidate dicts
 _watchlist_at          = 0.0  # timestamp of last full rebuild
 
+# Sentiment cache — {symbol: (score_float, fetched_at_timestamp)}
+# Avoids calling Claude API on every scan cycle for the same coin
+_sentiment_cache: dict = {}
+
 # ── Telegram ───────────────────────────────────────────────────
 
 def telegram(msg: str):
@@ -149,6 +164,110 @@ def scanner_log(msg: str):
     while len(_scanner_log_buffer) > _MAX_SCANNER_LOGS:
         _scanner_log_buffer.pop(0)
     log.info(msg)
+
+
+def get_sentiment(symbol: str) -> tuple[float | None, str]:
+    """
+    Ask Claude Haiku to search for recent news on a coin and return a
+    sentiment score from -1.0 (very bearish) to +1.0 (very bullish).
+
+    Uses the Anthropic API with web_search enabled so Claude can look up
+    actual current headlines rather than relying on training data.
+
+    Returns:
+        (score, summary_str) — score is None if API unavailable or errored.
+        summary_str is a one-sentence reason, used in Telegram messages.
+
+    Cached per symbol for SENTIMENT_CACHE_MINS to avoid hammering the API.
+    Entire function is a no-op if ANTHROPIC_API_KEY is not set.
+    """
+    if not SENTIMENT_ENABLED:
+        return None, ""
+
+    # Check cache
+    cached = _sentiment_cache.get(symbol)
+    if cached:
+        score, summary, fetched_at = cached
+        if time.time() - fetched_at < SENTIMENT_CACHE_MINS * 60:
+            return score, summary
+
+    coin = symbol.replace("USDT", "").strip()
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json={
+                "model":      "claude-haiku-4-5-20251001",
+                "max_tokens": 200,
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                "messages": [{
+                    "role":    "user",
+                    "content": (
+                        f"Search for the latest news about {coin} cryptocurrency "
+                        f"from the last 24 hours. Based on what you find, rate the "
+                        f"current market sentiment for {coin}.\n\n"
+                        f"Respond ONLY with valid JSON — no other text:\n"
+                        f'{{ "score": <float from -1.0 to 1.0>, '
+                        f'"summary": "<one sentence max 15 words>" }}\n\n'
+                        f"Score guide: 1.0=very bullish, 0=neutral, -1.0=very bearish. "
+                        f"Base it only on actual news you found, not general knowledge."
+                    )
+                }],
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        # Extract the text block from the response (may follow tool_use blocks)
+        text = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                text = block["text"].strip()
+                break
+
+        if not text:
+            return None, ""
+
+        # Strip any accidental markdown fences
+        text = text.replace("```json", "").replace("```", "").strip()
+        parsed  = json.loads(text)
+        score   = float(parsed["score"])
+        summary = str(parsed.get("summary", ""))
+        score   = max(-1.0, min(1.0, score))  # clamp to valid range
+
+        _sentiment_cache[symbol] = (score, summary, time.time())
+        log.info(f"🧠 Sentiment [{coin}]: {score:+.2f} — {summary}")
+        return score, summary
+
+    except Exception as e:
+        log.debug(f"🧠 Sentiment fetch failed for {coin}: {e}")
+        return None, ""
+
+
+def sentiment_score_adjustment(symbol: str) -> tuple[float, str]:
+    """
+    Returns (score_delta, label_str) to add to the technical score.
+    Positive = bullish bonus, negative = bearish penalty.
+    Returns (0, "") if sentiment unavailable — never blocks a trade.
+    """
+    score, summary = get_sentiment(symbol)
+    if score is None:
+        return 0.0, ""
+
+    if score >= 0:
+        delta = round(score * SENTIMENT_MAX_BONUS,   1)
+        label = f"🟢 sentiment {score:+.2f} (+{delta:.0f}pts)"
+    else:
+        # score is negative, SENTIMENT_MAX_PENALTY is positive → delta is negative (a penalty)
+        delta = round(score * SENTIMENT_MAX_PENALTY, 1)
+        label = f"🔴 sentiment {score:+.2f} ({delta:+.0f}pts)"
+
+    return delta, label
 
 def public_get(path, params=None):
     r = requests.get(BASE_URL + path, params=params or {}, timeout=10)
@@ -455,13 +574,25 @@ def evaluate_scalper_candidate(sym: str) -> dict | None:
         log.debug(f"[SCALPER] Skip {sym} — thin (1h vol ${recent_vol_usdt:,.0f} < ${SCALPER_MIN_1H_VOL:,})")
         return None
 
+    # Sentiment adjustment — applied after technical filters pass so we only
+    # call the API on genuinely interesting candidates (saves cost + latency).
+    sentiment_delta, sentiment_label = sentiment_score_adjustment(sym)
+    score = round(score + sentiment_delta, 2)
+    if sentiment_delta != 0:
+        log.info(f"[SCALPER] {sym} sentiment adjusted: {sentiment_label} → final score {score}")
+    # Re-check threshold after sentiment adjustment
+    if score < SCALPER_THRESHOLD:
+        log.info(f"[SCALPER] Skip {sym} — score dropped below threshold after sentiment ({score:.1f})")
+        return None
+
     atr     = calc_atr(df5m, period=SCALPER_ATR_PERIOD)
     atr_pct = atr / float(close.iloc[-1]) if float(close.iloc[-1]) > 0 else 0.015
 
     return {
-        "symbol": sym, "score": round(score, 2), "rsi": round(rsi, 2),
+        "symbol":    sym, "score": score, "rsi": round(rsi, 2),
         "vol_ratio": round(vol_ratio, 2), "price": float(close.iloc[-1]),
-        "atr_pct": round(atr_pct, 6),
+        "atr_pct":   round(atr_pct, 6),
+        "sentiment": sentiment_delta if sentiment_delta != 0 else None,
     }
 
 
@@ -614,10 +745,17 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
         score     = rsi_score + ma_score + vol_score
 
         if score >= MOONSHOT_MIN_SCORE:
+            # Apply sentiment adjustment to qualifying moonshot candidates
+            sentiment_delta, _ = sentiment_score_adjustment(sym)
+            final_score = round(score + sentiment_delta, 2)
+            if final_score < MOONSHOT_MIN_SCORE:
+                log.info(f"[MOONSHOT] Skip {sym} — score dropped after sentiment ({final_score:.1f})")
+                time.sleep(0.1); continue
             scores.append({
-                "symbol": sym, "score": round(score, 2), "rsi": round(rsi, 2),
+                "symbol": sym, "score": final_score, "rsi": round(rsi, 2),
                 "vol_ratio": round(vol_ratio, 2), "price": float(close.iloc[-1]),
                 "_df": df_k, "_is_new": is_new, "_1h_chg": round(change_1h or 0, 2),
+                "sentiment": sentiment_delta if sentiment_delta != 0 else None,
             })
         time.sleep(0.1)
 
@@ -949,6 +1087,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
         "opened_at":      datetime.now(timezone.utc).isoformat(),
         "score":          opp.get("score", 0),
         "rsi":            opp.get("rsi", 0),
+        "sentiment":      opp.get("sentiment"),  # sentiment score delta at entry
         # High-confidence trades get fast breakeven: SL moves to entry at +1.5%
         # preventing a winner from becoming a loser before the trailing stop kicks in
         "breakeven_act":  SCALPER_BREAKEVEN_ACT if (
@@ -971,6 +1110,12 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
         slippage_pct  = (actual_entry / price - 1) * 100
         slippage_line = f"Slippage:    {slippage_pct:+.3f}%\n"
 
+    sentiment_val = opp.get("sentiment")
+    sentiment_line = ""
+    if sentiment_val is not None:
+        icon = "🟢" if sentiment_val > 0 else "🔴"
+        sentiment_line = f"Sentiment:   {icon} {sentiment_val:+.1f}pts\n"
+
     if label == "SCALPER" and opp.get("atr_pct"):
         tp_display = f"TP (ATR×{SCALPER_TP_ATR_MULT:.0f}): <b>${tp_price:.6f}</b>  (+{used_tp_pct*100:.1f}%)\n"
     else:
@@ -986,6 +1131,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label,
         f"Budget:      <b>${actual_cost:.2f} USDT</b>\n"
         f"Entry:       <b>${actual_entry:.6f}</b>\n"
         f"{slippage_line}"
+        f"{sentiment_line}"
         f"{tp_display}"
         f"Stop loss:   <b>${sl_price:.6f}</b>  (-{actual_sl*100:.1f}%) [market]\n"
         f"{breakeven_line}"
@@ -1339,6 +1485,107 @@ def convert_dust():
     except Exception as e:
         log.debug(f"Dust sweep failed: {e}")
 
+# ── Haiku helpers ─────────────────────────────────────────────
+
+def ask_haiku(prompt: str, system: str = "", max_tokens: int = 500) -> str:
+    """
+    Core reusable call to Claude Haiku.
+    Returns the text response, or "" on any failure.
+    Does NOT use web search — for analysis tasks that only need trade data.
+    """
+    if not SENTIMENT_ENABLED:
+        return ""
+    try:
+        messages = [{"role": "user", "content": prompt}]
+        body = {
+            "model":      "claude-haiku-4-5-20251001",
+            "max_tokens": max_tokens,
+            "messages":   messages,
+        }
+        if system:
+            body["system"] = system
+
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json=body,
+            timeout=30,
+        )
+        r.raise_for_status()
+        for block in r.json().get("content", []):
+            if block.get("type") == "text":
+                return block["text"].strip()
+    except Exception as e:
+        log.debug(f"ask_haiku failed: {e}")
+    return ""
+
+
+def generate_daily_journal(today_trades: list, balance: float) -> str:
+    """
+    Pass today's closed trades to Haiku and ask for a plain-English analysis.
+    Returns a formatted journal string ready to send as a Telegram message.
+    Called once at midnight from send_daily_summary.
+    """
+    if not SENTIMENT_ENABLED or not today_trades:
+        return ""
+
+    # Build a compact trade summary — keep tokens low
+    lines = []
+    for t in today_trades:
+        try:
+            held = round(
+                (datetime.fromisoformat(t['closed_at']) -
+                 datetime.fromisoformat(t['opened_at'])).total_seconds() / 60
+            )
+        except Exception:
+            held = 0
+        lines.append(
+            f"{t['symbol']} [{t['label']}] "
+            f"entry={t.get('entry_price',0):.6f} exit={t.get('exit_price',0):.6f} "
+            f"pnl={t.get('pnl_pct',0):+.2f}% (${t.get('pnl_usdt',0):+.2f}) "
+            f"reason={t.get('exit_reason','?')} "
+            f"score={t.get('score',0):.0f} rsi={t.get('rsi',0):.0f} "
+            f"held={held}min"
+        )
+
+    system = (
+        "You are a concise crypto trading analyst reviewing a day of automated bot trades. "
+        "Be direct and specific. No generic advice. Focus on patterns in THIS data only. "
+        "Never suggest changing the bot code directly — frame suggestions as observations."
+    )
+
+    prompt = (
+        f"Today's closed trades ({len(today_trades)} total, balance ${balance:.2f}):\n\n"
+        + "\n".join(lines)
+        + "\n\nWrite a short journal entry (max 5 bullet points) covering:\n"
+        "• What worked and what didn't — specific patterns, not generalities\n"
+        "• Best and worst trade and why\n"
+        "• Any time-of-day, RSI, or exit-reason patterns worth noting\n"
+        "• One concrete observation for tomorrow\n\n"
+        "Keep it under 200 words. Be honest, not cheerful."
+    )
+
+    analysis = ask_haiku(prompt, system=system, max_tokens=400)
+    if not analysis:
+        return ""
+
+    wins   = [t for t in today_trades if t.get("pnl_pct", 0) > 0]
+    losses = [t for t in today_trades if t.get("pnl_pct", 0) <= 0]
+    total  = sum(t.get("pnl_usdt", 0) for t in today_trades)
+
+    return (
+        f"🧠 <b>Daily Journal</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"{len(today_trades)} trades | {len(wins)}W {len(losses)}L | "
+        f"P&L: <b>${total:+.2f}</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"{analysis}"
+    )
+
 # ── Daily summary ─────────────────────────────────────────────
 
 def send_daily_summary(balance: float):
@@ -1406,6 +1653,15 @@ def send_daily_summary(balance: float):
                  f"Net P&L: {emoji} <b>${net:+.2f}</b>\nBalance: <b>${balance:.2f}</b>")
     except Exception as e:
         log.error(f"Daily summary failed: {e}")
+
+    # ── AI journal — sent as a second message after raw stats ────
+    try:
+        today_trades = [t for t in trade_history if t.get("closed_at","")[:10] == today]
+        journal = generate_daily_journal(today_trades, balance)
+        if journal:
+            telegram(journal[:4000])   # Telegram hard limit is 4096 chars
+    except Exception as e:
+        log.debug(f"Daily journal failed: {e}")
 
 # ── Weekly P&L ────────────────────────────────────────────────
 
@@ -1503,8 +1759,9 @@ def listen_for_commands(balance: float):
 
         for update in data.get("result", []):
             last_telegram_update = update["update_id"]
-            msg  = update.get("message", {})
-            text = msg.get("text", "").strip().lower()
+            msg      = update.get("message", {})
+            raw_text = msg.get("text", "").strip()       # preserve case for /ask
+            text     = raw_text.lower()
             if str(msg.get("chat",{}).get("id")) != str(TELEGRAM_CHAT_ID):
                 continue
 
@@ -1577,8 +1834,68 @@ def listen_for_commands(balance: float):
                     f"  TP: +{MOONSHOT_TP*100:.0f}%  SL: -{MOONSHOT_SL*100:.0f}%  Max: {MOONSHOT_MAX_HOURS}h\n"
                     f"\n🔄 <b>Reversal</b>  [bot-monitored]\n"
                     f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%  Max: {REVERSAL_MAX_HOURS}h\n"
+                    f"\n🧠 Sentiment: {'✅ on' if SENTIMENT_ENABLED else '⚠️ off'}\n"
                     f"\n{'⏸️ PAUSED' if _paused else '▶️ RUNNING'}"
                 )
+
+            elif raw_text.startswith("/ask ") or raw_text.startswith("/ask@"):
+                # /ask <question> — ask Haiku anything about the bot's recent trades
+                question = raw_text.split(" ", 1)[1].strip() if " " in raw_text else ""
+                if not question:
+                    telegram("🧠 Usage: <code>/ask why am I losing on flat exits?</code>")
+                elif not SENTIMENT_ENABLED:
+                    telegram("🧠 <b>/ask</b> requires ANTHROPIC_API_KEY to be set.")
+                else:
+                    telegram("🧠 Thinking...")
+
+                    # Build context from recent trade history (last 50 trades)
+                    recent = trade_history[-50:] if len(trade_history) > 50 else trade_history
+                    today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+                    context_lines = []
+                    for t in recent:
+                        context_lines.append(
+                            f"{t.get('closed_at','?')[:16]} {t['symbol']} [{t['label']}] "
+                            f"pnl={t.get('pnl_pct',0):+.2f}% reason={t.get('exit_reason','?')} "
+                            f"score={t.get('score',0):.0f} rsi={t.get('rsi',0):.0f} "
+                            f"held={round((datetime.fromisoformat(t['closed_at']) - datetime.fromisoformat(t['opened_at'])).total_seconds()/60)}min"
+                        ) if t.get('closed_at') and t.get('opened_at') else None
+
+                    context_lines = [l for l in context_lines if l]
+
+                    # Open positions
+                    open_ctx = []
+                    for t in scalper_trades + alt_trades:
+                        try:
+                            px  = float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
+                            pct = (px - t["entry_price"]) / t["entry_price"] * 100
+                            open_ctx.append(f"{t['symbol']} [{t['label']}] currently {pct:+.2f}%")
+                        except:
+                            open_ctx.append(f"{t['symbol']} [{t['label']}]")
+
+                    system = (
+                        "You are a concise crypto trading analyst with access to a live bot's trade history. "
+                        "Answer the user's question directly using only the data provided. "
+                        "Be specific and honest. Keep answers under 150 words."
+                    )
+
+                    prompt = (
+                        f"Bot trade history (last {len(context_lines)} closed trades):\n"
+                        + "\n".join(context_lines[-30:])  # last 30 for token efficiency
+                        + (f"\n\nCurrently open: {', '.join(open_ctx)}" if open_ctx else "")
+                        + f"\n\nBalance: ${balance:.2f} USDT | Date: {today}\n\n"
+                        f"User question: {question}"
+                    )
+
+                    answer = ask_haiku(prompt, system=system, max_tokens=300)
+                    if answer:
+                        # Escape HTML in both the question and Haiku's answer
+                        safe_q = question.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+                        safe_a = answer.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+                        reply  = f"🧠 <b>Ask:</b> <i>{safe_q}</i>\n━━━━━━━━━━━━━━━\n{safe_a}"
+                        telegram(reply[:4000])  # Telegram hard limit
+                    else:
+                        telegram("🧠 Couldn't get an answer — check logs.")
 
     except Exception as e:
         log.debug(f"Telegram poll error: {e}")
@@ -1638,7 +1955,9 @@ def run():
         f"  Min budget: ${MIN_ALT_BUDGET:.2f} (10% of balance)\n"
         f"\n🔄 <b>Reversal</b> (5%) [bot-monitored]\n"
         f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%  max {REVERSAL_MAX_HOURS}h\n"
-        f"\n<i>/status · /pnl · /logs · /config · /pause · /resume · /close</i>"
+        f"\n🧠 <b>AI Sentiment</b>: {'✅ enabled (Claude Haiku + web search)' if SENTIMENT_ENABLED else '⚠️ disabled (set ANTHROPIC_API_KEY)'}\n"
+        f"  Cache: {SENTIMENT_CACHE_MINS}min | Bonus: +{SENTIMENT_MAX_BONUS}pts | Penalty: -{SENTIMENT_MAX_PENALTY}pts\n"
+        f"\n<i>/status · /pnl · /logs · /config · /pause · /resume · /close · /ask</i>"
     )
 
     scalper_excluded = {}   # {symbol: cooldown_until_ts} — 30min cooldown after SL
