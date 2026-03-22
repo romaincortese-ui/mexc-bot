@@ -7,12 +7,11 @@ MEXC Trading Bot — 3 Strategies
      Moonshot and Reversal share the alt slot.
 """
 
-import time, hmac, hashlib, logging, requests, math, json, os, threading, collections, re
+import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re
 import urllib.parse
 from decimal import Decimal, ROUND_DOWN
 import pandas as pd
 import numpy as np
-from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -20,15 +19,16 @@ from datetime import datetime, timezone
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-MEXC_API_KEY    = "mx0vgls12Y6RKLCNcF"
-MEXC_API_SECRET = "bb4627f25e3d4b86abe0b1eee2fe01bd"
+MEXC_API_KEY    = os.getenv("MEXC_API_KEY",    "your_api_key_here")
+MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "your_api_secret_here")
 
-PAPER_TRADE   = False
-PAPER_BALANCE = 50.0
+PAPER_TRADE   = os.getenv("PAPER_TRADE", "False").lower() == "true"
+PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "50"))
 
 # ── Scalper (max 3 concurrent) ────────────────────────────────
-SCALPER_MAX_TRADES   = 3
-SCALPER_BUDGET_PCT   = 0.30
+SCALPER_MAX_TRADES   = int(os.getenv("SCALPER_MAX_TRADES",   "3"))
+SCALPER_BUDGET_PCT   = float(os.getenv("SCALPER_BUDGET_PCT", "0.30"))  # max position cap
+SCALPER_RISK_PER_TRADE = float(os.getenv("SCALPER_RISK_PER_TRADE", "0.01"))  # 1% of balance risked per trade
 SCALPER_TRAIL_ACT    = 0.03      # trailing stop activates at +3%
 SCALPER_TRAIL_PCT    = 0.015     # trail 1.5% below highest price
 SCALPER_ATR_MULT     = 1.5       # EMA21 distance fallback multiplier in dynamic SL
@@ -79,9 +79,8 @@ ALT_MAX_TRADES      = 2
 MOONSHOT_BUDGET_PCT = 0.05
 MOONSHOT_TP         = 0.15      # +15% (was +25% — more achievable in 1h)
 MOONSHOT_SL         = 0.05      # -5% (tightened from -7% — 1h window, cut fast)
-MOONSHOT_MAX_VOL    = 500_000
+MOONSHOT_MAX_VOL    = 250_000
 MOONSHOT_MIN_VOL    = 5_000
-MOONSHOT_MIN_1H     = 5.0
 MOONSHOT_MIN_SCORE  = 20
 MOONSHOT_MAX_HOURS  = 2   # absolute ceiling — matches MOONSHOT_TIMEOUT_MAX_MINS
 MOONSHOT_MIN_DAYS   = 2
@@ -120,8 +119,8 @@ MIN_PRICE         = 0.001
 SCAN_INTERVAL     = 60
 STATE_FILE        = "state.json"  # persists open positions + history across restarts
 
-TELEGRAM_TOKEN   = "8729639207:AAGR2ytuX36ocCVagQj-tGBE2QEkvrTiqQo"
-TELEGRAM_CHAT_ID = "7058246374"
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ── HTTP reliability ───────────────────────────────────────────
 HTTP_RETRIES           = 3        # retry GET requests this many times
@@ -142,20 +141,20 @@ SCALPER_MAX_SPREAD     = 0.004   # skip pair if bid/ask spread > 0.4% (slippage 
 SCALPER_MAX_CORRELATION= 0.85    # skip if 20-candle return correlation with open
                                   # position > 0.85 (avoids correlated simultaneous SLs)
 SCALPER_MIN_ATR_PCT    = 0.003   # skip pair if ATR/price < 0.3% — choppy, TP unreachable
-MAX_CONSECUTIVE_LOSSES = 3       # pause scalper entries after this many SLs in a row
-WIN_RATE_CB_WINDOW     = 10      # look back this many full (non-partial) trades
-WIN_RATE_CB_THRESHOLD  = 0.30    # pause all entries if win rate < 30% over that window
-WIN_RATE_CB_PAUSE_MINS = 60      # how long to pause (minutes)
-MAX_EXPOSURE_PCT       = 0.80    # skip new entries if open positions > 80% of balance
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
+WIN_RATE_CB_WINDOW     = int(os.getenv("WIN_RATE_CB_WINDOW",     "10"))
+WIN_RATE_CB_THRESHOLD  = float(os.getenv("WIN_RATE_CB_THRESHOLD","0.30"))
+WIN_RATE_CB_PAUSE_MINS = int(os.getenv("WIN_RATE_CB_PAUSE_MINS", "60"))
+MAX_EXPOSURE_PCT       = float(os.getenv("MAX_EXPOSURE_PCT",     "0.80"))
 MOONSHOT_MAX_SPREAD    = 0.008   # skip moonshot if spread > 0.8% — pump entries fill worse
 
 # ── BTC regime filter ──────────────────────────────────────────
 # If BTC drops sharply in the last 5m candle the whole market is risk-off.
 # Entering a scalper position in that window almost guarantees an SL trigger.
-BTC_REGIME_DROP        = 0.02    # pause if BTC last 5m candle < -2%
-BTC_REGIME_EMA_PERIOD  = 100     # pause if price below this EMA — 100×5m = 8h trend filter
-BTC_REGIME_VOL_MULT    = 2.0     # also pause if BTC ATR > N× its own 20-candle average
-                                  # (volatility spike — unpredictable whipsaws)
+BTC_REGIME_DROP        = 0.02    # pause scalper if BTC last 5m candle < -2%
+BTC_REGIME_EMA_PERIOD  = 100     # pause scalper if price below this EMA — 100×5m = 8h trend filter
+BTC_REGIME_VOL_MULT    = 2.0     # pause scalper if BTC ATR > N× its own 20-candle average
+BTC_PANIC_DROP         = 0.05    # pause ALL strategies (incl. alts) if BTC drops > 5% in one candle
 
 # ── AI Sentiment ──────────────────────────────────────────────
 # Claude Haiku searches for latest news and returns a score -1.0 to +1.0.
@@ -168,13 +167,29 @@ SENTIMENT_MAX_BONUS  = 15       # max points added for very bullish sentiment (+
 SENTIMENT_MAX_PENALTY= 20       # max points removed for very bearish sentiment (-1.0)
                                  # asymmetric: bad news hurts more than good news helps
 
+# ── Moonshot social sentiment ──────────────────────────────────
+# Two-layer AI signal for moonshot discovery:
+# 1. Trending scan — Haiku searches for socially trending coins every N minutes,
+#    adds them to the candidate pool before technical scoring runs.
+# 2. Social boost — per-symbol search for influencer/Reddit buzz on candidates
+#    that pass technical scoring, applied as a score bonus on top of news sentiment.
+MOONSHOT_SOCIAL_SCAN_MINS  = int(os.getenv("MOONSHOT_SOCIAL_SCAN_MINS",  "30"))
+MOONSHOT_SOCIAL_MAX_COINS  = int(os.getenv("MOONSHOT_SOCIAL_MAX_COINS",  "10"))
+MOONSHOT_SOCIAL_BOOST_MAX  = int(os.getenv("MOONSHOT_SOCIAL_BOOST_MAX",  "20"))
+MOONSHOT_SOCIAL_CACHE_MINS = int(os.getenv("MOONSHOT_SOCIAL_CACHE_MINS", "20"))
+
 # ═══════════════════════════════════════════════════════════════
 BASE_URL = "https://api.mexc.com"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            "bot.log", maxBytes=10_000_000, backupCount=5
+        ),
+    ]
 )
 log = logging.getLogger(__name__)
 
@@ -240,6 +255,11 @@ _moonshot_scan_sem = threading.Semaphore(5)
 _scalper_excluded: dict = {}  # {symbol: cooldown_until_ts}
 _alt_excluded:     set  = set()
 
+# Moonshot social sentiment caches
+_trending_coins:      list  = []   # [(symbol, reason_str), ...] from last trending scan
+_trending_coins_at:   float = 0.0  # timestamp of last trending scan
+_social_boost_cache:  dict  = {}   # {symbol: (boost_float, summary, fetched_at)}
+
 # ── State persistence ──────────────────────────────────────────
 
 def save_state():
@@ -257,6 +277,7 @@ def save_state():
             "win_rate_pause_until": _win_rate_pause_until,
             "scalper_excluded":     _scalper_excluded,
             "alt_excluded":         list(_alt_excluded),
+            "api_blacklist":        list(_api_blacklist),
             "saved_at":             datetime.now(timezone.utc).isoformat(),
         }
         tmp = STATE_FILE + ".tmp"
@@ -267,17 +288,17 @@ def save_state():
         log.warning(f"State save failed: {e}")
 
 
-def load_state() -> tuple[list, list, list, int, float, dict, set]:
+def load_state() -> tuple[list, list, list, int, float, dict, set, set]:
     """
     Load persisted state from STATE_FILE.
     Returns (scalper_trades, alt_trades, trade_history,
              consecutive_losses, win_rate_pause_until,
-             scalper_excluded, alt_excluded).
+             scalper_excluded, alt_excluded, api_blacklist).
     Returns empty defaults if file is missing or unreadable.
     """
     try:
         if not os.path.exists(STATE_FILE):
-            return [], [], [], 0, 0.0, {}, set()
+            return [], [], [], 0, 0.0, {}, set(), set()
         with open(STATE_FILE) as f:
             d = json.load(f)
         age = (datetime.now(timezone.utc) -
@@ -295,10 +316,11 @@ def load_state() -> tuple[list, list, list, int, float, dict, set]:
             d.get("win_rate_pause_until", 0.0),
             d.get("scalper_excluded",     {}),
             set(d.get("alt_excluded",     [])),
+            set(d.get("api_blacklist",    [])),
         )
     except Exception as e:
         log.warning(f"State load failed ({e}) — starting fresh")
-        return [], [], [], 0, 0.0, {}, set()
+        return [], [], [], 0, 0.0, {}, set(), set()
 
 def _get_session() -> requests.Session:
     """Return a thread-local requests.Session, creating one if needed."""
@@ -444,6 +466,158 @@ def sentiment_score_adjustment(symbol: str) -> tuple[float, str]:
         label = f"🔴 sentiment {score:+.2f} ({delta:+.0f}pts)"
 
     return delta, label
+
+def get_trending_coins() -> list[tuple[str, str]]:
+    """
+    Option B — Proactive trending scan.
+    Ask Haiku to search for coins currently trending on social media.
+    Returns [(symbol_without_USDT, reason), ...]. Cached for
+    MOONSHOT_SOCIAL_SCAN_MINS. Returns [] if disabled or on error.
+    """
+    global _trending_coins, _trending_coins_at
+    if not SENTIMENT_ENABLED:
+        return []
+    if time.time() - _trending_coins_at < MOONSHOT_SOCIAL_SCAN_MINS * 60:
+        return _trending_coins
+
+    prompt = (
+        f"Search Reddit (r/CryptoCurrency, r/SatoshiStreetBets, r/altcoin), "
+        f"crypto Twitter/X, and Telegram channel summaries right now. "
+        f"Find up to {MOONSHOT_SOCIAL_MAX_COINS} cryptocurrency coins "
+        f"being hyped, trending, or pumped by influencers in the last few hours. "
+        f"Focus on small/unknown coins, not BTC/ETH/SOL.\n\n"
+        f"Respond ONLY with valid JSON — no other text:\n"
+        f'{{"coins": [{{"symbol": "<TICKER without USDT>", '
+        f'"reason": "<max 10 words why trending>"}}, ...]}}\n\n'
+        f"Only include coins with genuine social momentum right now. "
+        f"If nothing credible found, return {{\"coins\": []}}."
+    )
+
+    # ask_haiku doesn't support web_search — call directly with tool
+    try:
+        response = _get_session().post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY,
+                     "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 400,
+                  "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=25,
+        )
+        response.raise_for_status()
+        text = ""
+        for block in response.json().get("content", []):
+            if block.get("type") == "text":
+                text = block["text"].strip()
+                break
+        if not text:
+            return _trending_coins
+
+        text = text.replace("```json", "").replace("```", "").strip()
+        # Non-greedy match of outermost {...} — avoids swallowing nested structures
+        m = re.search(r'\{.*?\}', text, re.DOTALL)
+        if not m:
+            # Fallback: find the array directly
+            m = re.search(r'\[.*?\]', text, re.DOTALL)
+            parsed = {"coins": json.loads(m.group())} if m else {"coins": []}
+        else:
+            parsed = json.loads(m.group())
+
+        result = []
+        for c in parsed.get("coins", [])[:MOONSHOT_SOCIAL_MAX_COINS]:
+            sym    = str(c.get("symbol", "")).upper().strip().replace("USDT", "")
+            reason = str(c.get("reason", ""))
+            if sym and len(sym) >= 2:
+                result.append((sym, reason))
+
+        _trending_coins    = result
+        _trending_coins_at = time.time()
+        if result:
+            log.info(f"🔥 Trending scan: {[s for s, _ in result]}")
+        return result
+
+    except Exception as e:
+        log.debug(f"🔥 Trending scan failed: {e}")
+        return _trending_coins
+
+
+def get_social_boost(symbol: str) -> tuple[float, str]:
+    """
+    Option A — Per-symbol social sentiment boost.
+    For a moonshot candidate that passed technical scoring, search for
+    influencer mentions, Reddit posts, and community hype.
+    Returns (boost_points, summary) — boost is 0–MOONSHOT_SOCIAL_BOOST_MAX.
+    Cached per symbol for MOONSHOT_SOCIAL_CACHE_MINS.
+    Uses _moonshot_scan_sem so parallel scorer threads don't flood the API.
+    Returns (0, "") if disabled or on error.
+    """
+    if not SENTIMENT_ENABLED:
+        return 0.0, ""
+
+    cached = _social_boost_cache.get(symbol)
+    if cached:
+        boost, summary, fetched_at = cached
+        if time.time() - fetched_at < MOONSHOT_SOCIAL_CACHE_MINS * 60:
+            return boost, summary
+
+    coin = symbol.replace("USDT", "").strip()
+    prompt = (
+        f"Search for {coin} cryptocurrency on Reddit, Twitter/X, and Telegram right now. "
+        f"Look for: influencer posts, community hype, viral threads, 'gem' recommendations, "
+        f"or coordinated buying signals.\n\n"
+        f"Rate the SOCIAL MOMENTUM (not fundamentals) from 0.0 to 1.0.\n\n"
+        f"Respond ONLY with valid JSON — no other text:\n"
+        f'{{"social_score": <0.0 to 1.0>, "summary": "<one sentence max 12 words>"}}\n\n'
+        f"0.0 = no social activity found, 1.0 = massive viral hype right now. "
+        f"Base it only on what you actually found, not general knowledge."
+    )
+
+    # Use the semaphore so parallel scorer threads don't all fire Anthropic calls at once
+    with _moonshot_scan_sem:
+        # ask_haiku doesn't support web_search tools — call directly
+        try:
+            response = _get_session().post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY,
+                         "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 200,
+                      "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                      "messages": [{"role": "user", "content": prompt}]},
+                timeout=20,
+            )
+            response.raise_for_status()
+            text = ""
+            for block in response.json().get("content", []):
+                if block.get("type") == "text":
+                    text = block["text"].strip()
+                    break
+        except Exception as e:
+            log.debug(f"🔥 Social boost failed for {coin}: {e}")
+            return 0.0, ""
+
+    if not text:
+        return 0.0, ""
+
+    text = text.replace("```json", "").replace("```", "").strip()
+    m = re.search(r'\{[^{}]+\}', text, re.DOTALL)
+    if not m:
+        return 0.0, ""
+
+    try:
+        parsed  = json.loads(m.group())
+        raw     = float(parsed.get("social_score", 0.0))
+        score   = max(0.0, min(1.0, raw))
+        summary = str(parsed.get("summary", ""))
+        boost   = round(score * MOONSHOT_SOCIAL_BOOST_MAX, 1)
+        _social_boost_cache[symbol] = (boost, summary, time.time())
+        if boost > 0:
+            log.info(f"🔥 Social boost [{coin}]: +{boost:.0f}pts — {summary}")
+        return boost, summary
+    except Exception:
+        return 0.0, ""
+
 
 def public_get(path, params=None):
     """GET with retry on transient errors (5xx, 429, network timeouts).
@@ -764,10 +938,15 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
             log.debug(f"[SCALPER] Skip {sym} — thin "
                       f"(1h vol ${recent_vol_usdt:,.0f} < ${SCALPER_MIN_1H_VOL:,})")
             return None
-        sentiment_delta, sentiment_label = sentiment_score_adjustment(sym)
-        score = round(score + sentiment_delta, 2)
-        if sentiment_delta != 0:
-            log.info(f"[SCALPER] {sym} sentiment: {sentiment_label} → score {score}")
+        # Only fetch sentiment when score is near the threshold — if already well above
+        # or below, sentiment can't change the decision and the API call is wasted.
+        if score > SCALPER_THRESHOLD - 5:
+            sentiment_delta, sentiment_label = sentiment_score_adjustment(sym)
+            score = round(score + sentiment_delta, 2)
+            if sentiment_delta != 0:
+                log.info(f"[SCALPER] {sym} sentiment: {sentiment_label} → score {score}")
+        else:
+            sentiment_delta = 0.0
         if score < SCALPER_THRESHOLD:
             log.info(f"[SCALPER] Skip {sym} — below threshold after sentiment ({score:.1f})")
             return None
@@ -803,8 +982,6 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
     return result
 
 
-def _score_for_watchlist(sym: str)       -> dict | None: return _score_scalper(sym, strict=False)
-def evaluate_scalper_candidate(sym: str) -> dict | None: return _score_scalper(sym, strict=True)
 
 
 def build_watchlist(tickers: pd.DataFrame):
@@ -834,8 +1011,8 @@ def build_watchlist(tickers: pd.DataFrame):
 
     # Score all in parallel — entry scorer re-evaluates top 5 with fresh data anyway
     scores = []
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(_score_for_watchlist, sym): sym for sym in established}
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {ex.submit(_score_scalper, sym, False): sym for sym in established}
         for f in as_completed(futures):
             try:
                 result = f.result()
@@ -902,7 +1079,7 @@ def find_scalper_opportunity(budget: float, exclude: set, open_symbols: set) -> 
     # Only re-score the top 5 — avoids too many API calls between watchlist rebuilds
     refreshed = []
     for s in candidates[:5]:
-        result = evaluate_scalper_candidate(s["symbol"])
+        result = _score_scalper(s["symbol"], strict=True)
         if result:
             refreshed.append(result)
         time.sleep(0.05)
@@ -998,17 +1175,38 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
     df = df[df["lastPrice"]   >= MIN_PRICE]
     df = df[~df["symbol"].isin(open_symbols | exclude | _api_blacklist)]
 
-    # Pre-filter using priceChangePercent already in tickers — avoids a kline fetch per symbol.
-    # priceChangePercent is 24h change; use it as a proxy for momentum (not the same as 1h
-    # but eliminates flat/declining coins before the expensive per-symbol kline scan).
-    df_momentum = df[df["priceChangePercent"] >= MOONSHOT_MIN_1H]
-    momentum_candidates = df_momentum.sort_values("priceChangePercent", ascending=False).head(20)["symbol"].tolist()
+    # Sort by absolute price change to surface anything moving hard in either direction.
+    # We deliberately drop the 24h priceChangePercent directional filter here —
+    # in a down market a coin can pump +100% in an hour but still show negative 24h change,
+    # so filtering on 24h change misses the exact moves moonshot exists to catch.
+    # The kline scorer (EMA crossover + vol ratio) handles quality filtering.
+    momentum_candidates = (df.assign(abs_change=df["priceChangePercent"].abs())
+                             .sort_values("abs_change", ascending=False)
+                             .head(20)["symbol"].tolist())
 
     new_listings = find_new_listings(tickers, exclude=exclude, open_symbols=open_symbols)
     new_symbols  = [n["symbol"] for n in new_listings]
-    all_candidates = list(dict.fromkeys(new_symbols + momentum_candidates))
 
-    log.info(f"🌙 [MOONSHOT] {len(all_candidates)} candidates ({len(new_symbols)} new + {len(momentum_candidates)} momentum)")
+    # Option B — add socially trending coins to the candidate pool.
+    # get_trending_coins() is cached so this is cheap on most cycles.
+    trending       = get_trending_coins()
+    trending_syms  = []
+    trending_reasons = {}
+    all_ticker_syms = set(df["symbol"].tolist())
+    for coin, reason in trending:
+        sym = f"{coin}USDT"
+        if (sym in all_ticker_syms
+                and sym not in open_symbols
+                and sym not in exclude
+                and sym not in _api_blacklist):
+            trending_syms.append(sym)
+            trending_reasons[sym] = reason
+    if trending_syms:
+        log.info(f"🔥 [MOONSHOT] Adding {len(trending_syms)} trending coins: {trending_syms}")
+
+    all_candidates = list(dict.fromkeys(new_symbols + trending_syms + momentum_candidates))
+    log.info(f"🌙 [MOONSHOT] {len(all_candidates)} candidates "
+             f"({len(new_symbols)} new + {len(trending_syms)} trending + {len(momentum_candidates)} momentum)")
     if not all_candidates:
         return None
 
@@ -1037,24 +1235,38 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
             score     = rsi_score + ma_score + vol_score
             if score < MOONSHOT_MIN_SCORE:
                 return None
-            sentiment_delta, _ = sentiment_score_adjustment(sym)
-            final_score = round(score + sentiment_delta, 2)
+            # Only apply sentiment/social when score is near threshold — reduces cost
+            # significantly since most candidates fail well before sentiment matters.
+            if score > MOONSHOT_MIN_SCORE - 5:
+                sentiment_delta, _ = sentiment_score_adjustment(sym)
+                social_boost, social_summary = get_social_boost(sym)
+            else:
+                sentiment_delta, social_boost, social_summary = 0.0, 0.0, ""
+            final_score = round(score + sentiment_delta + social_boost, 2)
             if final_score < MOONSHOT_MIN_SCORE:
                 return None
-            # 1h change: use tickers if available, else last 2 closes
+            # 24h change — kept for logging only, not used as a filter.
+            # EMA crossover + vol_ratio in the scorer already enforce upward momentum.
             row = df[df["symbol"] == sym]
-            change_1h = float(row["priceChangePercent"].iloc[0]) if not row.empty else None
-            if not is_new and (change_1h is None or change_1h < MOONSHOT_MIN_1H):
-                return None
+            change_1h = float(row["priceChangePercent"].iloc[0]) if not row.empty else 0.0
             return {
-                "symbol": sym, "score": final_score, "rsi": round(rsi, 2),
-                "vol_ratio": round(vol_ratio, 2), "price": float(close.iloc[-1]),
-                "_df": df_k, "_is_new": is_new, "_1h_chg": round(change_1h or 0, 2),
-                "sentiment": sentiment_delta if sentiment_delta != 0 else None,
+                "symbol":       sym,
+                "score":        final_score,
+                "rsi":          round(rsi, 2),
+                "vol_ratio":    round(vol_ratio, 2),
+                "price":        float(close.iloc[-1]),
+                "_df":          df_k,
+                "_is_new":      is_new,
+                "_is_trending": sym in trending_syms,
+                "_trend_reason":trending_reasons.get(sym, ""),
+                "_1h_chg":      round(change_1h or 0, 2),
+                "sentiment":    sentiment_delta if sentiment_delta != 0 else None,
+                "social_boost": social_boost if social_boost > 0 else None,
+                "social_buzz":  social_summary if social_boost > 0 else None,
             }
 
     scores = []
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=5) as ex:
         futures = {ex.submit(_score_moonshot, sym): sym for sym in all_candidates}
         for f in as_completed(futures):
             try:
@@ -1068,11 +1280,16 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
         scanner_log("🌙 [MOONSHOT] No qualifying candidates.")
         return None
 
-    scores.sort(key=lambda x: x["score"] + (5 if x.get("_is_new") else 0), reverse=True)
+    scores.sort(key=lambda x: x["score"]
+                + (5  if x.get("_is_new")      else 0)
+                + (8  if x.get("_is_trending")  else 0),
+                reverse=True)
     best = scores[0]
     last_top_alt = best
-    scanner_log(f"🌙 [MOONSHOT] Top: {best['symbol']}{'🆕' if best.get('_is_new') else ''} | "
-                f"Score: {best['score']}/100 | 1h: {best['_1h_chg']:+.1f}% | RSI: {best['rsi']}")
+    trend_tag = "🔥" if best.get("_is_trending") else ("🆕" if best.get("_is_new") else "")
+    scanner_log(f"🌙 [MOONSHOT] Top: {best['symbol']}{trend_tag} | "
+                f"Score: {best['score']}/100 | 1h: {best['_1h_chg']:+.1f}% | RSI: {best['rsi']}"
+                + (f" | 🔥 {best['_trend_reason']}" if best.get("_trend_reason") else ""))
 
     # Burst detection — tightened: single threshold of MOONSHOT_MIN_VOL_BURST for both types
     tradeable = []
@@ -1479,6 +1696,31 @@ def calc_dynamic_tp_sl(opp: dict) -> tuple[float, float, str, str]:
 
 # ── Trade lifecycle ────────────────────────────────────────────
 
+def calc_risk_budget(opp: dict, balance: float) -> tuple[float, float, float, str, str]:
+    """
+    Risk-based position sizing for SCALPER.
+    Computes TP/SL via calc_dynamic_tp_sl once, then derives the budget so
+    hitting the SL costs exactly SCALPER_RISK_PER_TRADE of current balance.
+
+      budget = (balance × RISK_PCT) / sl_pct
+
+    Hard-capped at SCALPER_BUDGET_PCT to prevent oversized positions on tiny SLs.
+    Returns (budget, tp_pct, sl_pct, tp_label, sl_label) so the caller can pass
+    the pre-computed TP/SL directly into open_position — avoiding a second call.
+    Falls back to the percentage cap if dynamic TP/SL can't be computed.
+    """
+    try:
+        tp_pct, sl_pct, tp_label, sl_label = calc_dynamic_tp_sl(opp)
+        if sl_pct > 0:
+            risk_budget = (balance * SCALPER_RISK_PER_TRADE) / sl_pct
+            capped      = min(risk_budget, balance * SCALPER_BUDGET_PCT)
+            return round(capped, 2), tp_pct, sl_pct, tp_label, sl_label
+    except Exception:
+        pass
+    # Fallback — use pct cap and let open_position compute TP/SL itself
+    return round(balance * SCALPER_BUDGET_PCT, 2), 0.0, 0.0, "", ""
+
+
 def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     symbol                              = opp["symbol"]
 
@@ -1548,11 +1790,20 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     else:
         log.info(f"[{label}] Using ticker price (myTrades unavailable): ${price:.6f}")
 
-    # SCALPER: dynamic signal-aware TP and SL
+    # SCALPER: dynamic signal-aware TP and SL.
+    # If pre-computed values are passed in (tp_pct > 0), use them directly —
+    # calc_risk_budget already ran calc_dynamic_tp_sl to derive the budget.
+    # Falls back to calling calc_dynamic_tp_sl if no pre-computed values exist.
     # REVERSAL: SL anchored to cap-candle low stored in opp["cap_sl_pct"]
     # MOONSHOT: fixed pct TP/SL passed in from caller
     if label == "SCALPER" and opp.get("atr_pct"):
-        used_tp_pct, actual_sl, tp_label, sl_label = calc_dynamic_tp_sl(opp)
+        if tp_pct > 0 and sl_pct > 0:
+            used_tp_pct = tp_pct
+            actual_sl   = sl_pct
+            tp_label    = ""
+            sl_label    = ""
+        else:
+            used_tp_pct, actual_sl, tp_label, sl_label = calc_dynamic_tp_sl(opp)
         tp_price = round_price_to_tick(actual_entry * (1 + used_tp_pct), tick_size)
     elif label == "REVERSAL" and opp.get("cap_sl_pct"):
         used_tp_pct = tp_pct
@@ -1648,6 +1899,10 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         sentiment_icon = "🟢" if sentiment_val > 0 else "🔴"
         sentiment_line = f"Sentiment:   {sentiment_icon} {sentiment_val:+.1f}pts\n"
 
+    social_buzz = opp.get("social_buzz")
+    social_line = f"Social:      🔥 +{opp['social_boost']:.0f}pts — {social_buzz}\n" \
+                  if social_buzz else ""
+
     if label == "SCALPER" and tp_label:
         tp_display = (f"Take profit: <b>${tp_price:.6f}</b>  (+{used_tp_pct*100:.1f}%)"
                       f"  <i>[{tp_label}]</i>\n")
@@ -1680,6 +1935,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         f"Entry:       <b>${actual_entry:.6f}</b>\n"
         f"{slippage_line}"
         f"{sentiment_line}"
+        f"{social_line}"
         f"{tp_display}"
         f"{sl_display}"
         f"{partial_tp_line}"
@@ -2388,8 +2644,6 @@ def generate_daily_journal(today_trades: list, balance: float) -> str:
 
 # ── Daily summary ─────────────────────────────────────────────
 
-# ── Daily summary ─────────────────────────────────────────────
-
 def _fetch_fills_since(symbols: list, since_ms: int) -> dict:
     """
     Fetch all myTrades for the given symbols since since_ms.
@@ -2406,7 +2660,7 @@ def _fetch_fills_since(symbols: list, since_ms: int) -> dict:
         except:
             pass
         time.sleep(0.1)
-    orders = defaultdict(lambda: {"symbol": "", "qty": 0, "cost": 0, "side": ""})
+    orders = collections.defaultdict(lambda: {"symbol": "", "qty": 0, "cost": 0, "side": ""})
     for fill in all_fills:
         oid = fill["orderId"]
         orders[oid]["symbol"] = fill["symbol"]
@@ -2505,8 +2759,8 @@ def fetch_mexc_weekly_pnl() -> dict:
         sells   = {o: v for o, v in orders.items() if v["side"] == "SELL"}
         bought  = sum(v["cost"] for v in buys.values())
         sold    = sum(v["cost"] for v in sells.values())
-        bsyms   = Counter(v["symbol"] for v in buys.values())
-        ssyms   = Counter(v["symbol"] for v in sells.values())
+        bsyms   = collections.Counter(v["symbol"] for v in buys.values())
+        ssyms   = collections.Counter(v["symbol"] for v in sells.values())
         done    = sum(min(bsyms[s], ssyms[s]) for s in bsyms)
         return {"total":done,"buys":len(buys),"sells":len(sells),
                 "pnl_usdt":round(sold-bought,4),
@@ -2548,6 +2802,117 @@ def send_weekly_summary(balance: float):
 
 # ── Telegram commands ─────────────────────────────────────────
 
+def _cmd_status(balance: float):
+    mode  = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
+    lines = [f"📋 <b>Status</b> [{mode}]\n━━━━━━━━━━━━━━━"]
+    for t in scalper_trades:
+        try:
+            px  = float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
+            pct = (px - t["entry_price"]) / t["entry_price"] * 100
+            lines.append(f"🟢 {t['symbol']} | {pct:+.2f}% | "
+                         f"TP: ${t['tp_price']:.6f} | SL: ${t['sl_price']:.6f}")
+        except:
+            lines.append(f"🟢 {t['symbol']} (unavailable)")
+    if not scalper_trades:
+        lines.append("Scalper: scanning...")
+    for t in alt_trades:
+        try:
+            px  = float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
+            pct = (px - t["entry_price"]) / t["entry_price"] * 100
+            lines.append(f"{t['label']}: <b>{t['symbol']}</b> | {pct:+.2f}% | "
+                         f"TP: ${t['tp_price']:.6f} | SL: ${t['sl_price']:.6f}")
+        except:
+            lines.append(f"{t['label']}: {t['symbol']} (unavailable)")
+    if not alt_trades:
+        lines.append("Alt: scanning...")
+    lines.append(f"Balance: <b>${balance:.2f} USDT</b>")
+    telegram("\n".join(lines))
+
+
+def _cmd_config():
+    telegram(
+        f"⚙️ <b>Current Config</b>\n━━━━━━━━━━━━━━━\n"
+        f"🟢 <b>Scalper</b>\n"
+        f"  Max: {SCALPER_MAX_TRADES} × {SCALPER_BUDGET_PCT*100:.0f}%\n"
+        f"  TP: dynamic {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% (signal-aware, candle-capped)\n"
+        f"  SL: dynamic {SCALPER_SL_MIN*100:.1f}–{SCALPER_SL_MAX*100:.0f}% (noise-floored)\n"
+        f"  Trail: +{SCALPER_TRAIL_ACT*100:.0f}% → {SCALPER_TRAIL_PCT*100:.1f}%\n"
+        f"  Watchlist: {len(_watchlist)} pairs | age: {(time.time()-_watchlist_at)/60:.0f}min\n"
+        f"\n🌙 <b>Moonshot</b>  [bot-monitored]\n"
+        f"  Max: {ALT_MAX_TRADES} trades | Min budget: max($5, 5% of balance)\n"
+        f"  TP: +{MOONSHOT_TP*100:.0f}%  SL: -{MOONSHOT_SL*100:.0f}%  Max: {MOONSHOT_TIMEOUT_MAX_MINS}min\n"
+        f"  Partial TP: {MOONSHOT_PARTIAL_TP_RATIO*100:.0f}% sold at +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% → SL moves to entry\n"
+        f"\n🔄 <b>Reversal</b>  [bot-monitored]\n"
+        f"  TP: +{REVERSAL_TP*100:.1f}%  SL: cap-candle anchor  Max: {REVERSAL_MAX_HOURS}h\n"
+        f"  Partial TP: {REVERSAL_PARTIAL_TP_RATIO*100:.0f}% sold at +{REVERSAL_PARTIAL_TP_PCT*100:.1f}% → SL moves to entry\n"
+        f"\n🧠 Sentiment: {'✅ on' if SENTIMENT_ENABLED else '⚠️ off'}\n"
+        f"\n{'⏸️ PAUSED' if _paused else '▶️ RUNNING'}"
+    )
+
+
+def _cmd_close():
+    telegram("🚨 <b>Emergency close triggered.</b>")
+    closed = 0
+    for t in scalper_trades[:]:
+        if close_position(t, "STOP_LOSS"):
+            scalper_trades.remove(t); closed += 1
+    for t in alt_trades[:]:
+        if close_position(t, "STOP_LOSS"):
+            alt_trades.remove(t); closed += 1
+    telegram(f"✅ Closed {closed} position(s).")
+
+
+def _cmd_restart():
+    telegram("🔄 <b>Restarting...</b> State saved. Railway will redeploy.")
+    save_state()
+    os._exit(0)
+
+
+def _cmd_ask(question: str, balance: float):
+    if not SENTIMENT_ENABLED:
+        telegram("🧠 <b>/ask</b> requires ANTHROPIC_API_KEY to be set.")
+        return
+    telegram("🧠 Thinking...")
+    recent = trade_history[-50:] if len(trade_history) > 50 else trade_history
+    today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    context_lines = []
+    for t in recent:
+        if t.get("closed_at") and t.get("opened_at"):
+            held = round((datetime.fromisoformat(t["closed_at"]) -
+                          datetime.fromisoformat(t["opened_at"])).total_seconds() / 60)
+            context_lines.append(
+                f"{t.get('closed_at','?')[:16]} {t['symbol']} [{t['label']}] "
+                f"pnl={t.get('pnl_pct',0):+.2f}% reason={t.get('exit_reason','?')} "
+                f"score={t.get('score',0):.0f} rsi={t.get('rsi',0):.0f} held={held}min"
+            )
+    open_ctx = []
+    for t in scalper_trades + alt_trades:
+        try:
+            px  = float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
+            pct = (px - t["entry_price"]) / t["entry_price"] * 100
+            open_ctx.append(f"{t['symbol']} [{t['label']}] currently {pct:+.2f}%")
+        except:
+            open_ctx.append(f"{t['symbol']} [{t['label']}]")
+    system = (
+        "You are a concise crypto trading analyst with access to a live bot's trade history. "
+        "Answer the user's question directly using only the data provided. "
+        "Be specific and honest. Keep answers under 150 words."
+    )
+    prompt = (
+        f"Bot trade history (last {len(context_lines)} closed trades):\n"
+        + "\n".join(context_lines[-30:])
+        + (f"\n\nCurrently open: {', '.join(open_ctx)}" if open_ctx else "")
+        + f"\n\nBalance: ${balance:.2f} USDT | Date: {today}\n\nUser question: {question}"
+    )
+    answer = ask_haiku(prompt, system=system, max_tokens=300)
+    if answer:
+        safe_q = question.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+        safe_a = answer.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+        telegram(f"🧠 <b>Ask:</b> <i>{safe_q}</i>\n━━━━━━━━━━━━━━━\n{safe_a}"[:4000])
+    else:
+        telegram("🧠 Couldn't get an answer — check logs.")
+
+
 def listen_for_commands(balance: float):
     global last_telegram_update, _paused
     try:
@@ -2562,145 +2927,29 @@ def listen_for_commands(balance: float):
         for update in data.get("result", []):
             last_telegram_update = update["update_id"]
             msg      = update.get("message", {})
-            raw_text = msg.get("text", "").strip()       # preserve case for /ask
+            raw_text = msg.get("text", "").strip()
             text     = raw_text.lower()
-            if str(msg.get("chat",{}).get("id")) != str(TELEGRAM_CHAT_ID):
+            if str(msg.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
                 continue
 
-            if text in ("/pnl",):
-                telegram(build_weekly_message(fetch_mexc_weekly_pnl(), balance))
-
-            elif text in ("/status",):
-                mode  = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
-                lines = [f"📋 <b>Status</b> [{mode}]\n━━━━━━━━━━━━━━━"]
-                for t in scalper_trades:
-                    try:
-                        px  = float(public_get("/api/v3/ticker/price",{"symbol":t["symbol"]})["price"])
-                        pct = (px - t["entry_price"]) / t["entry_price"] * 100
-                        lines.append(f"🟢 {t['symbol']} | {pct:+.2f}% | "
-                                     f"TP: ${t['tp_price']:.6f} | SL: ${t['sl_price']:.6f}")
-                    except:
-                        lines.append(f"🟢 {t['symbol']} (unavailable)")
-                if not scalper_trades:
-                    lines.append("Scalper: scanning...")
-                for t in alt_trades:
-                    try:
-                        px  = float(public_get("/api/v3/ticker/price",{"symbol":t["symbol"]})["price"])
-                        pct = (px - t["entry_price"]) / t["entry_price"] * 100
-                        lines.append(f"{t['label']}: <b>{t['symbol']}</b> | {pct:+.2f}% | "
-                                     f"TP: ${t['tp_price']:.6f} | SL: ${t['sl_price']:.6f}")
-                    except:
-                        lines.append(f"{t['label']}: {t['symbol']} (unavailable)")
-                if not alt_trades:
-                    lines.append("Alt: scanning...")
-                lines.append(f"Balance: <b>${balance:.2f} USDT</b>")
-                telegram("\n".join(lines))
-
-            elif text in ("/logs",):
-                if _scanner_log_buffer:
-                    out = "📜 <b>Last Scanner Activity</b>\n━━━━━━━━━━━━━━━\n"
-                    out += "\n".join(f"<code>{l}</code>" for l in _scanner_log_buffer)
-                else:
-                    out = "📜 No scanner activity yet."
+            if   text == "/pnl":    telegram(build_weekly_message(fetch_mexc_weekly_pnl(), balance))
+            elif text == "/status": _cmd_status(balance)
+            elif text == "/logs":
+                out = ("📜 <b>Last Scanner Activity</b>\n━━━━━━━━━━━━━━━\n"
+                       + "\n".join(f"<code>{l}</code>" for l in _scanner_log_buffer)
+                       if _scanner_log_buffer else "📜 No scanner activity yet.")
                 telegram(out)
-
-            elif text in ("/pause",):
-                _paused = True
-                telegram("⏸️ <b>Paused.</b> No new trades. Existing positions monitored.\n/resume to restart.")
-
-            elif text in ("/resume",):
-                _paused = False
-                telegram("▶️ <b>Resumed.</b> Scanning for new trades.")
-
-            elif text in ("/close",):
-                telegram("🚨 <b>Emergency close triggered.</b>")
-                closed = 0
-                for t in scalper_trades[:]:
-                    if close_position(t, "STOP_LOSS"):
-                        scalper_trades.remove(t); closed += 1
-                for t in alt_trades[:]:
-                    if close_position(t, "STOP_LOSS"):
-                        alt_trades.remove(t); closed += 1
-                telegram(f"✅ Closed {closed} position(s).")
-
-            elif text in ("/config",):
-                telegram(
-                    f"⚙️ <b>Current Config</b>\n━━━━━━━━━━━━━━━\n"
-                    f"🟢 <b>Scalper</b>\n"
-                    f"  Max: {SCALPER_MAX_TRADES} × {SCALPER_BUDGET_PCT*100:.0f}%\n"
-                    f"  TP: dynamic {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% (signal-aware, candle-capped)\n"
-                    f"  SL: dynamic {SCALPER_SL_MIN*100:.1f}–{SCALPER_SL_MAX*100:.0f}% (noise-floored)\n"
-                    f"  Trail: +{SCALPER_TRAIL_ACT*100:.0f}% → {SCALPER_TRAIL_PCT*100:.1f}%\n"
-                    f"  Watchlist: {len(_watchlist)} pairs | age: {(time.time()-_watchlist_at)/60:.0f}min\n"
-                    f"\n🌙 <b>Moonshot</b>  [bot-monitored]\n"
-                    f"  Max: {ALT_MAX_TRADES} trades | Min budget: ${MIN_ALT_BUDGET:.2f}\n"
-                    f"  TP: +{MOONSHOT_TP*100:.0f}%  SL: -{MOONSHOT_SL*100:.0f}%  Max: {MOONSHOT_TIMEOUT_MAX_MINS}min\n"
-                    f"  Partial TP: {MOONSHOT_PARTIAL_TP_RATIO*100:.0f}% sold at +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% → SL moves to entry\n"
-                    f"\n🔄 <b>Reversal</b>  [bot-monitored]\n"
-                    f"  TP: +{REVERSAL_TP*100:.1f}%  SL: cap-candle anchor  Max: {REVERSAL_MAX_HOURS}h\n"
-                    f"  Partial TP: {REVERSAL_PARTIAL_TP_RATIO*100:.0f}% sold at +{REVERSAL_PARTIAL_TP_PCT*100:.1f}% → SL moves to entry\n"
-                    f"\n🧠 Sentiment: {'✅ on' if SENTIMENT_ENABLED else '⚠️ off'}\n"
-                    f"\n{'⏸️ PAUSED' if _paused else '▶️ RUNNING'}"
-                )
-
+            elif text == "/pause":  _paused = True;  telegram("⏸️ <b>Paused.</b> No new trades. Existing positions monitored.\n/resume to restart.")
+            elif text == "/resume": _paused = False; telegram("▶️ <b>Resumed.</b> Scanning for new trades.")
+            elif text == "/close":   _cmd_close()
+            elif text == "/restart": _cmd_restart()
+            elif text == "/config":  _cmd_config()
             elif raw_text.startswith("/ask ") or raw_text.startswith("/ask@"):
-                # /ask <question> — ask Haiku anything about the bot's recent trades
                 question = raw_text.split(" ", 1)[1].strip() if " " in raw_text else ""
                 if not question:
                     telegram("🧠 Usage: <code>/ask why am I losing on flat exits?</code>")
-                elif not SENTIMENT_ENABLED:
-                    telegram("🧠 <b>/ask</b> requires ANTHROPIC_API_KEY to be set.")
                 else:
-                    telegram("🧠 Thinking...")
-
-                    # Build context from recent trade history (last 50 trades)
-                    recent = trade_history[-50:] if len(trade_history) > 50 else trade_history
-                    today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-                    context_lines = []
-                    for t in recent:
-                        context_lines.append(
-                            f"{t.get('closed_at','?')[:16]} {t['symbol']} [{t['label']}] "
-                            f"pnl={t.get('pnl_pct',0):+.2f}% reason={t.get('exit_reason','?')} "
-                            f"score={t.get('score',0):.0f} rsi={t.get('rsi',0):.0f} "
-                            f"held={round((datetime.fromisoformat(t['closed_at']) - datetime.fromisoformat(t['opened_at'])).total_seconds()/60)}min"
-                        ) if t.get('closed_at') and t.get('opened_at') else None
-
-                    context_lines = [l for l in context_lines if l]
-
-                    # Open positions
-                    open_ctx = []
-                    for t in scalper_trades + alt_trades:
-                        try:
-                            px  = float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
-                            pct = (px - t["entry_price"]) / t["entry_price"] * 100
-                            open_ctx.append(f"{t['symbol']} [{t['label']}] currently {pct:+.2f}%")
-                        except:
-                            open_ctx.append(f"{t['symbol']} [{t['label']}]")
-
-                    system = (
-                        "You are a concise crypto trading analyst with access to a live bot's trade history. "
-                        "Answer the user's question directly using only the data provided. "
-                        "Be specific and honest. Keep answers under 150 words."
-                    )
-
-                    prompt = (
-                        f"Bot trade history (last {len(context_lines)} closed trades):\n"
-                        + "\n".join(context_lines[-30:])  # last 30 for token efficiency
-                        + (f"\n\nCurrently open: {', '.join(open_ctx)}" if open_ctx else "")
-                        + f"\n\nBalance: ${balance:.2f} USDT | Date: {today}\n\n"
-                        f"User question: {question}"
-                    )
-
-                    answer = ask_haiku(prompt, system=system, max_tokens=300)
-                    if answer:
-                        # Escape HTML in both the question and Haiku's answer
-                        safe_q = question.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-                        safe_a = answer.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-                        reply  = f"🧠 <b>Ask:</b> <i>{safe_q}</i>\n━━━━━━━━━━━━━━━\n{safe_a}"
-                        telegram(reply[:4000])  # Telegram hard limit
-                    else:
-                        telegram("🧠 Couldn't get an answer — check logs.")
+                    _cmd_ask(question, balance)
 
     except Exception as e:
         log.debug(f"Telegram poll error: {e}")
@@ -2828,31 +3077,30 @@ def reconcile_open_positions():
 
 # ── Main loop ──────────────────────────────────────────────────
 
-def run():
+def startup() -> float:
+    """
+    Initialise bot on launch: load state, reconcile exchange, build watchlist,
+    send the startup Telegram message. Returns startup_balance.
+    """
     global scalper_trades, alt_trades, trade_history, _consecutive_losses, \
-           _win_rate_pause_until, _last_rotation_scan, _watchlist, _watchlist_at, \
-           MIN_ALT_BUDGET, _scalper_excluded, _alt_excluded
+           _win_rate_pause_until, _scalper_excluded, _alt_excluded, _api_blacklist
 
     mode = "📝 PAPER TRADING" if PAPER_TRADE else "💰 LIVE TRADING"
     log.info(f"🚀 MEXC Bot — {mode}")
 
     _load_symbol_rules()
 
-    # ── Restore persisted state ────────────────────────────────
     (scalper_trades, alt_trades, trade_history,
      _consecutive_losses, _win_rate_pause_until,
-     _scalper_excluded, _alt_excluded) = load_state()
+     _scalper_excluded, _alt_excluded, _api_blacklist) = load_state()
 
     reconcile_open_positions()
 
-    # Build initial watchlist at startup
     log.info("📋 Building initial watchlist...")
-    startup_tickers = fetch_tickers()
-    build_watchlist(startup_tickers)
+    build_watchlist(fetch_tickers())
 
     startup_balance = get_available_balance()
-    MIN_ALT_BUDGET  = round(startup_balance * 0.10, 2)
-    log.info(f"💰 Starting balance: ${startup_balance:.2f} USDT | Min alt budget: ${MIN_ALT_BUDGET:.2f}")
+    log.info(f"💰 Starting balance: ${startup_balance:.2f} USDT")
     telegram(
         f"🚀 <b>MEXC Bot Started</b> [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"Balance: <b>${startup_balance:.2f} USDT</b>\n"
@@ -2867,15 +3115,20 @@ def run():
         f"  Watchlist: top {WATCHLIST_SIZE} pairs, refresh every {WATCHLIST_TTL//60}min\n"
         f"\n🌙 <b>Moonshot</b> (max {ALT_MAX_TRADES} trades, 5% each) [bot-monitored]\n"
         f"  TP: +{MOONSHOT_TP*100:.0f}%  SL: -{MOONSHOT_SL*100:.0f}%  max {MOONSHOT_MAX_HOURS}h\n"
-        f"  Min budget: ${MIN_ALT_BUDGET:.2f} (10% of balance)\n"
         f"\n🔄 <b>Reversal</b> (5%) [bot-monitored]\n"
         f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%  max {REVERSAL_MAX_HOURS}h\n"
         f"\n🧠 <b>AI Sentiment</b>: {'✅ enabled (Claude Haiku + web search)' if SENTIMENT_ENABLED else '⚠️ disabled (set ANTHROPIC_API_KEY)'}\n"
         f"  Cache: {SENTIMENT_CACHE_MINS}min | Bonus: +{SENTIMENT_MAX_BONUS}pts | Penalty: -{SENTIMENT_MAX_PENALTY}pts\n"
-        f"\n<i>/status · /pnl · /logs · /config · /pause · /resume · /close · /ask</i>"
+        f"\n<i>/status · /pnl · /logs · /config · /pause · /resume · /close · /restart · /ask</i>"
     )
+    return startup_balance
 
-    balance = get_available_balance()  # initialise before loop for listen_for_commands
+
+def run():
+    global _last_rotation_scan, _watchlist, _watchlist_at
+
+    startup_balance  = startup()
+    balance          = get_available_balance()
 
     while True:
         try:
@@ -2953,11 +3206,39 @@ def run():
             if over_exposed:
                 log.debug(f"⚠️ Over-exposed (${open_exposure:.0f} / ${balance:.0f}) — skipping new entries")
 
-            # Fetch tickers only when actively scanning for new entries
+            # ── Entry gates ───────────────────────────────────────
+            # Computed before the BTC fetch so the fetch only runs when needed.
+            # btc_panic is set below and fed back into these — that's fine since
+            # panic only adds an extra block, never removes one.
             scalper_needs_entry = (not _paused and not circuit_open and not over_exposed
                                    and len(scalper_trades) < SCALPER_MAX_TRADES)
-            alt_needs_entry     = not _paused and not over_exposed and len(alt_trades) < ALT_MAX_TRADES
-            need_scan           = scalper_needs_entry or alt_needs_entry
+            alt_needs_entry     = (not _paused and not over_exposed
+                                   and len(alt_trades) < ALT_MAX_TRADES)
+
+            # ── BTC panic check — blocks ALL strategies ───────────
+            # A -5% BTC candle is a market-wide event. Stop everything,
+            # not just scalper. Uses the same 120-candle dataset as the
+            # regime filter below — no extra fetch needed.
+            btc_panic = False
+            df_btc    = None  # fetched once, shared by panic + regime checks
+            if scalper_needs_entry or alt_needs_entry:
+                try:
+                    df_btc = parse_klines("BTCUSDT", interval="5m", limit=120, min_len=105)
+                    if df_btc is not None:
+                        chg = (float(df_btc["close"].iloc[-1]) /
+                               float(df_btc["open"].iloc[-1]) - 1)
+                        if chg < -BTC_PANIC_DROP:
+                            btc_panic = True
+                            log.warning(f"🚨 BTC panic: {chg*100:.2f}% — ALL entries paused this cycle")
+                except Exception:
+                    pass
+
+            # Apply panic gate now that btc_panic is known
+            if btc_panic:
+                scalper_needs_entry = False
+                alt_needs_entry     = False
+
+            need_scan = scalper_needs_entry or alt_needs_entry
             tickers             = None
             if need_scan:
                 try:
@@ -2975,12 +3256,9 @@ def run():
 
             # ── Step 1: Try to open a new scalper entry ───────
             if scalper_needs_entry:
-                # BTC regime filter — three independent checks.
-                # Any one failing skips entry for this cycle.
-                # Uses already-cached BTCUSDT klines when possible.
+                # BTC regime filter — three independent checks using the already-fetched df_btc.
                 btc_regime_ok = True
                 try:
-                    df_btc = parse_klines("BTCUSDT", interval="5m", limit=120, min_len=105)
                     if df_btc is not None:
                         btc_close = df_btc["close"]
 
@@ -3023,7 +3301,11 @@ def run():
                                                    exclude=_scalper_excluded,
                                                    open_symbols=open_symbols)
                 if opp:
-                    trade  = open_position(opp, budget, 0.0, 0.0, "SCALPER")
+                    trade_budget, pre_tp, pre_sl, _, _ = calc_risk_budget(opp, balance)
+                    log.info(f"💰 [SCALPER] Risk budget: ${trade_budget:.2f} "
+                             f"(1% risk @ SL {pre_sl*100:.2f}%, "
+                             f"cap ${round(balance*SCALPER_BUDGET_PCT,2):.2f})")
+                    trade = open_position(opp, trade_budget, pre_tp, pre_sl, "SCALPER")
                     if trade:
                         scalper_trades.append(trade)
                         _scalper_excluded.pop(opp["symbol"], None)
@@ -3066,7 +3348,8 @@ def run():
                         if close_position(trade, reason):
                             scalper_trades.remove(trade)
                             if reason == "ROTATION" and best_opp:
-                                new_t  = open_position(best_opp, budget, 0.0, 0.0, "SCALPER")
+                                rot_budget, rot_pre_tp, rot_pre_sl, _, _ = calc_risk_budget(best_opp, balance)
+                                new_t = open_position(best_opp, rot_budget, rot_pre_tp, rot_pre_sl, "SCALPER")
                                 if new_t:
                                     scalper_trades.append(new_t)
                                     _scalper_excluded.pop(best_opp["symbol"], None)
