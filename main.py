@@ -76,12 +76,13 @@ WATCHLIST_TTL       = 1800      # seconds between full rescores (30 min)
 
 # ── Moonshot ──────────────────────────────────────────────────
 ALT_MAX_TRADES      = 2
-MOONSHOT_BUDGET_PCT = 0.05
-MOONSHOT_TP         = 0.15      # +15% (was +25% — more achievable in 1h)
-MOONSHOT_SL         = 0.05      # -5% (tightened from -7% — 1h window, cut fast)
-MOONSHOT_MAX_VOL    = 250_000
-MOONSHOT_MIN_VOL    = 5_000
-MOONSHOT_MIN_SCORE  = 20
+MOONSHOT_BUDGET_PCT   = float(os.getenv("MOONSHOT_BUDGET_PCT",   "0.05"))
+MOONSHOT_TP           = 0.15      # +15% (was +25% — more achievable in 1h)
+MOONSHOT_SL           = 0.05      # -5% (tightened from -7% — 1h window, cut fast)
+MOONSHOT_MAX_VOL      = 250_000
+MOONSHOT_MIN_VOL      = 5_000
+MOONSHOT_MIN_SCORE    = 20
+MOONSHOT_MIN_NOTIONAL = float(os.getenv("MOONSHOT_MIN_NOTIONAL", "2.0"))  # min trade size
 MOONSHOT_MAX_HOURS  = 2   # absolute ceiling — matches MOONSHOT_TIMEOUT_MAX_MINS
 MOONSHOT_MIN_DAYS   = 2
 MOONSHOT_NEW_DAYS   = 14
@@ -1953,22 +1954,23 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
     label       = trade["label"]
     tp_order_id = trade.get("tp_order_id")
 
+    # held_min computed once here — used by timeout checks, graduated exits,
+    # flat exit, vol collapse, and trailing stop logic below.
+    held_min = (datetime.now(timezone.utc) -
+                datetime.fromisoformat(trade["opened_at"])).total_seconds() / 60
+
     # ── Timeout logic ─────────────────────────────────────────
     # MOONSHOT: graduated — timeout depends on how the trade is performing.
     #   Flat trade gets cut early; a trade that's working gets more time.
     # REVERSAL: hard 2h ceiling (short-hold strategy, no accommodation).
     # SCALPER: no max_hours (uses trailing stop / flat exit instead).
     if trade.get("max_hours"):
-        held_min = (datetime.now(timezone.utc) -
-                    datetime.fromisoformat(trade["opened_at"])).total_seconds() / 60
-
         if label == "MOONSHOT":
             if held_min >= MOONSHOT_TIMEOUT_MAX_MINS:
                 log.info(f"⏰ [{label}] Max timeout ({MOONSHOT_TIMEOUT_MAX_MINS}min): {symbol}")
                 return True, "TIMEOUT"
         else:
-            held_h = held_min / 60
-            if held_h >= trade["max_hours"]:
+            if held_min / 60 >= trade["max_hours"]:
                 log.info(f"⏰ [{label}] Timeout: {symbol}")
                 if not PAPER_TRADE and tp_order_id:
                     cancel_order(symbol, tp_order_id, label)
@@ -1980,9 +1982,7 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
         log.error(f"Price fetch error {symbol}: {e}")
         return False, ""
 
-    pct      = (price - trade["entry_price"]) / trade["entry_price"] * 100
-    held_min = (datetime.now(timezone.utc) -           # computed once, used by all branches
-                datetime.fromisoformat(trade["opened_at"])).total_seconds() / 60
+    pct = (price - trade["entry_price"]) / trade["entry_price"] * 100
     trade["highest_price"] = max(trade.get("highest_price", price), price)
 
     # Hard safety SL -5%
@@ -2062,11 +2062,6 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             except Exception:
                 pass  # never block an exit check on a kline failure
 
-    # ── REVERSAL-specific exits ───────────────────────────────
-    if label == "REVERSAL":
-        if held_min >= trade["max_hours"] * 60:
-            log.info(f"⏰ [{label}] Timeout: {symbol}")
-            return True, "TIMEOUT"
     if label == "SCALPER":
         # ── Breakeven trail (high-confidence trades only) ─────────
         # If score ≥ SCALPER_BREAKEVEN_SCORE and trade is up SCALPER_BREAKEVEN_ACT,
@@ -3274,7 +3269,7 @@ def run():
                             btc_ema = calc_ema(btc_close, BTC_REGIME_EMA_PERIOD)
                             if float(btc_close.iloc[-1]) < float(btc_ema.iloc[-1]):
                                 btc_regime_ok = False
-                                log.info("🔴 BTC regime: price below EMA20 — skip entry")
+                                log.info("🔴 BTC regime: price below EMA100 (8h trend) — skip entry")
 
                         # 3. Volatility spike — current ATR vs recent ATR average.
                         # Compute on the full series so ewm has proper warmup history,
@@ -3358,9 +3353,8 @@ def run():
             if not _paused and len(alt_trades) < ALT_MAX_TRADES:
                 ideal  = round(total_value * MOONSHOT_BUDGET_PCT, 2)
                 budget = min(ideal, balance)
-                # Dynamic floor: 5% of current balance (min $5) — prevents opening
-                # tiny trades as balance shrinks while still allowing trades
-                min_alt = max(5.0, round(balance * 0.05, 2))
+                # Floor: $2 minimum — below this fees eat the position entirely.
+                min_alt = MOONSHOT_MIN_NOTIONAL
 
                 if budget < min_alt:
                     log.info(f"💰 Alt budget ${budget:.2f} below floor ${min_alt:.2f} — skipping scan")
