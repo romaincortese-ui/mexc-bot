@@ -3108,7 +3108,7 @@ def startup() -> float:
         f"  Symbol cooldown: {SCALPER_SYMBOL_COOLDOWN//60}min after SL\n"
         f"  Circuit breakers: daily -{SCALPER_DAILY_LOSS_PCT*100:.0f}% | {MAX_CONSECUTIVE_LOSSES} consecutive losses\n"
         f"  Watchlist: top {WATCHLIST_SIZE} pairs, refresh every {WATCHLIST_TTL//60}min\n"
-        f"\n🌙 <b>Moonshot</b> (max {ALT_MAX_TRADES} trades, 5% each) [bot-monitored]\n"
+        f"\n🌙 <b>Moonshot</b> (max {ALT_MAX_TRADES} trades, {MOONSHOT_BUDGET_PCT*100:.0f}% each) [bot-monitored]\n"
         f"  TP: +{MOONSHOT_TP*100:.0f}%  SL: -{MOONSHOT_SL*100:.0f}%  max {MOONSHOT_MAX_HOURS}h\n"
         f"\n🔄 <b>Reversal</b> (5%) [bot-monitored]\n"
         f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%  max {REVERSAL_MAX_HOURS}h\n"
@@ -3120,7 +3120,8 @@ def startup() -> float:
 
 
 def run():
-    global _last_rotation_scan, _watchlist, _watchlist_at
+    global _last_rotation_scan, _watchlist, _watchlist_at, \
+           _scalper_excluded, _alt_excluded
 
     startup_balance  = startup()
     balance          = get_available_balance()
@@ -3135,9 +3136,10 @@ def run():
             _load_symbol_rules()
 
             open_symbols = {t["symbol"] for t in scalper_trades + alt_trades}
+            all_trades   = scalper_trades + alt_trades  # computed once, reused below
 
             total_value = balance
-            for t in scalper_trades + alt_trades:
+            for t in all_trades:
                 if not PAPER_TRADE:
                     try:
                         px = float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
@@ -3196,7 +3198,7 @@ def run():
             # ── Max combined exposure check ───────────────────────
             # If open positions already consume MAX_EXPOSURE_PCT of balance,
             # skip new entries this cycle — don't concentrate risk further.
-            open_exposure = sum(t.get("budget_used", 0) for t in scalper_trades + alt_trades)
+            open_exposure = sum(t.get("budget_used", 0) for t in all_trades)
             over_exposed  = (open_exposure / balance > MAX_EXPOSURE_PCT) if balance > 0 else False
             if over_exposed:
                 log.debug(f"⚠️ Over-exposed (${open_exposure:.0f} / ${balance:.0f}) — skipping new entries")
