@@ -153,7 +153,7 @@ MOONSHOT_MAX_SPREAD    = 0.008   # skip moonshot if spread > 0.8% — pump entri
 # If BTC drops sharply in the last 5m candle the whole market is risk-off.
 # Entering a scalper position in that window almost guarantees an SL trigger.
 BTC_REGIME_DROP        = 0.02    # pause if BTC last 5m candle < -2%
-BTC_REGIME_EMA_PERIOD  = 20      # also pause if price is below this EMA (micro-downtrend)
+BTC_REGIME_EMA_PERIOD  = 100     # pause if price below this EMA — 100×5m = 8h trend filter
 BTC_REGIME_VOL_MULT    = 2.0     # also pause if BTC ATR > N× its own 20-candle average
                                   # (volatility spike — unpredictable whipsaws)
 
@@ -2980,7 +2980,7 @@ def run():
                 # Uses already-cached BTCUSDT klines when possible.
                 btc_regime_ok = True
                 try:
-                    df_btc = parse_klines("BTCUSDT", interval="5m", limit=60, min_len=50)
+                    df_btc = parse_klines("BTCUSDT", interval="5m", limit=120, min_len=105)
                     if df_btc is not None:
                         btc_close = df_btc["close"]
 
