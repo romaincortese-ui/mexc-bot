@@ -7,7 +7,7 @@ MEXC Trading Bot — 3 Strategies
      Moonshot and Reversal share the alt slot.
 """
 
-import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re
+import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re, math
 import asyncio
 import urllib.parse
 from decimal import Decimal, ROUND_DOWN
@@ -3165,6 +3165,146 @@ def _cmd_status(balance: float):
     telegram("\n".join(lines))
 
 
+def _compute_metrics(trades: list) -> dict:
+    """
+    Compute trading performance metrics from trade_history.
+    Excludes partial TP entries — they always show positive and skew all stats.
+
+    Returns a dict with keys:
+      total, wins, losses, win_rate, avg_win, avg_loss, profit_factor,
+      total_pnl, max_drawdown, sharpe, best, worst,
+      by_label: {SCALPER: {...}, MOONSHOT: {...}, REVERSAL: {...}},
+      by_reason: {exit_reason: count}
+    """
+    full = [t for t in trades if not t.get("is_partial")]
+    if not full:
+        return {}
+
+    pnls      = [t["pnl_pct"] for t in full]
+    pnls_usdt = [t["pnl_usdt"] for t in full]
+    wins      = [p for p in pnls if p > 0]
+    losses    = [p for p in pnls if p <= 0]
+
+    # Max drawdown from running equity curve
+    equity   = 0.0
+    peak     = 0.0
+    max_dd   = 0.0
+    for p in pnls_usdt:
+        equity += p
+        peak    = max(peak, equity)
+        dd      = peak - equity
+        max_dd  = max(max_dd, dd)
+
+    # Trade-level Sharpe: mean / std * sqrt(n) — directional, not time-series
+    n = len(pnls)
+    mean_pnl = sum(pnls) / n
+    if n > 1:
+        variance = sum((p - mean_pnl) ** 2 for p in pnls) / (n - 1)
+        std_pnl  = variance ** 0.5
+        sharpe   = (mean_pnl / std_pnl * (n ** 0.5)) if std_pnl > 0 else 0.0
+    else:
+        sharpe = 0.0
+
+    profit_factor = (sum(wins) / abs(sum(losses))) if losses and sum(losses) != 0 else float("inf")
+
+    best  = max(full, key=lambda t: t["pnl_pct"])
+    worst = min(full, key=lambda t: t["pnl_pct"])
+
+    # Per-strategy breakdown
+    by_label = {}
+    for lbl in ("SCALPER", "MOONSHOT", "REVERSAL"):
+        lt = [t for t in full if t.get("label") == lbl]
+        if not lt:
+            continue
+        lw = [t for t in lt if t["pnl_pct"] > 0]
+        ll = [t for t in lt if t["pnl_pct"] <= 0]
+        by_label[lbl] = {
+            "total":    len(lt),
+            "wins":     len(lw),
+            "win_rate": len(lw) / len(lt) * 100,
+            "avg_win":  sum(t["pnl_pct"] for t in lw) / len(lw) if lw else 0.0,
+            "avg_loss": sum(t["pnl_pct"] for t in ll) / len(ll) if ll else 0.0,
+            "total_pnl":sum(t["pnl_usdt"] for t in lt),
+        }
+
+    # Exit reason breakdown (full trades only)
+    by_reason: dict = {}
+    for t in full:
+        r = t.get("exit_reason", "UNKNOWN")
+        by_reason[r] = by_reason.get(r, 0) + 1
+
+    return {
+        "total":         n,
+        "wins":          len(wins),
+        "losses":        len(losses),
+        "win_rate":      len(wins) / n * 100,
+        "avg_win":       sum(wins)  / len(wins)  if wins   else 0.0,
+        "avg_loss":      sum(losses)/ len(losses) if losses else 0.0,
+        "profit_factor": profit_factor,
+        "total_pnl":     sum(pnls_usdt),
+        "max_drawdown":  max_dd,
+        "sharpe":        sharpe,
+        "best":          best,
+        "worst":         worst,
+        "by_label":      by_label,
+        "by_reason":     by_reason,
+    }
+
+
+def _cmd_metrics(balance: float):
+    """Send a full performance metrics summary via Telegram."""
+    full = [t for t in trade_history if not t.get("is_partial")]
+    if not full:
+        telegram("📊 <b>Metrics</b>\n━━━━━━━━━━━━━━━\nNo completed trades yet.")
+        return
+
+    m = _compute_metrics(trade_history)
+
+    # ── Overall summary ──────────────────────────────────────
+    pf_str = f"{m['profit_factor']:.2f}" if not math.isinf(m["profit_factor"]) else "∞"
+    lines  = [
+        f"📊 <b>Performance Metrics</b>",
+        f"━━━━━━━━━━━━━━━",
+        f"Trades:   <b>{m['total']}</b>  ({m['wins']}W / {m['losses']}L)",
+        f"Win rate: <b>{m['win_rate']:.1f}%</b>",
+        f"Avg win:  <b>+{m['avg_win']:.2f}%</b>  |  Avg loss: <b>{m['avg_loss']:.2f}%</b>",
+        f"P-factor: <b>{pf_str}</b>  |  Sharpe: <b>{m['sharpe']:.2f}</b>",
+        f"Total P&L:<b>${m['total_pnl']:+.2f}</b>  |  Max DD: <b>-${m['max_drawdown']:.2f}</b>",
+        f"Balance:  <b>${balance:.2f}</b>",
+    ]
+
+    # ── Per-strategy ─────────────────────────────────────────
+    icons = {"SCALPER": "🟢", "MOONSHOT": "🌙", "REVERSAL": "🔄"}
+    if m["by_label"]:
+        lines.append("━━━━━━━━━━━━━━━")
+        for lbl, s in m["by_label"].items():
+            icon = icons.get(lbl, "•")
+            lines.append(
+                f"{icon} <b>{lbl}</b>  {s['total']}t  "
+                f"{s['win_rate']:.0f}%WR  "
+                f"${s['total_pnl']:+.2f}  "
+                f"avg +{s['avg_win']:.1f}%/{s['avg_loss']:.1f}%"
+            )
+
+    # ── Exit reasons ─────────────────────────────────────────
+    if m["by_reason"]:
+        lines.append("━━━━━━━━━━━━━━━")
+        reason_parts = [f"{r}: {c}" for r, c in
+                        sorted(m["by_reason"].items(), key=lambda x: -x[1])]
+        lines.append("Exits: " + "  ".join(reason_parts))
+
+    # ── Best / worst ─────────────────────────────────────────
+    best  = m["best"]
+    worst = m["worst"]
+    lines.append("━━━━━━━━━━━━━━━")
+    lines.append(f"Best:  {best['symbol']} {best['pnl_pct']:+.2f}% "
+                 f"({best.get('exit_reason','?')})")
+    lines.append(f"Worst: {worst['symbol']} {worst['pnl_pct']:+.2f}% "
+                 f"({worst.get('exit_reason','?')})")
+
+    telegram("\n".join(lines)[:4000])
+
+
 def _cmd_config():
     telegram(
         f"⚙️ <b>Current Config</b>\n━━━━━━━━━━━━━━━\n"
@@ -3198,6 +3338,12 @@ def _cmd_close():
     telegram(f"✅ Closed {closed} position(s).")
 
 
+def _cmd_restart():
+    telegram("🔄 <b>Restarting...</b> State saved. Railway will redeploy.")
+    save_state()
+    os._exit(0)
+
+
 def _cmd_resetstreak():
     global _consecutive_losses, _win_rate_pause_until, _streak_paused_at
     _consecutive_losses    = 0
@@ -3205,9 +3351,6 @@ def _cmd_resetstreak():
     _streak_paused_at      = 0.0
     save_state()
     telegram("✅ <b>Streak reset.</b> Consecutive losses cleared, win-rate pause lifted. Scalper entries resumed.")
-    telegram("🔄 <b>Restarting...</b> State saved. Railway will redeploy.")
-    save_state()
-    os._exit(0)
 
 
 def _cmd_ask(question: str, balance: float):
@@ -3275,7 +3418,8 @@ def listen_for_commands(balance: float):
                 continue
 
             if   text == "/pnl":    telegram(build_weekly_message(fetch_mexc_weekly_pnl(), balance))
-            elif text == "/status": _cmd_status(balance)
+            elif text == "/status":  _cmd_status(balance)
+            elif text == "/metrics": _cmd_metrics(balance)
             elif text == "/logs":
                 out = ("📜 <b>Last Scanner Activity</b>\n━━━━━━━━━━━━━━━\n"
                        + "\n".join(f"<code>{l}</code>" for l in _scanner_log_buffer)
@@ -3473,7 +3617,7 @@ def startup() -> float:
         f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%  max {REVERSAL_MAX_HOURS}h\n"
         f"\n🧠 <b>AI</b>: {'✅ Haiku + web search' if SENTIMENT_ENABLED and WEB_SEARCH_ENABLED else '✅ Haiku only (/ask + journal)' if SENTIMENT_ENABLED else '⚠️ disabled (set ANTHROPIC_API_KEY)'}\n"
         f"  Cache: {SENTIMENT_CACHE_MINS}min | Bonus: +{SENTIMENT_MAX_BONUS}pts | Penalty: -{SENTIMENT_MAX_PENALTY}pts\n"
-        f"\n<i>/status · /pnl · /logs · /config · /pause · /resume · /close · /restart · /resetstreak · /ask</i>"
+        f"\n<i>/status · /metrics · /pnl · /logs · /config · /pause · /resume · /close · /restart · /resetstreak · /ask</i>"
     )
     return startup_balance
 
