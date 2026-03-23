@@ -3187,11 +3187,9 @@ def _cmd_resetstreak():
     _consecutive_losses    = 0
     _win_rate_pause_until  = 0.0
     _streak_paused_at      = 0.0
+    run._streak_alerted    = False  # prevent stale alert flag blocking next trigger
     save_state()
     telegram("✅ <b>Streak reset.</b> Consecutive losses cleared, win-rate pause lifted. Scalper entries resumed.")
-    telegram("🔄 <b>Restarting...</b> State saved. Railway will redeploy.")
-    save_state()
-    os._exit(0)
 
 
 def _cmd_ask(question: str, balance: float):
