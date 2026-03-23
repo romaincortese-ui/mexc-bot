@@ -90,7 +90,9 @@ MOONSHOT_BUDGET_PCT   = float(os.getenv("MOONSHOT_BUDGET_PCT",   "0.03"))  # 3% 
 MOONSHOT_TP_INITIAL           = 0.15      # sets tp_price pre-partial-TP only; trailing stop takes over after
 MOONSHOT_SL           = float(os.getenv("MOONSHOT_SL",           "0.08"))  # 8% — slippage can't kill the trade
 MOONSHOT_TRAIL_PCT    = float(os.getenv("MOONSHOT_TRAIL_PCT",     "0.08"))  # trail 8% below highest after partial TP
-MOONSHOT_MAX_VOL      = int(os.getenv("MOONSHOT_MAX_VOL", "5000000"))  # raised from 250k — was excluding most legitimate movers
+MOONSHOT_MAX_VOL_RATIO = float(os.getenv("MOONSHOT_MAX_VOL_RATIO", "100000"))
+                                   # max 24h vol = balance × this ratio
+                                   # e.g. $52 → $5.2M | $1k → $100M (avoids large-caps)
 MOONSHOT_MIN_VOL      = int(os.getenv("MOONSHOT_MIN_VOL", "50000"))  # raised from 5k — filters dangerous micro-caps
 MOONSHOT_MIN_SCORE    = 30        # raised: need crossover OR strong vol burst, not just stale trend
 MOONSHOT_MAX_RSI      = float(os.getenv("MOONSHOT_MAX_RSI",      "70"))   # overbought gate
@@ -103,7 +105,10 @@ MOONSHOT_MIN_DAYS   = 2
 MOONSHOT_NEW_DAYS   = 14
 MOONSHOT_MIN_VOL_BURST = 2.5
 MOONSHOT_MIN_VOL_RATIO = float(os.getenv("MOONSHOT_MIN_VOL_RATIO", "1.2"))  # require ≥ avg volume
-MOONSHOT_MIN_1H_VOL    = int(os.getenv("MOONSHOT_MIN_1H_VOL",   "10000"))  # min $10k in last hour — catches dead 24h vol
+MOONSHOT_LIQUIDITY_RATIO = float(os.getenv("MOONSHOT_LIQUIDITY_RATIO", "200"))
+                                   # min 1h vol = balance × this ratio
+                                   # scales position liquidity requirement with account size
+                                   # e.g. $52 → $10,400 min/hr | $1k → $200k | $10k → $2M
 MOONSHOT_VOL_DIVISOR   = float(os.getenv("MOONSHOT_VOL_DIVISOR", "500000")) # vol-weighted sizing: budget_pct = min(3%, 24h_vol / divisor)
                                                                               # $500k vol → 1%, $1.5M → 3% (capped)
 
@@ -461,6 +466,7 @@ def save_state():
             "consecutive_losses":   _consecutive_losses,
             "win_rate_pause_until": _win_rate_pause_until,
             "streak_paused_at":     _streak_paused_at,
+            "paused":               _paused,
             "scalper_excluded":     _scalper_excluded,
             "alt_excluded":         list(_alt_excluded),
             "api_blacklist":        list(_api_blacklist),
@@ -474,17 +480,17 @@ def save_state():
         log.warning(f"State save failed: {e}")
 
 
-def load_state() -> tuple[list, list, list, int, float, float, dict, set, set]:
+def load_state() -> tuple[list, list, list, int, float, float, bool, dict, set, set]:
     """
     Load persisted state from STATE_FILE.
     Returns (scalper_trades, alt_trades, trade_history,
              consecutive_losses, win_rate_pause_until, streak_paused_at,
-             scalper_excluded, alt_excluded, api_blacklist).
+             paused, scalper_excluded, alt_excluded, api_blacklist).
     Returns empty defaults if file is missing or unreadable.
     """
     try:
         if not os.path.exists(STATE_FILE):
-            return [], [], [], 0, 0.0, 0.0, {}, set(), set()
+            return [], [], [], 0, 0.0, 0.0, False, {}, set(), set()
         with open(STATE_FILE) as f:
             d = json.load(f)
         age = (datetime.now(timezone.utc) -
@@ -501,13 +507,14 @@ def load_state() -> tuple[list, list, list, int, float, float, dict, set, set]:
             d.get("consecutive_losses",   0),
             d.get("win_rate_pause_until", 0.0),
             d.get("streak_paused_at",     0.0),
+            d.get("paused",               False),
             d.get("scalper_excluded",     {}),
             set(d.get("alt_excluded",     [])),
             set(d.get("api_blacklist",    [])),
         )
     except Exception as e:
         log.warning(f"State load failed ({e}) — starting fresh")
-        return [], [], [], 0, 0.0, 0.0, {}, set(), set()
+        return [], [], [], 0, 0.0, 0.0, False, {}, set(), set()
 
 def _get_session() -> requests.Session:
     """Return a thread-local requests.Session, creating one if needed."""
@@ -1115,7 +1122,7 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
     ema50_gap = (float(df_1h["close"].iloc[-1]) / float(ema50_1h) - 1)
     # Convert to penalty instead of hard block — coins slightly below EMA50 can still
     # qualify if their signal is strong enough. Deep below = penalised out naturally.
-    ema50_penalty = round(max(0.0, -ema50_gap) * SCALPER_EMA50_PENALTY, 1) if strict else 0.0
+    ema50_penalty = round(max(0.0, -ema50_gap) * SCALPER_EMA50_PENALTY, 1)
 
     df5m = parse_klines(sym, interval="5m", limit=60)
     if df5m is None:
@@ -1152,7 +1159,7 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
 
     threshold = SCALPER_THRESHOLD if strict else max(5, SCALPER_THRESHOLD // 2)
     if score < threshold:
-        if strict and ema50_penalty > 0:
+        if ema50_penalty > 0:
             log.debug(f"[SCALPER] Skip {sym} — EMA50 penalty {ema50_penalty:.1f}pts "
                       f"({ema50_gap*100:.1f}% below EMA50)")
         return None
@@ -1285,10 +1292,8 @@ def build_watchlist(tickers: pd.DataFrame):
     if _btc_ema_gap < -0.005:  # only mention if meaningfully below (> 0.5%)
         penalty = round(abs(_btc_ema_gap) * BTC_REGIME_EMA_PENALTY, 1)
         why_not.append(f"BTC {_btc_ema_gap*100:.1f}% below EMA (-{penalty:.0f}pts penalty)")
-    if top.get("ema50_penalty", 0) > 0 or top.get("ema50_gap", 0) < -0.5:
-        gap = top.get("ema50_gap", 0)
-        penalty = round(max(0.0, -gap / 100) * SCALPER_EMA50_PENALTY, 1)
-        why_not.append(f"coin EMA50 -{penalty:.0f}pts ({gap:.1f}% below) at entry")
+    if top.get("ema50_penalty", 0) > 0:
+        why_not.append(f"coin EMA50 -{top['ema50_penalty']:.0f}pts ({top['ema50_gap']:.1f}% below)")
     status_line = f"Holding off: {', '.join(why_not)}" if why_not else "Ready to enter ✅"
 
     telegram(
@@ -1413,7 +1418,7 @@ def find_new_listings(tickers: pd.DataFrame, exclude: set, open_symbols: set) ->
             days_old = len(data) if data else 0
             if MOONSHOT_MIN_DAYS <= days_old < MOONSHOT_NEW_DAYS:
                 new.append({"symbol": sym, "days_old": days_old})
-        except:
+        except Exception:
             pass
         time.sleep(0.05)
 
@@ -1424,12 +1429,21 @@ def find_new_listings(tickers: pd.DataFrame, exclude: set, open_symbols: set) ->
 
 
 def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
+                               balance: float,
                                exclude: set, open_symbols: set) -> dict | None:
     global last_top_alt
 
+    # Dynamic liquidity threshold — scales with account size so position risk stays
+    # proportional at any balance level. Uses total_value (passed as balance here)
+    # so the threshold doesn't shrink when capital is temporarily deployed.
+    min_1h_vol = max(5_000, balance * MOONSHOT_LIQUIDITY_RATIO)
+    max_vol    = max(5_000_000, balance * MOONSHOT_MAX_VOL_RATIO)
+    log.debug(f"🌙 [MOONSHOT] Vol window: ${min_1h_vol:,.0f}/hr – ${max_vol:,.0f}/day "
+              f"(balance ${balance:.0f})")
+
     df = tickers.copy()
     df = df[df["quoteVolume"] >= MOONSHOT_MIN_VOL]
-    df = df[df["quoteVolume"] <= MOONSHOT_MAX_VOL]
+    df = df[df["quoteVolume"] <= max_vol]
     df = df[df["lastPrice"]   >= MIN_PRICE]
     df = df[~df["symbol"].isin(open_symbols | exclude | _api_blacklist)]
 
@@ -1511,9 +1525,9 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
             # Candle count depends on interval: 4×15m = 1h, 1×60m = 1h.
             recent_candles = 1 if is_new else 4  # 60m interval for new listings, 15m otherwise
             recent_1h_vol = float(volume.iloc[-recent_candles:].sum()) * float(close.iloc[-1])
-            if recent_1h_vol < MOONSHOT_MIN_1H_VOL:
+            if recent_1h_vol < min_1h_vol:
                 log.debug(f"[MOONSHOT] Skip {sym} — dead recently "
-                          f"(1h vol ${recent_1h_vol:,.0f} < ${MOONSHOT_MIN_1H_VOL:,})")
+                          f"(1h vol ${recent_1h_vol:,.0f} < ${min_1h_vol:,.0f})")
                 return None
             score     = rsi_score + ma_score + vol_score
             if score < MOONSHOT_MIN_SCORE:
@@ -1740,7 +1754,7 @@ def place_market_buy(symbol, qty, label=""):
         return result
     except requests.exceptions.HTTPError as e:
         try:    body = e.response.json()
-        except: body = e.response.text if e.response else "no response"
+        except Exception: body = e.response.text if e.response else "no response"
         if isinstance(body, dict) and body.get("code") == 10007:
             _api_blacklist.add(symbol)
             log.warning(f"⚠️ [{label}] {symbol} not API-tradeable — blacklisted.")
@@ -1763,7 +1777,7 @@ def place_limit_sell(symbol, qty, price, label="", tag=""):
         return order_id
     except requests.exceptions.HTTPError as e:
         try:    body = e.response.json()
-        except: body = e.response.text if e.response else "no response"
+        except Exception: body = e.response.text if e.response else "no response"
         log.error(f"🚨 [{label}] LIMIT SELL rejected: {body}")
         telegram(f"⚠️ <b>TP limit order failed</b> [{label}]\n"
                  f"{symbol} qty={qty} @ {price}\n{str(body)[:200]}\n"
@@ -2474,7 +2488,7 @@ def execute_partial_tp(trade) -> bool:
             log.info(f"✅ [{label}] Partial sell: {partial_qty} {symbol} → {result}")
         except requests.exceptions.HTTPError as e:
             try:    body = e.response.json()
-            except: body = {"msg": str(e)}
+            except Exception: body = {"msg": str(e)}
             log.error(f"🚨 [{label}] Partial sell failed: {body}")
             telegram(f"🚨 <b>Partial TP sell failed!</b> [{label}] {symbol}\n"
                      f"{str(body)[:200]}\nClose manually if needed.")
@@ -2493,7 +2507,7 @@ def execute_partial_tp(trade) -> bool:
 
     try:
         ticker_price = float(public_get("/api/v3/ticker/price", {"symbol": symbol})["price"])
-    except:
+    except Exception:
         ticker_price = trade["partial_tp_price"]
 
     actual_entry = partial_fills.get("avg_buy_price")  or trade["entry_price"]
@@ -2598,7 +2612,7 @@ def close_position(trade, reason) -> bool:
             log.info(f"✅ [{label}] Market sell ({reason}): {result}")
         except requests.exceptions.HTTPError as e:
             try:    body = e.response.json()
-            except: body = {"msg": e.response.text if e.response else "no response"}
+            except Exception: body = {"msg": e.response.text if e.response else "no response"}
 
             code = body.get("code") if isinstance(body, dict) else None
             msg  = body.get("msg",  body) if isinstance(body, dict) else body
@@ -2652,7 +2666,7 @@ def close_position(trade, reason) -> bool:
     # Fallback ticker price if fills unavailable
     try:
         ticker_price = float(public_get("/api/v3/ticker/price", {"symbol": symbol})["price"])
-    except:
+    except Exception:
         ticker_price = trade["tp_price"] if reason == "TAKE_PROFIT" else trade["sl_price"]
 
     actual_entry  = exit_fills.get("avg_buy_price")   or trade["entry_price"]
@@ -2771,7 +2785,7 @@ def send_heartbeat(balance: float):
             px  = ws_price(t["symbol"]) or float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
             pct = (px - t["entry_price"]) / t["entry_price"] * 100
             scalper_lines.append(f"  🟢 {t['symbol']} {pct:+.2f}%")
-        except:
+        except Exception:
             scalper_lines.append(f"  🟢 {t['symbol']}")
     if not scalper_trades:
         if last_top_scalper:
@@ -2785,7 +2799,7 @@ def send_heartbeat(balance: float):
             px  = ws_price(t["symbol"]) or float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
             pct = (px - t["entry_price"]) / t["entry_price"] * 100
             alt_lines.append(f"  {t['label']}: <b>{t['symbol']}</b> {pct:+.2f}%")
-        except:
+        except Exception:
             alt_lines.append(f"  {t['label']}: <b>{t['symbol']}</b>")
     if not alt_trades:
         if last_top_alt:
@@ -2831,7 +2845,7 @@ def convert_dust():
                 value = free * price
                 if 0 < value < 1.0:
                     dust.append(asset)
-            except:
+            except Exception:
                 pass  # no USDT pair for this asset — skip
             time.sleep(0.05)
 
@@ -2979,7 +2993,7 @@ def _fetch_fills_since(symbols: list, since_ms: int) -> dict:
                                 {"symbol": sym, "startTime": since_ms, "limit": 1000})
             if fills:
                 all_fills.extend(fills)
-        except:
+        except Exception:
             pass
         time.sleep(0.1)
     orders = collections.defaultdict(lambda: {"symbol": "", "qty": 0, "cost": 0, "side": ""})
@@ -3133,7 +3147,7 @@ def _cmd_status(balance: float):
             pct = (px - t["entry_price"]) / t["entry_price"] * 100
             lines.append(f"🟢 {t['symbol']} | {pct:+.2f}% | "
                          f"TP: ${t['tp_price']:.6f} | SL: ${t['sl_price']:.6f}")
-        except:
+        except Exception:
             lines.append(f"🟢 {t['symbol']} (unavailable)")
     if not scalper_trades:
         lines.append("Scalper: scanning...")
@@ -3143,7 +3157,7 @@ def _cmd_status(balance: float):
             pct = (px - t["entry_price"]) / t["entry_price"] * 100
             lines.append(f"{t['label']}: <b>{t['symbol']}</b> | {pct:+.2f}% | "
                          f"TP: ${t['tp_price']:.6f} | SL: ${t['sl_price']:.6f}")
-        except:
+        except Exception:
             lines.append(f"{t['label']}: {t['symbol']} (unavailable)")
     if not alt_trades:
         lines.append("Alt: scanning...")
@@ -3189,9 +3203,11 @@ def _cmd_resetstreak():
     _consecutive_losses    = 0
     _win_rate_pause_until  = 0.0
     _streak_paused_at      = 0.0
-    run._streak_alerted    = False  # prevent stale alert flag blocking next trigger
     save_state()
     telegram("✅ <b>Streak reset.</b> Consecutive losses cleared, win-rate pause lifted. Scalper entries resumed.")
+    telegram("🔄 <b>Restarting...</b> State saved. Railway will redeploy.")
+    save_state()
+    os._exit(0)
 
 
 def _cmd_ask(question: str, balance: float):
@@ -3217,7 +3233,7 @@ def _cmd_ask(question: str, balance: float):
             px  = ws_price(t["symbol"]) or float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
             pct = (px - t["entry_price"]) / t["entry_price"] * 100
             open_ctx.append(f"{t['symbol']} [{t['label']}] currently {pct:+.2f}%")
-        except:
+        except Exception:
             open_ctx.append(f"{t['symbol']} [{t['label']}]")
     system = (
         "You are a concise crypto trading analyst with access to a live bot's trade history. "
@@ -3265,8 +3281,14 @@ def listen_for_commands(balance: float):
                        + "\n".join(f"<code>{l}</code>" for l in _scanner_log_buffer)
                        if _scanner_log_buffer else "📜 No scanner activity yet.")
                 telegram(out)
-            elif text == "/pause":  _paused = True;  telegram("⏸️ <b>Paused.</b> No new trades. Existing positions monitored.\n/resume to restart.")
-            elif text == "/resume": _paused = False; telegram("▶️ <b>Resumed.</b> Scanning for new trades.")
+            elif text == "/pause":
+                _paused = True
+                save_state()
+                telegram("⏸️ <b>Paused.</b> No new trades. Existing positions monitored.\n/resume to restart.")
+            elif text == "/resume":
+                _paused = False
+                save_state()
+                telegram("▶️ <b>Resumed.</b> Scanning for new trades.")
             elif text == "/close":   _cmd_close()
             elif text == "/restart":      _cmd_restart()
             elif text == "/resetstreak":  _cmd_resetstreak()
@@ -3419,7 +3441,10 @@ def startup() -> float:
 
     (scalper_trades, alt_trades, trade_history,
      _consecutive_losses, _win_rate_pause_until, _streak_paused_at,
-     _scalper_excluded, _alt_excluded, _api_blacklist) = load_state()
+     _paused, _scalper_excluded, _alt_excluded, _api_blacklist) = load_state()
+
+    if _paused:
+        log.info("⏸️  Bot restored in PAUSED state — send /resume to restart scanning")
 
     reconcile_open_positions()
 
@@ -3456,7 +3481,8 @@ def startup() -> float:
 def run():
     global _last_rotation_scan, _watchlist, _watchlist_at, \
            _scalper_excluded, _alt_excluded, _btc_ema_gap, \
-           _streak_paused_at, _consecutive_losses, _win_rate_pause_until
+           _streak_paused_at, _consecutive_losses, _win_rate_pause_until, \
+           _paused
 
     startup_balance  = startup()
     balance          = get_available_balance()
@@ -3481,7 +3507,7 @@ def run():
                             public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"]
                         )
                         total_value += px * t["qty"]
-                    except:
+                    except Exception:
                         total_value += t["budget_used"]
                 else:
                     total_value += t["budget_used"]
@@ -3629,9 +3655,7 @@ def run():
                             btc_ema_gap = (float(btc_close.iloc[-1]) / float(btc_ema.iloc[-1]) - 1)
                             _btc_ema_gap = btc_ema_gap  # expose for watchlist display
 
-                        # 3. Hard block — vol spike ONLY when BTC is declining.
-                        # High ATR on an up move = opportunity, not danger.
-                        # High ATR on a down move = panic, skip entry.
+                        # 3. Hard block — vol spike
                         if btc_regime_ok:
                             tr_full = pd.concat([
                                 df_btc["high"] - df_btc["low"],
@@ -3641,12 +3665,9 @@ def run():
                             atr_series  = tr_full.ewm(alpha=1.0 / 14, adjust=False).mean()
                             btc_atr_now = float(atr_series.iloc[-1])
                             btc_atr_avg = float(atr_series.iloc[-41:-1].mean())
-                            btc_declining = float(btc_close.iloc[-1]) < float(btc_close.iloc[-5])
-                            if (btc_atr_avg > 0
-                                    and btc_atr_now > btc_atr_avg * BTC_REGIME_VOL_MULT
-                                    and btc_declining):
+                            if btc_atr_avg > 0 and btc_atr_now > btc_atr_avg * BTC_REGIME_VOL_MULT:
                                 btc_regime_ok = False
-                                log.info(f"🔴 BTC regime: vol spike + declining "
+                                log.info(f"🔴 BTC regime: vol spike "
                                          f"ATR×{btc_atr_now/btc_atr_avg:.1f} — skip entry")
                 except Exception:
                     pass  # never block entry on a BTC fetch failure
@@ -3740,6 +3761,7 @@ def run():
                     log.info(f"💰 Alt budget: ${budget:.2f} "
                              f"(ideal ${ideal:.2f} | free ${balance:.2f} | total ${total_value:.2f})")
                     opp = find_moonshot_opportunity(tickers, budget,
+                                                    total_value,
                                                     exclude=_alt_excluded,
                                                     open_symbols=open_symbols)
                     if opp:
