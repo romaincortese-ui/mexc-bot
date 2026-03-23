@@ -3627,7 +3627,9 @@ def run():
                             btc_ema_gap = (float(btc_close.iloc[-1]) / float(btc_ema.iloc[-1]) - 1)
                             _btc_ema_gap = btc_ema_gap  # expose for watchlist display
 
-                        # 3. Hard block — vol spike
+                        # 3. Hard block — vol spike ONLY when BTC is declining.
+                        # High ATR on an up move = opportunity, not danger.
+                        # High ATR on a down move = panic, skip entry.
                         if btc_regime_ok:
                             tr_full = pd.concat([
                                 df_btc["high"] - df_btc["low"],
@@ -3637,9 +3639,12 @@ def run():
                             atr_series  = tr_full.ewm(alpha=1.0 / 14, adjust=False).mean()
                             btc_atr_now = float(atr_series.iloc[-1])
                             btc_atr_avg = float(atr_series.iloc[-41:-1].mean())
-                            if btc_atr_avg > 0 and btc_atr_now > btc_atr_avg * BTC_REGIME_VOL_MULT:
+                            btc_declining = float(btc_close.iloc[-1]) < float(btc_close.iloc[-5])
+                            if (btc_atr_avg > 0
+                                    and btc_atr_now > btc_atr_avg * BTC_REGIME_VOL_MULT
+                                    and btc_declining):
                                 btc_regime_ok = False
-                                log.info(f"🔴 BTC regime: vol spike "
+                                log.info(f"🔴 BTC regime: vol spike + declining "
                                          f"ATR×{btc_atr_now/btc_atr_avg:.1f} — skip entry")
                 except Exception:
                     pass  # never block entry on a BTC fetch failure
