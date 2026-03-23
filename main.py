@@ -2323,7 +2323,7 @@ def calc_dynamic_tp_sl(opp: dict) -> tuple[float, float, str, str]:
     rsi            = opp.get("rsi",             50.0)
     score          = opp.get("score",           0.0)
     crossed_now    = opp.get("crossed_now",     False)
-    ema21_dist_pct = opp.get("ema21_dist_pct",  atr_pct * SCALPER_ATR_MULT)
+    ema21_dist_pct = opp.get("ema21_dist_pct",  atr_pct * 1.5)  # 1.5× ATR fallback for EMA21 distance
     avg_candle_pct = opp.get("avg_candle_pct",  atr_pct)
 
     # ── TP ─────────────────────────────────────────────────────
