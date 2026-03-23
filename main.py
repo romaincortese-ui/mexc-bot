@@ -1,8 +1,10 @@
 """
 MEXC Trading Bot — 3 Strategies
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  1. SCALPER  — Max 3 trades (30% cap, 1% risk) | Dynamic ATR TP/SL | 1H trend | 30min watchlist
+  1. SCALPER  — Max 3 trades (30% cap, 1% risk) | Dynamic ATR TP/SL | 1H trend | 10min watchlist
+               Watchlist blends top-volume AND top-movers; BTC rebound triggers early rebuild.
   2. MOONSHOT — Max 2 trades (3%) | SL -8% | Partial TP +10% → 8% trail | RSI 35-70 gate
+               Rebound context relaxes RSI ceiling to 78 when vol_ratio>2 + RSI accelerating.
   3. REVERSAL — Max 2 trades (5%) | TP +4% | SL cap-candle anchor | Oversold bounce + vol capitulation
      Moonshot and Reversal share the alt slot.
 """
@@ -80,9 +82,24 @@ SCALPER_SL_NOISE_MULT     = 2.0  # SL must be ≥ N × avg candle body (noise fl
 SCALPER_SL_MAX            = 0.04  # hard ceiling 4% — never risk more than this
 SCALPER_SL_MIN            = 0.015 # hard floor 1.5% — gives trades breathing room on normal volatility
 
-# ── Watchlist — universe of pairs pre-scored every 30 minutes ──
+# ── Watchlist — universe of pairs pre-scored every 10 minutes ──
 WATCHLIST_SIZE      = 30        # top N pairs by score to trade from
-WATCHLIST_TTL       = 1800      # seconds between full rescores (30 min)
+WATCHLIST_TTL       = 600       # seconds between full rescores (10 min, down from 30)
+                                 # Shorter TTL lets the bot catch moves that start between rebuilds.
+WATCHLIST_SURGE_SIZE = int(os.getenv("WATCHLIST_SURGE_SIZE", "40"))
+                                 # Top N pairs by 24h abs_change added to candidate pool
+                                 # alongside the normal top-by-volume 100.
+                                 # These are deduplicated before scoring so no extra API cost
+                                 # when both lists overlap; net new cost is ~0–15 kline fetches.
+
+# ── BTC Rebound Detector — triggers early watchlist rebuild ────
+# On a coordinated rebound day the window between "coin starts moving" and
+# "coin is overbought" can be under 10 minutes. When BTC bounces hard,
+# force a watchlist rebuild immediately rather than waiting for the TTL.
+BTC_REBOUND_PCT          = float(os.getenv("BTC_REBOUND_PCT",          "0.01"))   # BTC up ≥1% in last 5m candle
+BTC_REBOUND_CONFIRM_PCTS = float(os.getenv("BTC_REBOUND_CONFIRM_PCTS", "0.005"))  # prior candle also ≥0.5% — not a spike
+WATCHLIST_REBOUND_MIN_INTERVAL = int(os.getenv("WATCHLIST_REBOUND_MIN_INTERVAL", "300"))
+                                 # don't force-rebuild more than once every 5 min even during a rally
 
 # ── Moonshot ──────────────────────────────────────────────────
 ALT_MAX_TRADES      = 2
@@ -99,6 +116,15 @@ MOONSHOT_MAX_RSI      = float(os.getenv("MOONSHOT_MAX_RSI",      "70"))   # over
 MOONSHOT_MIN_RSI      = float(os.getenv("MOONSHOT_MIN_RSI",      "35"))   # freefall gate
 MOONSHOT_RSI_ACCEL_MIN= float(os.getenv("MOONSHOT_RSI_ACCEL_MIN","60"))   # above this RSI, require acceleration
 MOONSHOT_RSI_ACCEL_DELTA=float(os.getenv("MOONSHOT_RSI_ACCEL_DELTA","2")) # min RSI rise candle-over-candle to pass
+
+# ── Moonshot rebound RSI relaxation ────────────────────────────
+# On a genuine rebound, RSI rises fast across the board. Coins that pass ALL
+# three rebound criteria (RSI accelerating + strong vol + vol_ratio >2×) are
+# allowed through with a higher RSI ceiling instead of being rejected as "overbought".
+# This is intentionally conservative — all three conditions must hold simultaneously.
+MOONSHOT_REBOUND_MAX_RSI   = float(os.getenv("MOONSHOT_REBOUND_MAX_RSI",   "78"))  # ceiling when rebound confirmed
+MOONSHOT_REBOUND_VOL_RATIO = float(os.getenv("MOONSHOT_REBOUND_VOL_RATIO",  "2.0")) # min vol_ratio to qualify
+MOONSHOT_REBOUND_RSI_DELTA = float(os.getenv("MOONSHOT_REBOUND_RSI_DELTA",  "3.0")) # min RSI candle-over-candle rise
 MOONSHOT_MIN_NOTIONAL = float(os.getenv("MOONSHOT_MIN_NOTIONAL", "2.0"))
 MOONSHOT_MAX_HOURS  = 2
 MOONSHOT_MIN_DAYS   = 2
@@ -311,6 +337,8 @@ NEW_LISTINGS_CACHE_TTL = 300  # seconds
 # During normal scans we only evaluate these, saving hundreds of API calls per hour
 _watchlist             = []   # list of scored candidate dicts
 _watchlist_at          = 0.0  # timestamp of last full rebuild
+_last_rebound_rebuild  = 0.0  # timestamp of last BTC-rebound-triggered rebuild
+                               # guards against rebuilding more than once per WATCHLIST_REBOUND_MIN_INTERVAL
 
 # Sentiment cache — {symbol: (score_float, summary, fetched_at_timestamp)}
 _sentiment_cache: dict = {}
@@ -789,14 +817,32 @@ def get_trending_coins() -> list[tuple[str, str]]:
             return _trending_coins
 
         text = text.replace("```json", "").replace("```", "").strip()
-        # Non-greedy match of outermost {...} — avoids swallowing nested structures
-        m = re.search(r'\{.*?\}', text, re.DOTALL)
-        if not m:
-            # Fallback: find the array directly
-            m = re.search(r'\[.*?\]', text, re.DOTALL)
-            parsed = {"coins": json.loads(m.group())} if m else {"coins": []}
-        else:
-            parsed = json.loads(m.group())
+        # Try direct JSON parse first (most reliable when model follows instructions).
+        # Fall back to extracting the first balanced {...} block for preamble cases.
+        parsed = None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            # Walk the string to find the outermost balanced {...} block.
+            # Non-greedy regex like r'\{.*?\}' breaks on nested structures like
+            # {"coins": [{"symbol": ...}]} — it stops at the first inner '}'.
+            depth, start = 0, -1
+            for i, ch in enumerate(text):
+                if ch == "{":
+                    if depth == 0:
+                        start = i
+                    depth += 1
+                elif ch == "}" and depth > 0:
+                    depth -= 1
+                    if depth == 0 and start >= 0:
+                        try:
+                            parsed = json.loads(text[start:i + 1])
+                        except json.JSONDecodeError:
+                            pass
+                        break
+
+        if parsed is None:
+            return _trending_coins
 
         result = []
         for c in parsed.get("coins", [])[:MOONSHOT_SOCIAL_MAX_COINS]:
@@ -1149,9 +1195,12 @@ def get_available_balance() -> float:
 # ── Indicators ─────────────────────────────────────────────────
 
 def calc_rsi(series, period=14) -> float:
+    """Wilder's RSI using EWM (alpha=1/period) — matches MEXC chart values.
+    SMA-based rolling mean gives systematically different RSI readings that
+    cause gate mismatches versus what traders see on the exchange."""
     delta = series.diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    gain  = delta.clip(lower=0).ewm(alpha=1.0 / period, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(alpha=1.0 / period, adjust=False).mean()
     rs    = gain / loss.replace(0, np.nan)
     val   = (100 - (100 / (1 + rs))).iloc[-1]
     return float(val) if not np.isnan(val) else float("nan")
@@ -1369,8 +1418,10 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
 def build_watchlist(tickers: pd.DataFrame):
     """
     Score ALL eligible pairs and cache the top WATCHLIST_SIZE scorers.
-    Called every WATCHLIST_TTL seconds (30 min) — this is the expensive scan.
+    Called every WATCHLIST_TTL seconds (10 min) or on BTC rebound detection.
     Between rebuilds, the scalper only evaluates pairs already on the watchlist.
+    8 workers (up from 5) keeps rebuild time under 30s with the larger dual-lens
+    candidate pool while staying within MEXC's rate limits.
     """
     global _watchlist, _watchlist_at
 
@@ -1382,9 +1433,20 @@ def build_watchlist(tickers: pd.DataFrame):
     # Note 4 — filter out dead coins that have been consecutively failing health checks
     now_ts = time.time()
     df = df[~df["symbol"].apply(lambda s: _liquidity_blacklist.get(s, 0) > now_ts)]
-    candidates = df.sort_values("quoteVolume", ascending=False).head(120)["symbol"].tolist()
 
-    log.info(f"📋 [WATCHLIST] Building from {len(candidates)} candidates (full rescore)...")
+    # ── Dual-lens candidate selection ──────────────────────────
+    # Normal markets: top-by-volume catches liquid trending pairs.
+    # Rebound / breakout days: top-by-abs_change surfaces coins just starting
+    # to move before their volume has had time to accumulate.
+    # Both paths share the same SCALPER_MIN_VOL floor, so thin coins never enter.
+    # Deduplication preserves order: change-movers first so they get scored even
+    # if we hit the ThreadPoolExecutor queue limit.
+    by_vol    = df.sort_values("quoteVolume", ascending=False).head(100)["symbol"].tolist()
+    by_change = df.sort_values("abs_change",  ascending=False).head(WATCHLIST_SURGE_SIZE)["symbol"].tolist()
+    candidates = list(dict.fromkeys(by_change + by_vol))  # deduped; change-movers prioritised
+
+    log.info(f"📋 [WATCHLIST] Building from {len(candidates)} candidates "
+             f"({len(by_change)} top-movers + {len(by_vol)} top-volume, deduped)...")
 
     # Age filter — exclude symbols that are too new for scalping.
     # Reuse the moonshot new-listings cache (already populated) rather than
@@ -1400,7 +1462,7 @@ def build_watchlist(tickers: pd.DataFrame):
     ticker_vol = dict(zip(tickers["symbol"], tickers["quoteVolume"].fillna(0)))
 
     scores = []
-    with ThreadPoolExecutor(max_workers=5) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         futures = {ex.submit(_score_scalper, sym, False): sym for sym in established}
         for f in as_completed(futures):
             try:
@@ -1608,10 +1670,12 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
     # We deliberately drop the 24h priceChangePercent directional filter here —
     # in a down market a coin can pump +100% in an hour but still show negative 24h change,
     # so filtering on 24h change misses the exact moves moonshot exists to catch.
-    # The kline scorer (EMA crossover + vol ratio) handles quality filtering.
+    # head(40) instead of head(20): on a broad rebound day 20 pairs isn't enough — the
+    # best early-stage mover may sit in slots 25-35 while the top 20 are already extended.
+    # The kline scorer (EMA crossover + vol ratio + RSI gates) handles quality filtering.
     momentum_candidates = (df.assign(abs_change=df["priceChangePercent"].abs())
                              .sort_values("abs_change", ascending=False)
-                             .head(20)["symbol"].tolist())
+                             .head(40)["symbol"].tolist())
 
     new_listings = find_new_listings(tickers, exclude=exclude, open_symbols=open_symbols)
     new_symbols  = [n["symbol"] for n in new_listings]
@@ -1659,10 +1723,35 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
             return None
         rsi_prev  = calc_rsi(close.iloc[:-1])  # RSI one candle ago
         rsi_delta = rsi - rsi_prev if not np.isnan(rsi_prev) else 0.0
-        if rsi > MOONSHOT_MAX_RSI:
+
+        # ── Volume ratio — computed once, shared by rebound gate + scorer ──
+        avg_vol   = float(volume.iloc[-20:-1].mean()) if len(volume) >= 21 else 0.0
+        vol_ratio = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
+
+        # ── Rebound context detection ────────────────────────────
+        # A genuine market-wide rebound pushes RSI up fast across ALL coins.
+        # If RSI is accelerating strongly AND volume is surging (both must hold),
+        # we're likely in the early leg of a move — not a late exhausted pump.
+        # In that case, allow RSI up to MOONSHOT_REBOUND_MAX_RSI (78) instead of 70.
+        # All three conditions must be true simultaneously to prevent misfires:
+        #   1. RSI delta > threshold — momentum genuinely accelerating
+        #   2. vol_ratio > threshold — real buying pressure, not just price drift
+        #   3. RSI within the extended ceiling — not already fully extended
+        is_rebound_context = (
+            rsi_delta  >= MOONSHOT_REBOUND_RSI_DELTA   # RSI rising fast
+            and vol_ratio >= MOONSHOT_REBOUND_VOL_RATIO  # real volume behind it
+            and rsi <= MOONSHOT_REBOUND_MAX_RSI          # not already fully extended
+        )
+        effective_max_rsi = MOONSHOT_REBOUND_MAX_RSI if is_rebound_context else MOONSHOT_MAX_RSI
+
+        if rsi > effective_max_rsi:
             return None  # overbought — entering after the bulk of the move
         if rsi < MOONSHOT_MIN_RSI:
             return None  # freefall — coin declining, not starting to pump
+
+        if is_rebound_context and rsi > MOONSHOT_MAX_RSI:
+            log.debug(f"[MOONSHOT] {sym} rebound RSI gate: {rsi:.1f} allowed "
+                      f"(delta={rsi_delta:+.1f} vol={vol_ratio:.1f}× — rebound context)")
         # Tiered RSI momentum gate:
         # RSI ≤ MOONSHOT_RSI_ACCEL_MIN: allow freely — early in the move
         # RSI > MOONSHOT_RSI_ACCEL_MIN: require RSI still accelerating (rsi_delta > threshold)
@@ -1676,8 +1765,7 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
         # Only score fresh crossover — "EMA above but crossed hours ago" is a mid-pump entry.
         # A stale uptrend with no crossover scores 0 here; vol_score must carry it instead.
         ma_score  = 30 if crossed else 0
-        avg_vol   = volume.iloc[-20:-1].mean()
-        vol_ratio = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
+        # avg_vol and vol_ratio already computed above for the rebound RSI gate — reuse them.
         vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
         if vol_ratio < MOONSHOT_MIN_VOL_RATIO:
             return None  # below average volume — no momentum
@@ -2433,7 +2521,8 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         # ATR% at entry — stored so check_exit can compute ATR-stepped trail tiers
         # without re-fetching klines. Defaults to trail_pct as a safe fallback.
         # Stored for ALL labels: Moonshot/Trinity use it for the wide-trail threshold.
-        "atr_pct":        opp.get("atr_pct") if opp.get("atr_pct") else (
+        # Note: explicit None check — atr_pct=0.0 is falsy but valid.
+        "atr_pct":        opp.get("atr_pct") if opp.get("atr_pct") is not None else (
                               opp.get("trail_pct", SCALPER_TRAIL_PCT) if label == "SCALPER"
                               else actual_sl * 0.5  # conservative proxy: half the SL width
                           ),
@@ -2649,8 +2738,12 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
                 return True, "PARTIAL_TP"
 
         # ── TP: limit order check (normal full close, post-partial path) ─
+        # Only poll get_open_order_ids when price is within 2% of TP — avoids
+        # an unnecessary API call every 2s when the trade is far from target.
+        # The 0.995 fill-confirm threshold below already filters noise.
         if not PAPER_TRADE and tp_order_id:
-            if tp_order_id not in get_open_order_ids(symbol):
+            near_tp = price >= trade["tp_price"] * 0.98
+            if near_tp and tp_order_id not in get_open_order_ids(symbol):
                 if price >= trade["tp_price"] * 0.995:
                     log.info(f"🎯 [{label}] TP limit filled: {symbol}")
                     return True, "TAKE_PROFIT"
@@ -3797,7 +3890,7 @@ def listen_for_commands(balance: float):
         params = {"timeout": 0, "limit": 5}
         if last_telegram_update:
             params["offset"] = last_telegram_update + 1
-        data = requests.get(
+        data = _get_session().get(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
             params=params, timeout=5
         ).json()
@@ -4005,7 +4098,8 @@ def startup() -> float:
         f"  Breakeven: score ≥ {SCALPER_BREAKEVEN_SCORE} → lock at +{SCALPER_BREAKEVEN_ACT*100:.1f}%\n"
         f"  Symbol cooldown: {SCALPER_SYMBOL_COOLDOWN//60}min after SL\n"
         f"  Circuit breakers: daily -{SCALPER_DAILY_LOSS_PCT*100:.0f}% | {MAX_CONSECUTIVE_LOSSES} consecutive losses\n"
-        f"  Watchlist: top {WATCHLIST_SIZE} pairs, refresh every {WATCHLIST_TTL//60}min\n"
+        f"  Watchlist: top {WATCHLIST_SIZE} pairs, refresh every {WATCHLIST_TTL//60}min "
+        f"(+early rebuild on BTC ≥{BTC_REBOUND_PCT*100:.0f}% rebound)\n"
         f"\n🌙 <b>Moonshot</b> (max {ALT_MAX_TRADES} trades, {MOONSHOT_BUDGET_PCT*100:.0f}% each) [bot-monitored]\n"
         f"  SL: -{MOONSHOT_SL*100:.0f}% | Partial TP: +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% then {MOONSHOT_TRAIL_PCT*100:.0f}% trail | max {MOONSHOT_MAX_HOURS}h\n"
         f"\n🔱 <b>Trinity</b> ({TRINITY_BUDGET_PCT*100:.0f}%) [exchange TP + bot SL]\n"
@@ -4021,6 +4115,7 @@ def startup() -> float:
 
 def run():
     global _last_rotation_scan, _watchlist, _watchlist_at, \
+           _last_rebound_rebuild, \
            _scalper_excluded, _alt_excluded, _btc_ema_gap, \
            _streak_paused_at, _consecutive_losses, _win_rate_pause_until, \
            _paused
@@ -4165,10 +4260,37 @@ def run():
                 except Exception as e:
                     log.warning(f"fetch_tickers failed — skipping entry scan this cycle: {e}")
 
-            # Rebuild watchlist every WATCHLIST_TTL seconds (30 min)
+            # Rebuild watchlist every WATCHLIST_TTL seconds (10 min)
             if time.time() - _watchlist_at >= WATCHLIST_TTL:
                 log.info("📋 Watchlist TTL expired — rebuilding...")
                 build_watchlist(tickers if tickers is not None else fetch_tickers())
+
+            # ── BTC Rebound Detector — early watchlist rebuild ────
+            # On a coordinated rebound day, coins can go from flat to +30% in
+            # under 10 minutes. If BTC confirms an upward thrust (two consecutive
+            # green candles of meaningful size), force a rebuild now rather than
+            # waiting for the TTL — even if we rebuilt recently.
+            # Guard: WATCHLIST_REBOUND_MIN_INTERVAL (5 min) prevents thrashing
+            # during a choppy BTC that oscillates around the threshold.
+            if (df_btc is not None
+                    and not btc_panic
+                    and time.time() - _last_rebound_rebuild >= WATCHLIST_REBOUND_MIN_INTERVAL
+                    and time.time() - _watchlist_at >= WATCHLIST_REBOUND_MIN_INTERVAL):
+                try:
+                    btc_close = df_btc["close"]
+                    btc_open  = df_btc["open"]
+                    last_chg  = float(btc_close.iloc[-1]) / float(btc_open.iloc[-1]) - 1
+                    prev_chg  = float(btc_close.iloc[-2]) / float(btc_open.iloc[-2]) - 1
+                    if last_chg >= BTC_REBOUND_PCT and prev_chg >= BTC_REBOUND_CONFIRM_PCTS:
+                        _last_rebound_rebuild = time.time()
+                        log.info(
+                            f"📈 BTC rebound confirmed "
+                            f"(last={last_chg*100:+.2f}% prev={prev_chg*100:+.2f}%) "
+                            f"— forcing early watchlist rebuild"
+                        )
+                        build_watchlist(tickers if tickers is not None else fetch_tickers())
+                except Exception as _e:
+                    log.debug(f"BTC rebound check error: {_e}")
 
             # ── Scalper ───────────────────────────────────────
             budget = round(balance * SCALPER_BUDGET_PCT, 2)
