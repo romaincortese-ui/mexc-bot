@@ -39,7 +39,6 @@ SCALPER_TRAIL_MIN    = float(os.getenv("SCALPER_TRAIL_MIN",   "0.010"))     # fl
 SCALPER_TRAIL_MAX    = float(os.getenv("SCALPER_TRAIL_MAX",   "0.035"))     # ceiling 3.5%
 SCALPER_CONFLUENCE_BONUS = float(os.getenv("SCALPER_CONFLUENCE_BONUS", "15"))
                                   # bonus pts when crossover + vol_ratio>2 + RSI rising simultaneously
-SCALPER_ATR_MULT     = 1.5       # EMA21 distance fallback multiplier in dynamic SL
 SCALPER_ATR_PERIOD   = 21        # ATR period — 21 candles smoother than 14, less SL hunting
 SCALPER_FLAT_MINS    = 30
 SCALPER_FLAT_RANGE   = 0.005
@@ -199,6 +198,7 @@ REVERSAL_BOUNCE_RECOVERY = 0.30   # current candle must reclaim ≥30% of prior 
 REVERSAL_VOL_RECOVERY    = 1.20   # bounce candle volume must be ≥ 1.2× 20-candle avg
                                    # (confirms buyers stepping in, not just dead-cat)
 REVERSAL_CAP_SL_BUFFER   = 0.005  # place SL 0.5% below capitulation candle low
+REVERSAL_SL_MAX          = 0.050  # hard cap — never risk more than 5% on a reversal
 # Partial TP — capture reliable first bounce leg, protect remainder at breakeven
 REVERSAL_PARTIAL_TP_PCT  = 0.025  # sell first half at +2.5%
 REVERSAL_PARTIAL_TP_RATIO= 0.50   # fraction to sell at stage 1 (50%)
@@ -244,6 +244,40 @@ SCALPER_MAX_SPREAD     = 0.004   # skip pair if bid/ask spread > 0.4% (slippage 
 SCALPER_MAX_CORRELATION= 0.85    # skip if 20-candle return correlation with open
                                   # position > 0.85 (avoids correlated simultaneous SLs)
 SCALPER_MIN_ATR_PCT    = 0.003   # skip pair if ATR/price < 0.3% — choppy, TP unreachable
+
+# ── A. Order Book Depth Check ──────────────────────────────────
+# Volume can be wash-traded. Bid-side depth tells us whether we can actually
+# exit at our SL price without severe slippage.
+# We fetch 20 levels (vs 5 for spread check) and sum bids within
+# DEPTH_PCT_RANGE of the best bid. If total bid USDT < position_value ×
+# DEPTH_BID_RATIO, the order book is too thin to absorb our exit — skip.
+# Set DEPTH_BID_RATIO=0 to disable. Applies to SCALPER and MOONSHOT only.
+DEPTH_BID_LEVELS    = int(os.getenv("DEPTH_BID_LEVELS",    "20"))   # L2 levels to fetch
+DEPTH_PCT_RANGE     = float(os.getenv("DEPTH_PCT_RANGE",   "0.02")) # sum bids within 2% of best bid
+DEPTH_BID_RATIO     = float(os.getenv("DEPTH_BID_RATIO",   "3.0"))  # min bid depth = 3× position value
+                                  # e.g. $50 position needs ≥$150 of bids within 2% to enter
+
+# ── C. Reversal Flat-Progress Exit ────────────────────────────
+# Mean-reversion trades have a shelf life. If the bounce hasn't made meaningful
+# progress toward the TP target within REVERSAL_FLAT_MINS, the thesis is stale —
+# cut the trade and redeploy capital rather than sitting in a non-moving position.
+# "Progress" = (price − entry) / (tp_price − entry). At 40%, the coin has covered
+# nearly half the expected bounce range; below that after 45min, call it dead.
+# Does NOT apply after partial TP fires (remainder is risk-free, let it breathe).
+REVERSAL_FLAT_MINS     = int(os.getenv("REVERSAL_FLAT_MINS",     "45"))   # minutes before checking
+REVERSAL_FLAT_PROGRESS = float(os.getenv("REVERSAL_FLAT_PROGRESS","0.40")) # min fraction of TP range covered
+
+# ── D. Kelly Criterion Lite — Score-Based Risk Multiplier ─────
+# The existing risk model sizes by SL width (1% risk / sl_pct).
+# This layer adjusts that base risk by entry conviction (score tier).
+# A marginal entry (score just above threshold) gets 0.6× risk.
+# A high-confluence entry (score ≥ 85, already eligible for partial TP) gets 1.2×.
+# The result is always hard-capped at SCALPER_BUDGET_PCT regardless of multiplier.
+# Tiers are relative to SCALPER_THRESHOLD so they auto-adjust if threshold changes.
+KELLY_MULT_MARGINAL  = float(os.getenv("KELLY_MULT_MARGINAL",  "0.60"))  # score < threshold+15
+KELLY_MULT_SOLID     = float(os.getenv("KELLY_MULT_SOLID",     "0.80"))  # score < threshold+30
+KELLY_MULT_STANDARD  = float(os.getenv("KELLY_MULT_STANDARD",  "1.00"))  # score < threshold+45
+KELLY_MULT_HIGH_CONF = float(os.getenv("KELLY_MULT_HIGH_CONF", "1.20"))  # score ≥ threshold+45
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 STREAK_AUTO_RESET_MINS = int(os.getenv("STREAK_AUTO_RESET_MINS", "60"))  # auto-clear streak after this many minutes
 WIN_RATE_CB_WINDOW     = int(os.getenv("WIN_RATE_CB_WINDOW",     "10"))
@@ -1352,9 +1386,13 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
             log.debug(f"[SCALPER] Skip {sym} — thin "
                       f"(1h vol ${recent_vol_usdt:,.0f} < ${SCALPER_MIN_1H_VOL:,})")
             return None
-        # Only fetch sentiment when score is near the threshold — if already well above
-        # or below, sentiment can't change the decision and the API call is wasted.
-        if score > SCALPER_THRESHOLD - 5:
+        # Only fetch sentiment when score is close enough to the threshold that
+        # sentiment could flip the decision. If score is already well above the
+        # maximum possible penalty (SENTIMENT_MAX_PENALTY), sentiment can't push
+        # it below threshold — skip the API call entirely.
+        # Conversely if score is far below threshold even the max bonus can't save it.
+        if (score >= SCALPER_THRESHOLD - SENTIMENT_MAX_BONUS
+                and score <= SCALPER_THRESHOLD + SENTIMENT_MAX_PENALTY):
             sentiment_delta, sentiment_label = sentiment_score_adjustment(sym)
             score = round(score + sentiment_delta, 2)
             if sentiment_delta != 0:
@@ -1942,13 +1980,15 @@ def evaluate_reversal_candidate(sym: str) -> dict | None:
         REVERSAL_SL,
         (entry_est - cap_low) / entry_est + REVERSAL_CAP_SL_BUFFER
     )
-    cap_sl_pct  = min(cap_sl_pct, 0.05)  # never risk more than 5% on a reversal
+    cap_sl_pct  = min(cap_sl_pct, REVERSAL_SL_MAX)  # never risk more than 5% on a reversal
 
     return {
         "symbol":      sym,
         "price":       entry_est,
         "rsi":         round(rsi, 2),
-        "score":       round(rsi, 2),
+        # Composite score: lower RSI = more oversold (better), higher recovery/vol = stronger signal.
+        # Inverted RSI so sorting ascending by score gives best candidates first.
+        "score":       round((REVERSAL_MAX_RSI - rsi) + recovery * 20 + (curr_vol / avg_vol if avg_vol > 0 else 1.0), 2),
         "recovery":    round(recovery, 3),    # how much of cap body was reclaimed
         "cap_vol_ratio": round(cap_vol / avg_vol, 2) if avg_vol > 0 else 1.0,
         "bounce_vol_ratio": round(curr_vol / avg_vol, 2) if avg_vol > 0 else 1.0,
@@ -1986,7 +2026,7 @@ def find_reversal_opportunity(tickers: pd.DataFrame, budget: float,
         scanner_log("🔄 [REVERSAL] No oversold pairs with capitulation + green candle.")
         return None
 
-    tradeable.sort(key=lambda x: x["rsi"])
+    tradeable.sort(key=lambda x: x["score"], reverse=True)  # highest composite score first
     best = tradeable[0]
     last_top_alt = best
     scanner_log(f"🔄 [REVERSAL] Top: {best['symbol']} | RSI: {best['rsi']} | "
@@ -2354,20 +2394,37 @@ def calc_risk_budget(opp: dict, balance: float) -> tuple[float, float, float, st
     """
     Risk-based position sizing for SCALPER.
     Computes TP/SL via calc_dynamic_tp_sl once, then derives the budget so
-    hitting the SL costs exactly SCALPER_RISK_PER_TRADE of current balance.
+    hitting the SL costs exactly SCALPER_RISK_PER_TRADE of current balance,
+    adjusted by a Kelly Lite score multiplier.
 
-      budget = (balance × RISK_PCT) / sl_pct
+      base_risk  = balance × SCALPER_RISK_PER_TRADE × kelly_mult(score)
+      budget     = base_risk / sl_pct
 
-    Hard-capped at SCALPER_BUDGET_PCT to prevent oversized positions on tiny SLs.
-    Returns (budget, tp_pct, sl_pct, tp_label, sl_label) so the caller can pass
-    the pre-computed TP/SL directly into open_position — avoiding a second call.
+    Kelly Lite tiers (relative to SCALPER_THRESHOLD so they auto-adjust):
+      score < threshold+15  → 0.60× (marginal — minimum conviction)
+      score < threshold+30  → 0.80× (solid — clear signal)
+      score < threshold+45  → 1.00× (standard — multi-signal)
+      score ≥ threshold+45  → 1.20× (high confluence — already gets partial TP)
+
+    Hard-capped at SCALPER_BUDGET_PCT regardless of multiplier.
+    Returns (budget, tp_pct, sl_pct, tp_label, sl_label).
     Falls back to the percentage cap if dynamic TP/SL can't be computed.
     """
+    score = opp.get("score", SCALPER_THRESHOLD)
+    gap   = score - SCALPER_THRESHOLD  # how far above the entry bar
+    if   gap < 15: kelly_mult = KELLY_MULT_MARGINAL
+    elif gap < 30: kelly_mult = KELLY_MULT_SOLID
+    elif gap < 45: kelly_mult = KELLY_MULT_STANDARD
+    else:          kelly_mult = KELLY_MULT_HIGH_CONF
+
     try:
         tp_pct, sl_pct, tp_label, sl_label = calc_dynamic_tp_sl(opp)
         if sl_pct > 0:
-            risk_budget = (balance * SCALPER_RISK_PER_TRADE) / sl_pct
+            base_risk   = balance * SCALPER_RISK_PER_TRADE * kelly_mult
+            risk_budget = base_risk / sl_pct
             capped      = min(risk_budget, balance * SCALPER_BUDGET_PCT)
+            log.debug(f"[SCALPER] Kelly mult {kelly_mult:.2f}× "
+                      f"(score {score:.0f}, gap +{gap:.0f}) → ${capped:.2f}")
             return round(capped, 2), tp_pct, sl_pct, tp_label, sl_label
     except Exception:
         pass
@@ -2406,14 +2463,16 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     # Record timestamp BEFORE placing the order so fills are captured reliably
     bought_at_ms = int(time.time() * 1000)
 
-    # 🟢 Spread / depth check — reject pairs with wide bid/ask before money moves.
-    # SCALPER: tight 0.4% threshold — small TP, spread eats the profit.
-    # MOONSHOT: wider 0.8% threshold — larger TP absorbs more, but still filter thin markets.
+    # 🟢 Spread + bid-depth check — reject pairs with wide spread OR thin books.
+    # SCALPER: tight 0.4% spread. MOONSHOT: wider 0.8%.
+    # Depth gate: sum all bids within DEPTH_PCT_RANGE (2%) of best bid.
+    # If total bid USDT < position_value × DEPTH_BID_RATIO, our market sell
+    # at SL would eat through the book and gap past the stop price.
     # Check is advisory — never blocks on error.
     spread_limit = SCALPER_MAX_SPREAD if label in ("SCALPER", "TRINITY") else MOONSHOT_MAX_SPREAD
     if label in ("SCALPER", "MOONSHOT", "TRINITY") and not PAPER_TRADE:
         try:
-            depth    = public_get("/api/v3/depth", {"symbol": symbol, "limit": 5})
+            depth    = public_get("/api/v3/depth", {"symbol": symbol, "limit": DEPTH_BID_LEVELS})
             bids     = depth.get("bids", [])
             asks     = depth.get("asks", [])
             if bids and asks:
@@ -2421,17 +2480,37 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
                 best_ask = float(asks[0][0])
                 mid      = (best_bid + best_ask) / 2
                 spread   = (best_ask - best_bid) / mid if mid > 0 else 1.0
+
                 if spread > spread_limit:
                     log.info(f"[{label}] Skip {symbol} — spread {spread*100:.3f}% "
                              f"> {spread_limit*100:.1f}%")
                     return None
+
+                # ── Bid depth sum gate ────────────────────────────
+                # Sum the USDT value of all bids within DEPTH_PCT_RANGE of best_bid.
+                # This catches wash-traded pairs that show a tight spread but have
+                # almost no real liquidity behind it — our SL exit would gap straight
+                # through a thin book and realise far worse than the SL price.
+                if DEPTH_BID_RATIO > 0:
+                    depth_floor = best_bid * (1 - DEPTH_PCT_RANGE)
+                    bid_usdt    = sum(
+                        float(p) * float(q)
+                        for p, q in bids
+                        if float(p) >= depth_floor
+                    )
+                    min_depth = notional * DEPTH_BID_RATIO
+                    if bid_usdt < min_depth:
+                        log.info(f"[{label}] Skip {symbol} — thin book "
+                                 f"(${bid_usdt:,.0f} bids within {DEPTH_PCT_RANGE*100:.0f}% "
+                                 f"< ${min_depth:,.0f} required = {DEPTH_BID_RATIO:.0f}× "
+                                 f"${notional:.2f} position)")
+                        return None
+
                 # Note 4 — feed real spread back into dead-coin tracking.
-                # open_position is called after scanner scoring, so this is the
-                # most accurate spread data we'll ever have for this symbol.
                 strategy_key = "SCALPER" if label in ("SCALPER", "TRINITY") else "MOONSHOT"
                 check_dead_coin(symbol, 0.0, spread, strategy_key)
         except Exception:
-            pass  # spread check is advisory — don't block on error
+            pass  # spread/depth check is advisory — don't block on error
 
     buy_order = place_market_buy(symbol, qty, label)
     if not buy_order:
@@ -2455,7 +2534,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     # Falls back to calling calc_dynamic_tp_sl if no pre-computed values exist.
     # REVERSAL: SL anchored to cap-candle low stored in opp["cap_sl_pct"]
     # MOONSHOT: fixed pct TP/SL passed in from caller
-    if label == "SCALPER" and opp.get("atr_pct"):
+    if label == "SCALPER" and opp.get("atr_pct") is not None:
         if tp_pct > 0 and sl_pct > 0:
             used_tp_pct = tp_pct
             actual_sl   = sl_pct
@@ -2642,6 +2721,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         + (f" 📐 (keltner +{opp.get('keltner_bonus',0):.0f})" if opp.get('keltner_bonus') else "")
         + f" | RSI: {opp.get('rsi','?')} ({opp.get('rsi_delta',0):+.1f}) | Vol: {opp.get('vol_ratio','?')}x"
         + (f" | Trail: {opp.get('trail_pct', SCALPER_TRAIL_PCT)*100:.1f}%" if label == "SCALPER" else "")
+        + (f" | Kelly: {opp.get('kelly_mult', 1.0):.2f}×" if label == "SCALPER" and opp.get("kelly_mult") else "")
     )
     save_state()
     return trade
@@ -2654,8 +2734,15 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
 
     # held_min computed once here — used by timeout checks, graduated exits,
     # flat exit, vol collapse, and trailing stop logic below.
-    held_min = (datetime.now(timezone.utc) -
-                datetime.fromisoformat(trade["opened_at"])).total_seconds() / 60
+    # Guard: fromisoformat on old state may return a naive datetime (no tz info).
+    # Normalize to UTC-aware before subtracting to avoid TypeError.
+    try:
+        opened = datetime.fromisoformat(trade["opened_at"])
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+        held_min = (datetime.now(timezone.utc) - opened).total_seconds() / 60
+    except Exception:
+        held_min = 0.0
 
     # ── Timeout logic ─────────────────────────────────────────
     # MOONSHOT: graduated — timeout depends on how the trade is performing.
@@ -2870,6 +2957,29 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
                         return True, "VOL_COLLAPSE"
             except Exception:
                 pass  # never block an exit check on a kline failure
+
+    # ── REVERSAL-specific exits ───────────────────────────────
+    if label == "REVERSAL" and not trade.get("partial_tp_hit"):
+        # Mean-reversion shelf-life check.
+        # If the bounce hasn't made REVERSAL_FLAT_PROGRESS (40%) of the way
+        # from entry to TP within REVERSAL_FLAT_MINS (45min), the thesis is
+        # stale — the oversold condition has resolved without our coin bouncing.
+        # Exit now at a small loss / breakeven rather than waiting for the hard
+        # 2h timeout with a larger loss, or sitting in dead capital.
+        # Guards:
+        #   - Only fires before partial TP hits (remainder is risk-free by then)
+        #   - Only fires when price is above entry — if already at a loss, the
+        #     SL handles it; this exit is for "stuck but not losing" situations
+        #   - Only fires when TP range is positive (avoids divide-by-zero)
+        if held_min >= REVERSAL_FLAT_MINS and pct >= 0:
+            tp_range = trade["tp_price"] - trade["entry_price"]
+            if tp_range > 0:
+                progress = (price - trade["entry_price"]) / tp_range
+                if progress < REVERSAL_FLAT_PROGRESS:
+                    log.info(f"😴 [{label}] Flat-progress exit: {symbol} | "
+                             f"{pct:+.2f}% | progress {progress*100:.0f}% "
+                             f"< {REVERSAL_FLAT_PROGRESS*100:.0f}% after {held_min:.0f}min")
+                    return True, "FLAT_EXIT"
 
     # ── Breakeven lock (any label with breakeven_act set) ────────
     # Fires once when trade reaches breakeven_act — moves SL to entry.
@@ -3233,6 +3343,21 @@ def close_position(trade, reason) -> bool:
 
 # ── Heartbeat ─────────────────────────────────────────────────
 
+def _trade_price_pct(trade: dict) -> tuple[float | None, float | None]:
+    """
+    Return (current_price, pct_from_entry) for an open trade.
+    Uses WS price first, falls back to REST. Returns (None, None) on error.
+    Centralises the repeated ws_price-or-REST pattern used in status/heartbeat.
+    """
+    try:
+        px = ws_price(trade["symbol"]) or float(
+            public_get("/api/v3/ticker/price", {"symbol": trade["symbol"]})["price"]
+        )
+        pct = (px - trade["entry_price"]) / trade["entry_price"] * 100
+        return px, pct
+    except Exception:
+        return None, None
+
 def send_heartbeat(balance: float):
     global last_heartbeat_at
     if time.time() - last_heartbeat_at < 3600:
@@ -3247,11 +3372,10 @@ def send_heartbeat(balance: float):
 
     scalper_lines = []
     for t in scalper_trades:
-        try:
-            px  = ws_price(t["symbol"]) or float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
-            pct = (px - t["entry_price"]) / t["entry_price"] * 100
+        _, pct = _trade_price_pct(t)
+        if pct is not None:
             scalper_lines.append(f"  🟢 {t['symbol']} {pct:+.2f}%")
-        except Exception:
+        else:
             scalper_lines.append(f"  🟢 {t['symbol']}")
     if not scalper_trades:
         if last_top_scalper:
@@ -3261,11 +3385,10 @@ def send_heartbeat(balance: float):
 
     alt_lines = []
     for t in alt_trades:
-        try:
-            px  = ws_price(t["symbol"]) or float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
-            pct = (px - t["entry_price"]) / t["entry_price"] * 100
+        _, pct = _trade_price_pct(t)
+        if pct is not None:
             alt_lines.append(f"  {t['label']}: <b>{t['symbol']}</b> {pct:+.2f}%")
-        except Exception:
+        else:
             alt_lines.append(f"  {t['label']}: <b>{t['symbol']}</b>")
     if not alt_trades:
         if last_top_alt:
@@ -3294,26 +3417,33 @@ def convert_dust():
     Runs once per day at midnight alongside the daily summary.
     Skips safely if PAPER_TRADE, or if nothing qualifies.
     Rules: max 99 assets per call, each < $5 USDT value, 0.2% fee.
+    Uses a single batch price fetch instead of one call per asset.
     """
     if PAPER_TRADE:
         return
     try:
         balances = private_get("/api/v3/account").get("balances", [])
+        candidates = {
+            b["asset"]: float(b.get("free", 0))
+            for b in balances
+            if b["asset"] not in ("USDT", "MX") and float(b.get("free", 0)) > 0
+        }
+        if not candidates:
+            log.info("🧹 Dust sweep: nothing to convert.")
+            return
+
+        # Single batch fetch — /api/v3/ticker/price with no symbol returns all pairs
+        try:
+            all_prices = {p["symbol"]: float(p["price"])
+                          for p in public_get("/api/v3/ticker/price")}
+        except Exception:
+            all_prices = {}
+
         dust = []
-        for b in balances:
-            asset = b["asset"]
-            free  = float(b.get("free", 0))
-            if asset in ("USDT", "MX") or free <= 0:
-                continue
-            try:
-                price = float(public_get("/api/v3/ticker/price",
-                                         {"symbol": f"{asset}USDT"})["price"])
-                value = free * price
-                if 0 < value < 1.0:
-                    dust.append(asset)
-            except Exception:
-                pass  # no USDT pair for this asset — skip
-            time.sleep(0.05)
+        for asset, free in candidates.items():
+            price = all_prices.get(f"{asset}USDT", 0.0)
+            if price > 0 and 0 < free * price < 1.0:
+                dust.append(asset)
 
         if not dust:
             log.info("🧹 Dust sweep: nothing to convert.")
@@ -3608,22 +3738,20 @@ def _cmd_status(balance: float):
     mode  = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
     lines = [f"📋 <b>Status</b> [{mode}]\n━━━━━━━━━━━━━━━"]
     for t in scalper_trades:
-        try:
-            px  = ws_price(t["symbol"]) or float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
-            pct = (px - t["entry_price"]) / t["entry_price"] * 100
+        _, pct = _trade_price_pct(t)
+        if pct is not None:
             lines.append(f"🟢 {t['symbol']} | {pct:+.2f}% | "
                          f"TP: ${t['tp_price']:.6f} | SL: ${t['sl_price']:.6f}")
-        except Exception:
+        else:
             lines.append(f"🟢 {t['symbol']} (unavailable)")
     if not scalper_trades:
         lines.append("Scalper: scanning...")
     for t in alt_trades:
-        try:
-            px  = ws_price(t["symbol"]) or float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
-            pct = (px - t["entry_price"]) / t["entry_price"] * 100
+        _, pct = _trade_price_pct(t)
+        if pct is not None:
             lines.append(f"{t['label']}: <b>{t['symbol']}</b> | {pct:+.2f}% | "
                          f"TP: ${t['tp_price']:.6f} | SL: ${t['sl_price']:.6f}")
-        except Exception:
+        else:
             lines.append(f"{t['label']}: {t['symbol']} (unavailable)")
     if not alt_trades:
         lines.append("Alt: scanning...")
@@ -3803,6 +3931,13 @@ def _cmd_config():
         f"\n🔄 <b>Reversal</b>  [bot-monitored]\n"
         f"  TP: +{REVERSAL_TP*100:.1f}% | SL: cap-candle anchor | Max: {REVERSAL_MAX_HOURS}h\n"
         f"  Partial TP: {REVERSAL_PARTIAL_TP_RATIO*100:.0f}% sold at +{REVERSAL_PARTIAL_TP_PCT*100:.1f}% → SL moves to entry\n"
+        f"  Flat-progress exit: <{REVERSAL_FLAT_PROGRESS*100:.0f}% toward TP after {REVERSAL_FLAT_MINS}min → cut\n"
+        f"\n📊 <b>Order Book Depth</b>\n"
+        f"  Bid sum within {DEPTH_PCT_RANGE*100:.0f}% must be ≥ {DEPTH_BID_RATIO:.0f}× position value\n"
+        f"  ({DEPTH_BID_LEVELS} levels fetched per entry)\n"
+        f"\n📐 <b>Kelly Lite Sizing</b>  (score vs threshold={SCALPER_THRESHOLD})\n"
+        f"  gap <15: {KELLY_MULT_MARGINAL:.2f}× | gap <30: {KELLY_MULT_SOLID:.2f}× "
+        f"| gap <45: {KELLY_MULT_STANDARD:.2f}× | gap ≥45: {KELLY_MULT_HIGH_CONF:.2f}×\n"
         f"\n☠️ <b>Dead Coins</b>\n"
         f"  Scalper floor: ${DEAD_COIN_VOL_SCALPER:,.0f} vol | Moonshot floor: ${DEAD_COIN_VOL_MOONSHOT:,.0f} vol\n"
         f"  Spread cap: {DEAD_COIN_SPREAD_MAX*100:.1f}% | {DEAD_COIN_CONSECUTIVE} fails → {DEAD_COIN_BLACKLIST_HOURS}h blacklist\n"
@@ -4357,8 +4492,15 @@ def run():
 
                 if opp:
                     trade_budget, pre_tp, pre_sl, _, _ = calc_risk_budget(opp, balance)
+                    # Stash the kelly multiplier that was applied so open_position
+                    # can show it in the Telegram message without recomputing.
+                    gap = opp.get("score", SCALPER_THRESHOLD) - SCALPER_THRESHOLD
+                    opp["kelly_mult"] = (KELLY_MULT_HIGH_CONF if gap >= 45
+                                         else KELLY_MULT_STANDARD if gap >= 30
+                                         else KELLY_MULT_SOLID    if gap >= 15
+                                         else KELLY_MULT_MARGINAL)
                     log.info(f"💰 [SCALPER] Risk budget: ${trade_budget:.2f} "
-                             f"(1% risk @ SL {pre_sl*100:.2f}%, "
+                             f"(Kelly {opp['kelly_mult']:.2f}× | 1% risk @ SL {pre_sl*100:.2f}%, "
                              f"cap ${round(balance*SCALPER_BUDGET_PCT,2):.2f})")
                     trade = open_position(opp, trade_budget, pre_tp, pre_sl, "SCALPER")
                     if trade:
@@ -4410,6 +4552,13 @@ def run():
                             if close_position(trade, reason):
                                 scalper_trades.remove(trade)
                                 if reason == "ROTATION" and best_opp:
+                                    rot_gap = best_opp.get("score", SCALPER_THRESHOLD) - SCALPER_THRESHOLD
+                                    best_opp["kelly_mult"] = (
+                                        KELLY_MULT_HIGH_CONF if rot_gap >= 45 else
+                                        KELLY_MULT_STANDARD  if rot_gap >= 30 else
+                                        KELLY_MULT_SOLID     if rot_gap >= 15 else
+                                        KELLY_MULT_MARGINAL
+                                    )
                                     rot_budget, rot_pre_tp, rot_pre_sl, _, _ = calc_risk_budget(best_opp, balance)
                                     new_t = open_position(best_opp, rot_budget, rot_pre_tp, rot_pre_sl, "SCALPER")
                                     if new_t:
