@@ -1115,7 +1115,7 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
     ema50_gap = (float(df_1h["close"].iloc[-1]) / float(ema50_1h) - 1)
     # Convert to penalty instead of hard block — coins slightly below EMA50 can still
     # qualify if their signal is strong enough. Deep below = penalised out naturally.
-    ema50_penalty = round(max(0.0, -ema50_gap) * SCALPER_EMA50_PENALTY, 1)
+    ema50_penalty = round(max(0.0, -ema50_gap) * SCALPER_EMA50_PENALTY, 1) if strict else 0.0
 
     df5m = parse_klines(sym, interval="5m", limit=60)
     if df5m is None:
@@ -1152,7 +1152,7 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
 
     threshold = SCALPER_THRESHOLD if strict else max(5, SCALPER_THRESHOLD // 2)
     if score < threshold:
-        if ema50_penalty > 0:
+        if strict and ema50_penalty > 0:
             log.debug(f"[SCALPER] Skip {sym} — EMA50 penalty {ema50_penalty:.1f}pts "
                       f"({ema50_gap*100:.1f}% below EMA50)")
         return None
@@ -1285,8 +1285,10 @@ def build_watchlist(tickers: pd.DataFrame):
     if _btc_ema_gap < -0.005:  # only mention if meaningfully below (> 0.5%)
         penalty = round(abs(_btc_ema_gap) * BTC_REGIME_EMA_PENALTY, 1)
         why_not.append(f"BTC {_btc_ema_gap*100:.1f}% below EMA (-{penalty:.0f}pts penalty)")
-    if top.get("ema50_penalty", 0) > 0:
-        why_not.append(f"coin EMA50 -{top['ema50_penalty']:.0f}pts ({top['ema50_gap']:.1f}% below)")
+    if top.get("ema50_penalty", 0) > 0 or top.get("ema50_gap", 0) < -0.5:
+        gap = top.get("ema50_gap", 0)
+        penalty = round(max(0.0, -gap / 100) * SCALPER_EMA50_PENALTY, 1)
+        why_not.append(f"coin EMA50 -{penalty:.0f}pts ({gap:.1f}% below) at entry")
     status_line = f"Holding off: {', '.join(why_not)}" if why_not else "Ready to enter ✅"
 
     telegram(
