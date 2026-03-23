@@ -69,7 +69,7 @@ SCALPER_SL_MULT_HIGH_CONF = 1.8  # high-confidence multi-signal — give it room
 SCALPER_SL_MULT_DEFAULT   = 1.3  # standard trending entry
 SCALPER_SL_NOISE_MULT     = 2.0  # SL must be ≥ N × avg candle body (noise floor)
 SCALPER_SL_MAX            = 0.04  # hard ceiling 4% — never risk more than this
-SCALPER_SL_MIN            = 0.008 # hard floor 0.8% — fees kill anything tighter
+SCALPER_SL_MIN            = 0.015 # hard floor 1.5% — gives trades breathing room on normal volatility
 
 # ── Watchlist — universe of pairs pre-scored every 30 minutes ──
 WATCHLIST_SIZE      = 30        # top N pairs by score to trade from
