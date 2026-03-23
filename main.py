@@ -3404,7 +3404,7 @@ def startup() -> float:
 def run():
     global _last_rotation_scan, _watchlist, _watchlist_at, \
            _scalper_excluded, _alt_excluded, _btc_ema_gap, \
-           _streak_paused_at
+           _streak_paused_at, _consecutive_losses, _win_rate_pause_until
 
     startup_balance  = startup()
     balance          = get_available_balance()
