@@ -85,8 +85,8 @@ MOONSHOT_BUDGET_PCT   = float(os.getenv("MOONSHOT_BUDGET_PCT",   "0.03"))  # 3% 
 MOONSHOT_TP_INITIAL           = 0.15      # sets tp_price pre-partial-TP only; trailing stop takes over after
 MOONSHOT_SL           = float(os.getenv("MOONSHOT_SL",           "0.08"))  # 8% — slippage can't kill the trade
 MOONSHOT_TRAIL_PCT    = float(os.getenv("MOONSHOT_TRAIL_PCT",     "0.08"))  # trail 8% below highest after partial TP
-MOONSHOT_MAX_VOL      = 250_000
-MOONSHOT_MIN_VOL      = 5_000
+MOONSHOT_MAX_VOL      = int(os.getenv("MOONSHOT_MAX_VOL", "5000000"))  # raised from 250k — was excluding most legitimate movers
+MOONSHOT_MIN_VOL      = int(os.getenv("MOONSHOT_MIN_VOL", "50000"))  # raised from 5k — filters dangerous micro-caps
 MOONSHOT_MIN_SCORE    = 30        # raised: need crossover OR strong vol burst, not just stale trend
 MOONSHOT_MAX_RSI      = float(os.getenv("MOONSHOT_MAX_RSI",      "70"))   # overbought gate
 MOONSHOT_MIN_RSI      = float(os.getenv("MOONSHOT_MIN_RSI",      "35"))   # freefall gate
@@ -451,6 +451,7 @@ def save_state():
             "trade_history":        trade_history,
             "consecutive_losses":   _consecutive_losses,
             "win_rate_pause_until": _win_rate_pause_until,
+            "streak_paused_at":     _streak_paused_at,
             "scalper_excluded":     _scalper_excluded,
             "alt_excluded":         list(_alt_excluded),
             "api_blacklist":        list(_api_blacklist),
@@ -464,17 +465,17 @@ def save_state():
         log.warning(f"State save failed: {e}")
 
 
-def load_state() -> tuple[list, list, list, int, float, dict, set, set]:
+def load_state() -> tuple[list, list, list, int, float, float, dict, set, set]:
     """
     Load persisted state from STATE_FILE.
     Returns (scalper_trades, alt_trades, trade_history,
-             consecutive_losses, win_rate_pause_until,
+             consecutive_losses, win_rate_pause_until, streak_paused_at,
              scalper_excluded, alt_excluded, api_blacklist).
     Returns empty defaults if file is missing or unreadable.
     """
     try:
         if not os.path.exists(STATE_FILE):
-            return [], [], [], 0, 0.0, {}, set(), set()
+            return [], [], [], 0, 0.0, 0.0, {}, set(), set()
         with open(STATE_FILE) as f:
             d = json.load(f)
         age = (datetime.now(timezone.utc) -
@@ -490,13 +491,14 @@ def load_state() -> tuple[list, list, list, int, float, dict, set, set]:
             d.get("trade_history",        []),
             d.get("consecutive_losses",   0),
             d.get("win_rate_pause_until", 0.0),
+            d.get("streak_paused_at",     0.0),
             d.get("scalper_excluded",     {}),
             set(d.get("alt_excluded",     [])),
             set(d.get("api_blacklist",    [])),
         )
     except Exception as e:
         log.warning(f"State load failed ({e}) — starting fresh")
-        return [], [], [], 0, 0.0, {}, set(), set()
+        return [], [], [], 0, 0.0, 0.0, {}, set(), set()
 
 def _get_session() -> requests.Session:
     """Return a thread-local requests.Session, creating one if needed."""
@@ -1255,6 +1257,8 @@ def build_watchlist(tickers: pd.DataFrame):
     if _btc_ema_gap < -0.005:  # only mention if meaningfully below (> 0.5%)
         penalty = round(abs(_btc_ema_gap) * BTC_REGIME_EMA_PENALTY, 1)
         why_not.append(f"BTC {_btc_ema_gap*100:.1f}% below EMA (-{penalty:.0f}pts penalty)")
+    if top.get("ema50_penalty", 0) > 0:
+        why_not.append(f"coin EMA50 -{top['ema50_penalty']:.0f}pts ({top['ema50_gap']:.1f}% below)")
     status_line = f"Holding off: {', '.join(why_not)}" if why_not else "Ready to enter ✅"
 
     telegram(
@@ -3366,7 +3370,7 @@ def startup() -> float:
     _load_symbol_rules()
 
     (scalper_trades, alt_trades, trade_history,
-     _consecutive_losses, _win_rate_pause_until,
+     _consecutive_losses, _win_rate_pause_until, _streak_paused_at,
      _scalper_excluded, _alt_excluded, _api_blacklist) = load_state()
 
     reconcile_open_positions()
