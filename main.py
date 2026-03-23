@@ -1,9 +1,9 @@
 """
 MEXC Trading Bot — 3 Strategies
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  1. SCALPER  — Max 3 trades (30% each) | ATR TP (2:1 R:R) | ATR SL | 1H trend | 30min watchlist
-  2. MOONSHOT — Max 2 trades (5%) | TP +15% | SL -5% | Bot-monitored exits only
-  3. REVERSAL — Max 2 trades (5%) | TP +4%  | SL -2% | Oversold bounce + volume capitulation
+  1. SCALPER  — Max 3 trades (30% cap, 1% risk) | Dynamic ATR TP/SL | 1H trend | 30min watchlist
+  2. MOONSHOT — Max 2 trades (3%) | SL -8% | Partial TP +10% → 8% trail | RSI 35-70 gate
+  3. REVERSAL — Max 2 trades (5%) | TP +4% | SL cap-candle anchor | Oversold bounce + vol capitulation
      Moonshot and Reversal share the alt slot.
 """
 
@@ -96,7 +96,7 @@ MOONSHOT_MIN_VOL_RATIO = float(os.getenv("MOONSHOT_MIN_VOL_RATIO", "1.2"))  # re
 # ── Moonshot graduated timeout ─────────────────────────────────
 # Hard clock replaced with P&L-aware timeouts:
 MOONSHOT_TIMEOUT_FLAT_MINS   = 30    # exit if pct < 0.5% after this many minutes
-MOONSHOT_TIMEOUT_MARGINAL_MINS= 60   # exit if pct < 3.0% after this many minutes
+MOONSHOT_TIMEOUT_MARGINAL_MINS= 60   # exit if pct < 5.0% after this many minutes
 MOONSHOT_TIMEOUT_MAX_MINS    = 120   # absolute ceiling regardless of P&L
 # Mid-hold vol re-check — if volume collapses the pump is over
 MOONSHOT_VOL_CHECK_MINS      = 15    # start checking vol after this many minutes held
@@ -3091,7 +3091,12 @@ def _cmd_close():
     telegram(f"✅ Closed {closed} position(s).")
 
 
-def _cmd_restart():
+def _cmd_resetstreak():
+    global _consecutive_losses, _win_rate_pause_until
+    _consecutive_losses    = 0
+    _win_rate_pause_until  = 0.0
+    save_state()
+    telegram("✅ <b>Streak reset.</b> Consecutive losses cleared, win-rate pause lifted. Scalper entries resumed.")
     telegram("🔄 <b>Restarting...</b> State saved. Railway will redeploy.")
     save_state()
     os._exit(0)
@@ -3171,8 +3176,9 @@ def listen_for_commands(balance: float):
             elif text == "/pause":  _paused = True;  telegram("⏸️ <b>Paused.</b> No new trades. Existing positions monitored.\n/resume to restart.")
             elif text == "/resume": _paused = False; telegram("▶️ <b>Resumed.</b> Scanning for new trades.")
             elif text == "/close":   _cmd_close()
-            elif text == "/restart": _cmd_restart()
-            elif text == "/config":  _cmd_config()
+            elif text == "/restart":      _cmd_restart()
+            elif text == "/resetstreak":  _cmd_resetstreak()
+            elif text == "/config":       _cmd_config()
             elif raw_text.startswith("/ask ") or raw_text.startswith("/ask@"):
                 question = raw_text.split(" ", 1)[1].strip() if " " in raw_text else ""
                 if not question:
@@ -3350,14 +3356,14 @@ def startup() -> float:
         f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%  max {REVERSAL_MAX_HOURS}h\n"
         f"\n🧠 <b>AI</b>: {'✅ Haiku + web search' if SENTIMENT_ENABLED and WEB_SEARCH_ENABLED else '✅ Haiku only (/ask + journal)' if SENTIMENT_ENABLED else '⚠️ disabled (set ANTHROPIC_API_KEY)'}\n"
         f"  Cache: {SENTIMENT_CACHE_MINS}min | Bonus: +{SENTIMENT_MAX_BONUS}pts | Penalty: -{SENTIMENT_MAX_PENALTY}pts\n"
-        f"\n<i>/status · /pnl · /logs · /config · /pause · /resume · /close · /restart · /ask</i>"
+        f"\n<i>/status · /pnl · /logs · /config · /pause · /resume · /close · /restart · /resetstreak · /ask</i>"
     )
     return startup_balance
 
 
 def run():
     global _last_rotation_scan, _watchlist, _watchlist_at, \
-           _scalper_excluded, _alt_excluded
+           _scalper_excluded, _alt_excluded, _btc_ema_gap
 
     startup_balance  = startup()
     balance          = get_available_balance()
