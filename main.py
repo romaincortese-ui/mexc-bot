@@ -125,6 +125,43 @@ MOONSHOT_PARTIAL_TP_PCT      = 0.10  # sell first half at +10% (raised from 6% �
 MOONSHOT_PARTIAL_TP_RATIO    = 0.50  # fraction to sell at stage 1 (50%)
 MOONSHOT_BREAKEVEN_ACT       = float(os.getenv("MOONSHOT_BREAKEVEN_ACT", "0.04"))  # move SL to entry at +4%
 
+# ── Note 4 — Dead Coins: proactive liquidity blacklist ─────────
+# Coins that fail the volume/spread check 3× in a row are blacklisted for 24h.
+# Separate thresholds per strategy: Scalper is stricter, Moonshot hunts emerging pumps.
+# The blacklist expires daily so recovering coins get a second chance.
+DEAD_COIN_VOL_SCALPER     = int(os.getenv("DEAD_COIN_VOL_SCALPER",    "500000"))  # 24h vol floor for scalper
+DEAD_COIN_VOL_MOONSHOT    = int(os.getenv("DEAD_COIN_VOL_MOONSHOT",   "150000"))  # looser — catching pumps
+DEAD_COIN_SPREAD_MAX      = float(os.getenv("DEAD_COIN_SPREAD_MAX",   "0.003"))   # 0.3% — slippage danger above this
+DEAD_COIN_CONSECUTIVE     = int(os.getenv("DEAD_COIN_CONSECUTIVE",    "3"))       # failures before blacklist
+DEAD_COIN_BLACKLIST_HOURS = int(os.getenv("DEAD_COIN_BLACKLIST_HOURS","24"))      # blacklist duration
+
+# ── Note 2 — ATR-Stepped Trailing Stop ─────────────────────────
+# Instead of a single fixed trail width, the trail adjusts based on how far
+# the trade has moved relative to ATR — tight when locking in, wide on runners.
+# Tier 1 activates at +2×ATR profit (tighter than the static 3% activation).
+# Tier 2 kicks in at +4×ATR — gives parabolic moves room to breathe.
+SCALPER_TRAIL_ATR_ACTIVATE = float(os.getenv("SCALPER_TRAIL_ATR_ACTIVATE", "2.0"))  # ×ATR profit to activate trail
+SCALPER_TRAIL_ATR_TIER1    = float(os.getenv("SCALPER_TRAIL_ATR_TIER1",    "1.0"))  # trail = 1×ATR at tier1
+SCALPER_TRAIL_ATR_TIER2    = float(os.getenv("SCALPER_TRAIL_ATR_TIER2",    "2.0"))  # trail = 2×ATR at +4×ATR profit
+SCALPER_TRAIL_TIER2_THRESH = float(os.getenv("SCALPER_TRAIL_TIER2_THRESH", "4.0"))  # ×ATR profit threshold for tier2
+# MOONSHOT: same idea — widen trail after partial TP fires on big runners
+MOONSHOT_TRAIL_ATR_WIDE    = float(os.getenv("MOONSHOT_TRAIL_ATR_WIDE",    "0.12")) # 12% trail after +4×ATR (vs 8% default)
+MOONSHOT_TRAIL_WIDE_THRESH = float(os.getenv("MOONSHOT_TRAIL_WIDE_THRESH", "4.0"))  # ×ATR profit threshold
+
+# ── Note 11 — Confidence-Weighted Partial TP (Scalper) ─────────
+# High-confidence scalper trades (score ≥ threshold) capture a partial at the
+# normal TP target, then ride the remaining 70% on a wider ATR trail — no hard cap.
+SCALPER_PARTIAL_TP_SCORE     = int(os.getenv("SCALPER_PARTIAL_TP_SCORE",     "85"))
+SCALPER_PARTIAL_TP_RATIO     = float(os.getenv("SCALPER_PARTIAL_TP_RATIO",   "0.30"))  # sell 30% at TP
+SCALPER_PARTIAL_TP_TRAIL_MULT= float(os.getenv("SCALPER_PARTIAL_TP_TRAIL_MULT","2.0")) # remainder trail = 2×ATR
+
+# ── Note 9 — Keltner Channel Breakout ──────────────────────────
+# Stateless 15m confirmation: close > hl2 + KELTNER_ATR_MULT×ATR.
+# Applied as a score bonus rather than a hard filter to avoid over-pruning.
+# Disable by setting KELTNER_SCORE_BONUS=0.
+KELTNER_ATR_MULT   = float(os.getenv("KELTNER_ATR_MULT",   "3.0"))
+KELTNER_SCORE_BONUS= float(os.getenv("KELTNER_SCORE_BONUS","10"))
+
 # ── Reversal ──────────────────────────────────────────────────
 REVERSAL_TP              = 0.040  # +4%
 REVERSAL_SL              = 0.020  # -2% fallback (overridden by cap-candle anchor)
@@ -256,6 +293,8 @@ _symbol_rules         = {}
 _symbol_rules_fetched = False
 _symbol_rules_at      = 0
 _api_blacklist        = set()
+_liquidity_blacklist: dict = {}   # {symbol: until_ts} — dead coin blacklist, expires after 24h
+_liquidity_fail_count: dict = {}  # {symbol: int} — consecutive scan failures before blacklist
 _scanner_log_buffer   = collections.deque(maxlen=5)  # rolling window, auto-evicts oldest
 _paused               = False
 
@@ -484,6 +523,8 @@ def save_state():
             "scalper_excluded":     _scalper_excluded,
             "alt_excluded":         list(_alt_excluded),
             "api_blacklist":        list(_api_blacklist),
+            "liquidity_blacklist":  _liquidity_blacklist,
+            "liquidity_fail_count": _liquidity_fail_count,
             "saved_at":             datetime.now(timezone.utc).isoformat(),
         }
         tmp = STATE_FILE + ".tmp"
@@ -494,17 +535,18 @@ def save_state():
         log.warning(f"State save failed: {e}")
 
 
-def load_state() -> tuple[list, list, list, int, float, float, bool, dict, set, set]:
+def load_state() -> tuple[list, list, list, int, float, float, bool, dict, set, set, dict, dict]:
     """
     Load persisted state from STATE_FILE.
     Returns (scalper_trades, alt_trades, trade_history,
              consecutive_losses, win_rate_pause_until, streak_paused_at,
-             paused, scalper_excluded, alt_excluded, api_blacklist).
+             paused, scalper_excluded, alt_excluded, api_blacklist,
+             liquidity_blacklist, liquidity_fail_count).
     Returns empty defaults if file is missing or unreadable.
     """
     try:
         if not os.path.exists(STATE_FILE):
-            return [], [], [], 0, 0.0, 0.0, False, {}, set(), set()
+            return [], [], [], 0, 0.0, 0.0, False, {}, set(), set(), {}, {}
         with open(STATE_FILE) as f:
             d = json.load(f)
         age = (datetime.now(timezone.utc) -
@@ -525,10 +567,12 @@ def load_state() -> tuple[list, list, list, int, float, float, bool, dict, set, 
             d.get("scalper_excluded",     {}),
             set(d.get("alt_excluded",     [])),
             set(d.get("api_blacklist",    [])),
+            d.get("liquidity_blacklist",  {}),
+            d.get("liquidity_fail_count", {}),
         )
     except Exception as e:
         log.warning(f"State load failed ({e}) — starting fresh")
-        return [], [], [], 0, 0.0, 0.0, False, {}, set(), set()
+        return [], [], [], 0, 0.0, 0.0, False, {}, set(), set(), {}, {}
 
 def _get_session() -> requests.Session:
     """Return a thread-local requests.Session, creating one if needed."""
@@ -847,6 +891,80 @@ def get_social_boost(symbol: str) -> tuple[float, str]:
         return boost, summary
     except Exception:
         return 0.0, ""
+
+
+def check_dead_coin(symbol: str, vol_24h: float, spread: float,
+                    strategy: str = "SCALPER") -> bool:
+    """
+    Note 4 — Dead Coins: proactive liquidity health check.
+
+    Called during scanner runs for each candidate. Tracks consecutive failures
+    and blacklists symbols that fail DEAD_COIN_CONSECUTIVE times in a row.
+    The blacklist expires after DEAD_COIN_BLACKLIST_HOURS so recovering coins
+    (e.g., a coin that gets relisted or suddenly pumps) get a second chance.
+
+    Returns True if the coin is dead (should be skipped), False if healthy.
+    Never raises — any error returns False (don't block on a health check).
+    """
+    global _liquidity_blacklist, _liquidity_fail_count
+
+    # Already blacklisted?
+    until_ts = _liquidity_blacklist.get(symbol)
+    if until_ts:
+        if time.time() < until_ts:
+            return True  # still in blacklist window
+        else:
+            # Expired — give the coin a second chance
+            del _liquidity_blacklist[symbol]
+            _liquidity_fail_count.pop(symbol, None)
+            log.info(f"💧 [DEAD_COIN] {symbol} blacklist expired — re-enabled")
+
+    vol_threshold = (DEAD_COIN_VOL_SCALPER if strategy == "SCALPER"
+                     else DEAD_COIN_VOL_MOONSHOT)
+    failed = (vol_24h < vol_threshold) or (spread > DEAD_COIN_SPREAD_MAX)
+
+    if failed:
+        count = _liquidity_fail_count.get(symbol, 0) + 1
+        _liquidity_fail_count[symbol] = count
+        log.debug(f"💧 [DEAD_COIN] {symbol} fail #{count}/{DEAD_COIN_CONSECUTIVE} "
+                  f"(vol=${vol_24h:,.0f} spread={spread*100:.3f}%)")
+        if count >= DEAD_COIN_CONSECUTIVE:
+            until_ts = time.time() + DEAD_COIN_BLACKLIST_HOURS * 3600
+            _liquidity_blacklist[symbol] = until_ts
+            _liquidity_fail_count.pop(symbol, None)
+            log.info(f"☠️  [DEAD_COIN] {symbol} blacklisted for {DEAD_COIN_BLACKLIST_HOURS}h "
+                     f"(vol=${vol_24h:,.0f} spread={spread*100:.3f}%)")
+            save_state()
+        return True
+    else:
+        # Healthy scan — reset the failure counter
+        _liquidity_fail_count.pop(symbol, None)
+        return False
+
+
+def keltner_breakout(df: pd.DataFrame,
+                     atr_mult: float = None) -> bool:
+    """
+    Note 9 — Stateless 15m Keltner Channel breakout confirmation.
+
+    True if the latest close is above the upper channel: close > hl2 + mult×ATR.
+    Requires no persistent state — safe to call on any klines DataFrame.
+    Returns False on any error so it never blocks an entry.
+    """
+    if atr_mult is None:
+        atr_mult = KELTNER_ATR_MULT
+    try:
+        if df is None or len(df) < 20:
+            return False
+        close = df["close"]
+        high  = df["high"]
+        low   = df["low"]
+        hl2   = (high + low) / 2
+        atr   = calc_atr(df, period=14)
+        upper = float(hl2.iloc[-1]) + atr_mult * atr
+        return float(close.iloc[-1]) > upper
+    except Exception:
+        return False
 
 
 def public_get(path, params=None):
@@ -1204,6 +1322,18 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
                   f"(ATR {atr_pct*100:.3f}% < {SCALPER_MIN_ATR_PCT*100:.1f}%)")
         return None
 
+    # ── Note 9 — Keltner Channel breakout bonus (strict mode only) ──
+    # Fetch 15m klines once for the confirmation check — cached so no extra API hit
+    # when build_watchlist and find_scalper_opportunity run close together.
+    keltner_bonus = 0.0
+    if strict and KELTNER_SCORE_BONUS > 0:
+        df_15m = parse_klines(sym, interval="15m", limit=40, min_len=20)
+        if keltner_breakout(df_15m):
+            keltner_bonus = KELTNER_SCORE_BONUS
+            log.debug(f"[SCALPER] {sym} Keltner breakout confirmed (+{keltner_bonus:.0f}pts)")
+
+    score = round(score + keltner_bonus, 2)
+
     curr_close     = float(close.iloc[-1])
     ema21_dist_pct = max(0.0, (curr_close - float(ema21.iloc[-1])) / curr_close) if curr_close > 0 else 0.0
     opens          = df5m["open"]
@@ -1217,6 +1347,7 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
         "rsi":             round(rsi, 2),
         "rsi_delta":       round(rsi_delta, 2),
         "confluence_bonus":confluence_bonus,
+        "keltner_bonus":   keltner_bonus,
         "vol_ratio":       round(vol_ratio, 2),
         "ema50_gap":       round(ema50_gap * 100, 2),
         "ema50_penalty":   ema50_penalty,
@@ -1248,6 +1379,9 @@ def build_watchlist(tickers: pd.DataFrame):
     df = df[df["lastPrice"]   >= SCALPER_MIN_PRICE]
     df = df[df["abs_change"]  >= SCALPER_MIN_CHANGE]
     df = df[~df["symbol"].isin(_api_blacklist)]
+    # Note 4 — filter out dead coins that have been consecutively failing health checks
+    now_ts = time.time()
+    df = df[~df["symbol"].apply(lambda s: _liquidity_blacklist.get(s, 0) > now_ts)]
     candidates = df.sort_values("quoteVolume", ascending=False).head(120)["symbol"].tolist()
 
     log.info(f"📋 [WATCHLIST] Building from {len(candidates)} candidates (full rescore)...")
@@ -1261,6 +1395,10 @@ def build_watchlist(tickers: pd.DataFrame):
              f"({len(candidates) - len(established)} new listings excluded)")
 
     # Score all in parallel — entry scorer re-evaluates top 5 with fresh data anyway
+    # Note 4: build a fast vol lookup from the tickers df so check_dead_coin can run
+    # per symbol without extra API calls (spread check happens at open_position already).
+    ticker_vol = dict(zip(tickers["symbol"], tickers["quoteVolume"].fillna(0)))
+
     scores = []
     with ThreadPoolExecutor(max_workers=5) as ex:
         futures = {ex.submit(_score_scalper, sym, False): sym for sym in established}
@@ -1268,7 +1406,12 @@ def build_watchlist(tickers: pd.DataFrame):
             try:
                 result = f.result()
                 if result and result["score"] >= WATCHLIST_MIN_SCORE:
-                    scores.append(result)
+                    # Dead-coin check: use 24h vol from tickers; spread=0 here since
+                    # a full order-book fetch per symbol would be too slow at watchlist
+                    # build time — the spread gate at open_position is the real guard.
+                    vol_24h = ticker_vol.get(result["symbol"], 0)
+                    if not check_dead_coin(result["symbol"], vol_24h, 0.0, "SCALPER"):
+                        scores.append(result)
             except Exception as e:
                 sym = futures[f]
                 log.debug(f"[WATCHLIST] Score failed for {sym}: {e}")
@@ -1496,87 +1639,98 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
     if not all_candidates:
         return None
 
+    # Pre-build O(1) lookups from the tickers df — avoids repeated O(n) pandas
+    # row searches inside the parallel _score_moonshot threads.
+    ticker_vol_map    = dict(zip(df["symbol"], df["quoteVolume"].fillna(0)))
+    ticker_change_map = dict(zip(df["symbol"], df["priceChangePercent"].fillna(0)))
+
     # Score candidates in parallel with a Semaphore to avoid MEXC rate-limit (429).
     # Max 5 concurrent kline fetches — aggressive enough to be fast, gentle on the API.
     def _score_moonshot(sym: str) -> dict | None:
-        with _moonshot_scan_sem:
-            is_new = sym in new_symbols
-            interval = "60m" if is_new else "15m"
-            df_k = parse_klines(sym, interval=interval, limit=60)
-            if df_k is None:
-                return None
-            close  = df_k["close"]
-            volume = df_k["volume"]
-            rsi      = calc_rsi(close)
-            if np.isnan(rsi):
-                return None
-            rsi_prev  = calc_rsi(close.iloc[:-1])  # RSI one candle ago
-            rsi_delta = rsi - rsi_prev if not np.isnan(rsi_prev) else 0.0
-            if rsi > MOONSHOT_MAX_RSI:
-                return None  # overbought — entering after the bulk of the move
-            if rsi < MOONSHOT_MIN_RSI:
-                return None  # freefall — coin declining, not starting to pump
-            # Tiered RSI momentum gate:
-            # RSI ≤ MOONSHOT_RSI_ACCEL_MIN: allow freely — early in the move
-            # RSI > MOONSHOT_RSI_ACCEL_MIN: require RSI still accelerating (rsi_delta > threshold)
-            # This lets through DEXE/VVV-style moves while blocking late overbought entries
-            if rsi > MOONSHOT_RSI_ACCEL_MIN and rsi_delta < MOONSHOT_RSI_ACCEL_DELTA:
-                return None  # RSI elevated but decelerating — likely topping out
-            rsi_score = max(0, 40 - rsi) if rsi < 50 else 0
-            ema9  = calc_ema(close, 9)
-            ema21 = calc_ema(close, 21)
-            crossed   = (ema9.iloc[-1] > ema21.iloc[-1]) and (ema9.iloc[-2] <= ema21.iloc[-2])
-            # Only score fresh crossover — "EMA above but crossed hours ago" is a mid-pump entry.
-            # A stale uptrend with no crossover scores 0 here; vol_score must carry it instead.
-            ma_score  = 30 if crossed else 0
-            avg_vol   = volume.iloc[-20:-1].mean()
-            vol_ratio = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
-            vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
-            if vol_ratio < MOONSHOT_MIN_VOL_RATIO:
-                return None  # below average volume — no momentum
-            # Recent 1h liquidity check — mirrors SCALPER_MIN_1H_VOL.
-            # A coin can have $200k 24h volume but $190k happened 18h ago.
-            # Candle count depends on interval: 4×15m = 1h, 1×60m = 1h.
-            recent_candles = 1 if is_new else 4  # 60m interval for new listings, 15m otherwise
-            recent_1h_vol = float(volume.iloc[-recent_candles:].sum()) * float(close.iloc[-1])
-            if recent_1h_vol < min_1h_vol:
-                log.debug(f"[MOONSHOT] Skip {sym} — dead recently "
-                          f"(1h vol ${recent_1h_vol:,.0f} < ${min_1h_vol:,.0f})")
-                return None
-            score     = rsi_score + ma_score + vol_score
-            if score < MOONSHOT_MIN_SCORE:
-                return None
-            # Only apply sentiment/social when score is near threshold — reduces cost
-            # significantly since most candidates fail well before sentiment matters.
-            if score > MOONSHOT_MIN_SCORE - 5:
-                sentiment_delta, _ = sentiment_score_adjustment(sym)
-                social_boost, social_summary = get_social_boost(sym)
-            else:
-                sentiment_delta, social_boost, social_summary = 0.0, 0.0, ""
-            final_score = round(score + sentiment_delta + social_boost, 2)
-            if final_score < MOONSHOT_MIN_SCORE:
-                return None
-            # 24h change — kept for logging only, not used as a filter.
-            # EMA crossover + vol_ratio in the scorer already enforce upward momentum.
-            row = df[df["symbol"] == sym]
-            change_1h = float(row["priceChangePercent"].iloc[0]) if not row.empty else 0.0
-            return {
-                "symbol":       sym,
-                "score":        final_score,
-                "rsi":          round(rsi, 2),
-                "rsi_delta":    round(rsi_delta, 2),
-                "vol_ratio":    round(vol_ratio, 2),
-                "vol_1h_usdt":  round(recent_1h_vol, 0),
-                "price":        float(close.iloc[-1]),
-                "_df":          df_k,
-                "_is_new":      is_new,
-                "_is_trending": sym in trending_syms,
-                "_trend_reason":trending_reasons.get(sym, ""),
-                "_1h_chg":      round(change_1h or 0, 2),
-                "sentiment":    sentiment_delta if sentiment_delta != 0 else None,
-                "social_boost": social_boost if social_boost > 0 else None,
-                "social_buzz":  social_summary if social_boost > 0 else None,
-            }
+        is_new = sym in new_symbols
+        interval = "60m" if is_new else "15m"
+        df_k = parse_klines(sym, interval=interval, limit=60)
+        if df_k is None:
+            return None
+        close  = df_k["close"]
+        volume = df_k["volume"]
+        rsi      = calc_rsi(close)
+        if np.isnan(rsi):
+            return None
+        rsi_prev  = calc_rsi(close.iloc[:-1])  # RSI one candle ago
+        rsi_delta = rsi - rsi_prev if not np.isnan(rsi_prev) else 0.0
+        if rsi > MOONSHOT_MAX_RSI:
+            return None  # overbought — entering after the bulk of the move
+        if rsi < MOONSHOT_MIN_RSI:
+            return None  # freefall — coin declining, not starting to pump
+        # Tiered RSI momentum gate:
+        # RSI ≤ MOONSHOT_RSI_ACCEL_MIN: allow freely — early in the move
+        # RSI > MOONSHOT_RSI_ACCEL_MIN: require RSI still accelerating (rsi_delta > threshold)
+        # This lets through DEXE/VVV-style moves while blocking late overbought entries
+        if rsi > MOONSHOT_RSI_ACCEL_MIN and rsi_delta < MOONSHOT_RSI_ACCEL_DELTA:
+            return None  # RSI elevated but decelerating — likely topping out
+        rsi_score = max(0, 40 - rsi) if rsi < 50 else 0
+        ema9  = calc_ema(close, 9)
+        ema21 = calc_ema(close, 21)
+        crossed   = (ema9.iloc[-1] > ema21.iloc[-1]) and (ema9.iloc[-2] <= ema21.iloc[-2])
+        # Only score fresh crossover — "EMA above but crossed hours ago" is a mid-pump entry.
+        # A stale uptrend with no crossover scores 0 here; vol_score must carry it instead.
+        ma_score  = 30 if crossed else 0
+        avg_vol   = volume.iloc[-20:-1].mean()
+        vol_ratio = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
+        vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
+        if vol_ratio < MOONSHOT_MIN_VOL_RATIO:
+            return None  # below average volume — no momentum
+        # Recent 1h liquidity check — mirrors SCALPER_MIN_1H_VOL.
+        # A coin can have $200k 24h volume but $190k happened 18h ago.
+        # Candle count depends on interval: 4×15m = 1h, 1×60m = 1h.
+        recent_candles = 1 if is_new else 4  # 60m interval for new listings, 15m otherwise
+        recent_1h_vol = float(volume.iloc[-recent_candles:].sum()) * float(close.iloc[-1])
+        if recent_1h_vol < min_1h_vol:
+            log.debug(f"[MOONSHOT] Skip {sym} — dead recently "
+                      f"(1h vol ${recent_1h_vol:,.0f} < ${min_1h_vol:,.0f})")
+            return None
+        score     = rsi_score + ma_score + vol_score
+        if score < MOONSHOT_MIN_SCORE:
+            return None
+        # ── Note 9 — Keltner bonus on the same klines already fetched ──
+        keltner_bonus = 0.0
+        if KELTNER_SCORE_BONUS > 0 and keltner_breakout(df_k):
+            keltner_bonus = KELTNER_SCORE_BONUS
+        # Only apply sentiment/social when score is near threshold — reduces cost
+        # significantly since most candidates fail well before sentiment matters.
+        if score > MOONSHOT_MIN_SCORE - 5:
+            sentiment_delta, _ = sentiment_score_adjustment(sym)
+            social_boost, social_summary = get_social_boost(sym)
+        else:
+            sentiment_delta, social_boost, social_summary = 0.0, 0.0, ""
+        final_score = round(score + keltner_bonus + sentiment_delta + social_boost, 2)
+        if final_score < MOONSHOT_MIN_SCORE:
+            return None
+        # Note 4 — dead coin check using 24h vol from pre-built ticker lookup
+        row_vol = ticker_vol_map.get(sym, 0.0)
+        if check_dead_coin(sym, row_vol, 0.0, "MOONSHOT"):
+            return None
+        # 24h change — kept for logging only, not used as a filter.
+        # EMA crossover + vol_ratio in the scorer already enforce upward momentum.
+        change_1h = ticker_change_map.get(sym, 0.0)
+        return {
+            "symbol":       sym,
+            "score":        final_score,
+            "rsi":          round(rsi, 2),
+            "rsi_delta":    round(rsi_delta, 2),
+            "vol_ratio":    round(vol_ratio, 2),
+            "vol_1h_usdt":  round(recent_1h_vol, 0),
+            "price":        float(close.iloc[-1]),
+            "_df":          df_k,
+            "_is_new":      is_new,
+            "_is_trending": sym in trending_syms,
+            "_trend_reason":trending_reasons.get(sym, ""),
+            "_1h_chg":      round(change_1h or 0, 2),
+            "sentiment":    sentiment_delta if sentiment_delta != 0 else None,
+            "social_boost": social_boost if social_boost > 0 else None,
+            "social_buzz":  social_summary if social_boost > 0 else None,
+        }
 
     scores = []
     with ThreadPoolExecutor(max_workers=5) as ex:
@@ -2183,6 +2337,11 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
                     log.info(f"[{label}] Skip {symbol} — spread {spread*100:.3f}% "
                              f"> {spread_limit*100:.1f}%")
                     return None
+                # Note 4 — feed real spread back into dead-coin tracking.
+                # open_position is called after scanner scoring, so this is the
+                # most accurate spread data we'll ever have for this symbol.
+                strategy_key = "SCALPER" if label in ("SCALPER", "TRINITY") else "MOONSHOT"
+                check_dead_coin(symbol, 0.0, spread, strategy_key)
         except Exception:
             pass  # spread check is advisory — don't block on error
 
@@ -2271,6 +2430,13 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         # ATR-based trail width — set at entry from scorer, persisted across restarts.
         # check_exit uses this instead of the static SCALPER_TRAIL_PCT constant.
         "trail_pct":      opp.get("trail_pct", SCALPER_TRAIL_PCT) if label == "SCALPER" else None,
+        # ATR% at entry — stored so check_exit can compute ATR-stepped trail tiers
+        # without re-fetching klines. Defaults to trail_pct as a safe fallback.
+        # Stored for ALL labels: Moonshot/Trinity use it for the wide-trail threshold.
+        "atr_pct":        opp.get("atr_pct") if opp.get("atr_pct") else (
+                              opp.get("trail_pct", SCALPER_TRAIL_PCT) if label == "SCALPER"
+                              else actual_sl * 0.5  # conservative proxy: half the SL width
+                          ),
         # High-confidence scalper trades get fast breakeven: SL moves to entry at +1.5%
         # Moonshot trades get breakeven at +4% — prevents giving back gains before partial TP
         # Trinity trades get breakeven at +1% — tight, liquid, small moves matter
@@ -2281,17 +2447,21 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
                            else TRINITY_BREAKEVEN_ACT if label == "TRINITY"
                            else None),
         "breakeven_done": False,   # flips True once SL has been moved to entry
-        # ── Partial TP (MOONSHOT / REVERSAL only) ─────────────
-        # Stage 1: sell partial_tp_ratio of qty at partial_tp_price.
-        # After stage 1: sl_price moves to entry (remainder is risk-free),
-        # qty and budget_used updated to reflect remaining position.
+        # ── Partial TP (MOONSHOT / REVERSAL / high-score SCALPER) ──
+        # Stage 1: sell partial_tp_ratio at partial_tp_price.
+        # After stage 1: sl_price → entry (risk-free), qty/budget_used reduced.
+        # Note 11: high-score scalper trades sell 30% at the normal TP price;
+        # the remaining 70% rides a wider 2×ATR trailing stop with no hard cap.
         "partial_tp_price": (
+            tp_price  # SCALPER: partial fires at the same TP level already on the exchange
+            if (label == "SCALPER" and opp.get("score", 0) >= SCALPER_PARTIAL_TP_SCORE) else
             round_price_to_tick(actual_entry * (1 + MOONSHOT_PARTIAL_TP_PCT), tick_size)
             if label == "MOONSHOT" else
             round_price_to_tick(actual_entry * (1 + REVERSAL_PARTIAL_TP_PCT), tick_size)
             if label == "REVERSAL" else None
         ),
         "partial_tp_ratio": (
+            SCALPER_PARTIAL_TP_RATIO  if (label == "SCALPER" and opp.get("score", 0) >= SCALPER_PARTIAL_TP_SCORE) else
             MOONSHOT_PARTIAL_TP_RATIO if label == "MOONSHOT" else
             REVERSAL_PARTIAL_TP_RATIO if label == "REVERSAL" else None
         ),
@@ -2321,6 +2491,9 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     social_line = f"Social:      🔥 +{opp['social_boost']:.0f}pts — {social_buzz}\n" \
                   if social_buzz else ""
 
+    keltner_line = (f"Keltner:     ✅ breakout confirmed (+{opp.get('keltner_bonus',0):.0f}pts)\n"
+                    if opp.get("keltner_bonus") else "")
+
     if label == "SCALPER" and tp_label:
         tp_display = (f"Take profit: <b>${tp_price:.6f}</b>  (+{used_tp_pct*100:.1f}%)"
                       f"  <i>[{tp_label}]</i>\n")
@@ -2347,6 +2520,14 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         partial_tp_line = (f"Partial TP:  {ratio_pct:.0f}% @ "
                            f"<b>${trade['partial_tp_price']:.6f}</b>"
                            f"  (+{partial_pct:.1f}%) → SL → entry\n")
+    elif trade.get("partial_tp_price") and label == "SCALPER":
+        # Note 11 — high-score scalper partial TP
+        ratio_pct   = (trade["partial_tp_ratio"] or 0.3) * 100
+        partial_pct = (trade["partial_tp_price"] / actual_entry - 1) * 100
+        trail_wide  = round(opp.get("atr_pct", SCALPER_TRAIL_PCT) * SCALPER_PARTIAL_TP_TRAIL_MULT * 100, 1)
+        partial_tp_line = (f"Partial TP:  {ratio_pct:.0f}% @ "
+                           f"<b>${trade['partial_tp_price']:.6f}</b>"
+                           f"  (+{partial_pct:.1f}%) → {trail_wide}% ATR trail (no cap)\n")
 
     log.info(f"{icon} [{label}] Opened {symbol} | ${actual_cost:.2f} | "
              f"Entry: {actual_entry:.6f} | TP: {tp_price:.6f} (+{used_tp_pct*100:.1f}%) | "
@@ -2360,6 +2541,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         f"{slippage_line}"
         f"{sentiment_line}"
         f"{social_line}"
+        f"{keltner_line}"
         f"{tp_display}"
         f"{sl_display}"
         f"{partial_tp_line}"
@@ -2368,6 +2550,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         f"{tp_status}\n"
         f"Score: {opp.get('score',0)}"
         + (f" 🔥 (confluence +{opp.get('confluence_bonus',0):.0f})" if opp.get('confluence_bonus') else "")
+        + (f" 📐 (keltner +{opp.get('keltner_bonus',0):.0f})" if opp.get('keltner_bonus') else "")
         + f" | RSI: {opp.get('rsi','?')} ({opp.get('rsi_delta',0):+.1f}) | Vol: {opp.get('vol_ratio','?')}x"
         + (f" | Trail: {opp.get('trail_pct', SCALPER_TRAIL_PCT)*100:.1f}%" if label == "SCALPER" else "")
     )
@@ -2449,6 +2632,23 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
     # MOONSHOT after partial TP: trailing stop — uncapped upside, ride the wave
     # MOONSHOT before partial TP / REVERSAL: price polling against fixed tp_price
     if label == "SCALPER":
+        # ── Note 11 — High-score partial TP ───────────────────
+        # For score ≥ SCALPER_PARTIAL_TP_SCORE, the exchange TP limit order sells
+        # 30% when price hits tp_price.  We detect the fill the same way as a normal
+        # TAKE_PROFIT (limit order disappears) but instead of closing, we:
+        #   • mark partial_tp_hit = True
+        #   • move SL to entry (risk-free remainder)
+        #   • widen trail to 2×ATR — no hard cap
+        if (trade.get("partial_tp_price")
+                and not trade.get("partial_tp_hit")
+                and price >= trade["partial_tp_price"]):
+            # Check if the exchange TP limit has been (partially) filled.
+            # For paper trade or if no order, trigger immediately on price.
+            if PAPER_TRADE or not tp_order_id or tp_order_id not in get_open_order_ids(symbol):
+                log.info(f"🎯½ [SCALPER] Partial TP triggered: {symbol} | {pct:+.2f}%")
+                return True, "PARTIAL_TP"
+
+        # ── TP: limit order check (normal full close, post-partial path) ─
         if not PAPER_TRADE and tp_order_id:
             if tp_order_id not in get_open_order_ids(symbol):
                 if price >= trade["tp_price"] * 0.995:
@@ -2464,12 +2664,84 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
                 log.info(f"🎯 [{label}] TP: {symbol} | +{pct:.2f}%")
                 return True, "TAKE_PROFIT"
 
+        # ── Note 2 — ATR-stepped trailing stop ────────────────
+        # Entry ATR stored in trade["atr_pct"]; fall back to trail_pct if missing
+        # (handles trades opened before this upgrade).
+        atr_pct   = trade.get("atr_pct") or trade.get("trail_pct") or SCALPER_TRAIL_PCT
+        # Use highest_price for tier determination — the tier should be based on the
+        # peak the trade reached, not the current (potentially pulled-back) price.
+        # A trade that ran +10% and pulled back to +6.7% should still be on the wide tier2
+        # trail, not snap back to the tight tier1 trail mid-move.
+        peak_profit = (trade["highest_price"] / trade["entry_price"] - 1)
+        profit_pct  = (price / trade["entry_price"] - 1)  # used for post-partial check only
+
+        # Tier 2: peak has run ≥ SCALPER_TRAIL_TIER2_THRESH × ATR — widen trail
+        # to give parabolic moves room.  Tier 2 overrides tier 1 when active.
+        if peak_profit >= atr_pct * SCALPER_TRAIL_TIER2_THRESH:
+            active_trail = atr_pct * SCALPER_TRAIL_ATR_TIER2
+            tier_label   = f"tier2 {active_trail*100:.1f}%"
+        # Tier 1: peak has run ≥ SCALPER_TRAIL_ATR_ACTIVATE × ATR — activate trail
+        elif peak_profit >= atr_pct * SCALPER_TRAIL_ATR_ACTIVATE:
+            active_trail = atr_pct * SCALPER_TRAIL_ATR_TIER1
+            tier_label   = f"tier1 {active_trail*100:.1f}%"
+        else:
+            active_trail = None  # below activation threshold — no ATR trail yet
+            tier_label   = ""
+
+        # After partial TP the remainder uses the wider 2×ATR trail regardless of tier
+        if trade.get("partial_tp_hit"):
+            active_trail = atr_pct * SCALPER_PARTIAL_TP_TRAIL_MULT
+            tier_label   = f"post-partial {active_trail*100:.1f}%"
+
+        # Also honour the legacy fixed-pct trail as a minimum floor when ATR trail
+        # is active — ensures we never widen beyond what the user originally tuned.
+        if active_trail is not None:
+            # Clamp: never narrower than tier-1 floor, never wider than tier-2 ceiling
+            active_trail = min(SCALPER_TRAIL_MAX,
+                               max(SCALPER_TRAIL_MIN, active_trail))
+            if price <= trade["highest_price"] * (1 - active_trail):
+                log.info(f"📉 [{label}] ATR trail stop ({tier_label}): {symbol} | {pct:+.2f}%")
+                if not PAPER_TRADE and tp_order_id:
+                    cancel_order(symbol, tp_order_id, label)
+                return True, "TRAILING_STOP"
+        else:
+            # Below ATR activation — fall back to the original static trail if it was
+            # already active (i.e. trade crossed +SCALPER_TRAIL_ACT before ATR logic
+            # existed).  Keeps backward-compat for bot restarts mid-trade.
+            trail_pct = trade.get("trail_pct") or SCALPER_TRAIL_PCT
+            if trade["highest_price"] >= trade["entry_price"] * (1 + SCALPER_TRAIL_ACT):
+                if price <= trade["highest_price"] * (1 - trail_pct):
+                    log.info(f"📉 [{label}] Trailing stop (legacy {trail_pct*100:.1f}%): "
+                             f"{symbol} | {pct:+.2f}%")
+                    if not PAPER_TRADE and tp_order_id:
+                        cancel_order(symbol, tp_order_id, label)
+                    return True, "TRAILING_STOP"
+
+        if held_min >= SCALPER_FLAT_MINS and abs(pct) <= SCALPER_FLAT_RANGE * 100:
+            log.info(f"😴 [{label}] Flat exit: {symbol} | {pct:+.2f}%")
+            if not PAPER_TRADE and tp_order_id:
+                cancel_order(symbol, tp_order_id, label)
+            return True, "FLAT_EXIT"
+
+        if best_score > 0 and pct < SCALPER_TRAIL_ACT * 100:
+            if (best_score - trade.get("score", 0)) >= SCALPER_ROTATE_GAP:
+                log.info(f"🔀 [{label}] Rotation: {symbol} | {pct:+.2f}%")
+                if not PAPER_TRADE and tp_order_id:
+                    cancel_order(symbol, tp_order_id, label)
+                return True, "ROTATION"
+
     elif label == "MOONSHOT" and trade.get("partial_tp_hit"):
         # After partial TP: trailing stop on remainder — no fixed target, ride the move.
-        # Trails MOONSHOT_TRAIL_PCT below highest price seen since entry.
-        trail_sl = trade["highest_price"] * (1 - MOONSHOT_TRAIL_PCT)
+        # Note 2: widen trail to MOONSHOT_TRAIL_ATR_WIDE if profit ≥ 4×ATR.
+        atr_pct     = trade.get("atr_pct") or MOONSHOT_SL * 0.5  # rough proxy if not stored
+        peak_profit = (trade["highest_price"] / trade["entry_price"] - 1)
+        profit_pct  = (price / trade["entry_price"] - 1)
+        trail_pct   = (MOONSHOT_TRAIL_ATR_WIDE
+                       if peak_profit >= atr_pct * MOONSHOT_TRAIL_WIDE_THRESH
+                       else MOONSHOT_TRAIL_PCT)
+        trail_sl   = trade["highest_price"] * (1 - trail_pct)
         if price <= trail_sl:
-            log.info(f"📉 [{label}] Trail stop: {symbol} | {pct:+.2f}% | "
+            log.info(f"📉 [{label}] Trail stop ({trail_pct*100:.0f}%): {symbol} | {pct:+.2f}% | "
                      f"high {((trade['highest_price']/trade['entry_price'])-1)*100:.1f}%")
             return True, "TRAILING_STOP"
 
@@ -2517,32 +2789,6 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             log.info(f"🔒 [{label}] Breakeven locked: {symbol} | {pct:+.2f}% | "
                      f"SL moved to entry ${trade['entry_price']:.6f}")
 
-    if label == "SCALPER":
-        # ── Trailing stop ─────────────────────────────────────────
-        # trail_pct is computed at entry from ATR — wider on volatile coins,
-        # tighter on calm ones. Falls back to static constant for old trades.
-        trail_pct = trade.get("trail_pct") or SCALPER_TRAIL_PCT
-        if trade["highest_price"] >= trade["entry_price"] * (1 + SCALPER_TRAIL_ACT):
-            if price <= trade["highest_price"] * (1 - trail_pct):
-                log.info(f"📉 [{label}] Trailing stop: {symbol} | {pct:+.2f}% "
-                         f"(trail {trail_pct*100:.1f}%)")
-                if not PAPER_TRADE and tp_order_id:
-                    cancel_order(symbol, tp_order_id, label)
-                return True, "TRAILING_STOP"
-
-        if held_min >= SCALPER_FLAT_MINS and abs(pct) <= SCALPER_FLAT_RANGE * 100:
-            log.info(f"😴 [{label}] Flat exit: {symbol} | {pct:+.2f}%")
-            if not PAPER_TRADE and tp_order_id:
-                cancel_order(symbol, tp_order_id, label)
-            return True, "FLAT_EXIT"
-
-        if best_score > 0 and pct < SCALPER_TRAIL_ACT * 100:
-            if (best_score - trade.get("score", 0)) >= SCALPER_ROTATE_GAP:
-                log.info(f"🔀 [{label}] Rotation: {symbol} | {pct:+.2f}%")
-                if not PAPER_TRADE and tp_order_id:
-                    cancel_order(symbol, tp_order_id, label)
-                return True, "ROTATION"
-
     log.info(f"👀 [{label}] {symbol} | {pct:+.2f}% | {held_min:.0f}min | "
              f"High: {((trade['highest_price']/trade['entry_price'])-1)*100:.2f}%")
     return False, ""
@@ -2589,6 +2835,14 @@ def execute_partial_tp(trade) -> bool:
     partial_sell_id  = None
     partial_sold_at_ms = int(time.time() * 1000)  # record before sell for fill query
     if not PAPER_TRADE:
+        # ── For SCALPER: cancel the full-qty TP limit before selling partial ──
+        # The limit order was placed for 100% of qty. After selling partial_qty at
+        # market we only hold remaining_qty, so the old limit would over-sell.
+        # Cancel it now; re-place for remaining_qty after the partial fill.
+        if label == "SCALPER" and trade.get("tp_order_id"):
+            cancel_order(symbol, trade["tp_order_id"], label)
+            trade["tp_order_id"] = None
+
         try:
             result = private_post("/api/v3/order", {
                 "symbol": symbol, "side": "SELL",
@@ -2655,6 +2909,19 @@ def execute_partial_tp(trade) -> bool:
     trade["partial_tp_hit"]    = True
     # close_position uses this as bought_at_ms so fill query only sees remaining fills
     trade["bought_at_ms"]      = partial_sold_at_ms
+
+    # ── SCALPER: re-place TP limit for remaining qty ──────────────────
+    # The original limit was cancelled above. Place a new one at the same
+    # tp_price but sized for remaining_qty — exchange now monitors the tail.
+    if label == "SCALPER" and not PAPER_TRADE and remaining_qty > 0:
+        _, _, _, tick_size = get_symbol_rules(symbol)
+        new_tp_id = place_limit_sell(symbol, remaining_qty, trade["tp_price"],
+                                     label, tag="TP_REMAINDER")
+        trade["tp_order_id"] = new_tp_id
+        if new_tp_id:
+            log.info(f"[SCALPER] Re-placed TP limit for {remaining_qty} @ ${trade['tp_price']:.6f}")
+        else:
+            log.warning(f"[SCALPER] TP re-place failed for {symbol} — remainder monitored by bot")
 
     # Save immediately after mutation — minimises the crash window between
     # "sell confirmed on exchange" and "state reflects reduced position"
@@ -3686,7 +3953,8 @@ def startup() -> float:
     send the startup Telegram message. Returns startup_balance.
     """
     global scalper_trades, alt_trades, trade_history, _consecutive_losses, \
-           _win_rate_pause_until, _scalper_excluded, _alt_excluded, _api_blacklist
+           _win_rate_pause_until, _scalper_excluded, _alt_excluded, _api_blacklist, \
+           _liquidity_blacklist, _liquidity_fail_count
 
     mode = "📝 PAPER TRADING" if PAPER_TRADE else "💰 LIVE TRADING"
     log.info(f"🚀 MEXC Bot — {mode}")
@@ -3695,7 +3963,8 @@ def startup() -> float:
 
     (scalper_trades, alt_trades, trade_history,
      _consecutive_losses, _win_rate_pause_until, _streak_paused_at,
-     _paused, _scalper_excluded, _alt_excluded, _api_blacklist) = load_state()
+     _paused, _scalper_excluded, _alt_excluded, _api_blacklist,
+     _liquidity_blacklist, _liquidity_fail_count) = load_state()
 
     if _paused:
         log.info("⏸️  Bot restored in PAUSED state — send /resume to restart scanning")
@@ -3987,20 +4256,27 @@ def run():
 
                     should_exit, reason = check_exit(trade, best_score=s_arg)
                     if should_exit:
-                        if reason in ("STOP_LOSS", "TRAILING_STOP", "FLAT_EXIT", "TIMEOUT"):
+                        if reason == "PARTIAL_TP":
+                            # Note 11 — sell 30%, remainder rides wider ATR trail
+                            execute_partial_tp(trade)
+                            # Trade stays live — do NOT remove from scalper_trades
+                        elif reason in ("STOP_LOSS", "TRAILING_STOP", "FLAT_EXIT", "TIMEOUT"):
                             _scalper_excluded[trade["symbol"]] = (
                                 time.time() + SCALPER_SYMBOL_COOLDOWN
                             )
                             log.info(f"⏳ [SCALPER] {trade['symbol']} in cooldown "
                                      f"for {SCALPER_SYMBOL_COOLDOWN//60}min after {reason}")
-                        if close_position(trade, reason):
-                            scalper_trades.remove(trade)
-                            if reason == "ROTATION" and best_opp:
-                                rot_budget, rot_pre_tp, rot_pre_sl, _, _ = calc_risk_budget(best_opp, balance)
-                                new_t = open_position(best_opp, rot_budget, rot_pre_tp, rot_pre_sl, "SCALPER")
-                                if new_t:
-                                    scalper_trades.append(new_t)
-                                    _scalper_excluded.pop(best_opp["symbol"], None)
+                            if close_position(trade, reason):
+                                scalper_trades.remove(trade)
+                        else:
+                            if close_position(trade, reason):
+                                scalper_trades.remove(trade)
+                                if reason == "ROTATION" and best_opp:
+                                    rot_budget, rot_pre_tp, rot_pre_sl, _, _ = calc_risk_budget(best_opp, balance)
+                                    new_t = open_position(best_opp, rot_budget, rot_pre_tp, rot_pre_sl, "SCALPER")
+                                    if new_t:
+                                        scalper_trades.append(new_t)
+                                        _scalper_excluded.pop(best_opp["symbol"], None)
 
             # ── Alt (Trinity / Moonshot / Reversal) ──────────────
             if not _paused and len(alt_trades) < ALT_MAX_TRADES:
