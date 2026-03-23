@@ -3679,26 +3679,42 @@ def _cmd_metrics(balance: float):
 
 
 def _cmd_config():
+    # Dead coin blacklist summary
+    now_ts      = time.time()
+    dead_active = sum(1 for v in _liquidity_blacklist.values() if v > now_ts)
+    dead_pending= sum(1 for v in _liquidity_fail_count.values() if v > 0)
+
     telegram(
         f"⚙️ <b>Current Config</b>\n━━━━━━━━━━━━━━━\n"
         f"🟢 <b>Scalper</b>\n"
-        f"  Max: {SCALPER_MAX_TRADES} × {SCALPER_BUDGET_PCT*100:.0f}%\n"
+        f"  Max: {SCALPER_MAX_TRADES} × {SCALPER_BUDGET_PCT*100:.0f}% cap | 1% risk/trade\n"
         f"  TP: dynamic {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% (signal-aware, candle-capped)\n"
         f"  SL: dynamic {SCALPER_SL_MIN*100:.1f}–{SCALPER_SL_MAX*100:.0f}% (noise-floored)\n"
-        f"  Trail: +{SCALPER_TRAIL_ACT*100:.0f}% → {SCALPER_TRAIL_PCT*100:.1f}%\n"
+        f"  Trail: ATR-stepped\n"
+        f"    Tier 1 (+{SCALPER_TRAIL_ATR_ACTIVATE:.0f}×ATR): trail {SCALPER_TRAIL_ATR_TIER1:.0f}×ATR behind high\n"
+        f"    Tier 2 (+{SCALPER_TRAIL_TIER2_THRESH:.0f}×ATR): trail {SCALPER_TRAIL_ATR_TIER2:.0f}×ATR (wider on runners)\n"
+        f"  Breakeven: score ≥{SCALPER_BREAKEVEN_SCORE} → lock at +{SCALPER_BREAKEVEN_ACT*100:.1f}%\n"
+        f"  Partial TP: score ≥{SCALPER_PARTIAL_TP_SCORE} → sell {SCALPER_PARTIAL_TP_RATIO*100:.0f}% at TP, remainder rides {SCALPER_PARTIAL_TP_TRAIL_MULT:.0f}×ATR trail\n"
+        f"  Keltner: close > hl2+{KELTNER_ATR_MULT:.0f}×ATR → +{KELTNER_SCORE_BONUS:.0f}pts bonus\n"
         f"  Watchlist: {len(_watchlist)} pairs | age: {(time.time()-_watchlist_at)/60:.0f}min\n"
         f"\n🌙 <b>Moonshot</b>  [bot-monitored]\n"
-        f"  Max: {ALT_MAX_TRADES} trades | Min budget: max($2, {MOONSHOT_BUDGET_PCT*100:.0f}% of balance)\n"
-        f"  SL: -{MOONSHOT_SL*100:.0f}%  Max: {MOONSHOT_TIMEOUT_MAX_MINS}min (no limit after partial TP)\n"
-        f"  Partial TP: {MOONSHOT_PARTIAL_TP_RATIO*100:.0f}% sold at +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% → trail {MOONSHOT_TRAIL_PCT*100:.0f}% stop\n"
+        f"  Max: {ALT_MAX_TRADES} trades | Budget: max($2, {MOONSHOT_BUDGET_PCT*100:.0f}% of balance)\n"
+        f"  SL: -{MOONSHOT_SL*100:.0f}% | Breakeven: +{MOONSHOT_BREAKEVEN_ACT*100:.0f}%\n"
+        f"  Partial TP: {MOONSHOT_PARTIAL_TP_RATIO*100:.0f}% sold at +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}%\n"
+        f"  Trail after partial: {MOONSHOT_TRAIL_PCT*100:.0f}% (widens to {MOONSHOT_TRAIL_ATR_WIDE*100:.0f}% once +{MOONSHOT_TRAIL_WIDE_THRESH:.0f}×ATR)\n"
+        f"  Timeout: flat {MOONSHOT_TIMEOUT_FLAT_MINS}min | marginal {MOONSHOT_TIMEOUT_MARGINAL_MINS}min | hard {MOONSHOT_TIMEOUT_MAX_MINS}min\n"
         f"\n🔱 <b>Trinity</b>  [exchange TP + bot SL]\n"
         f"  Pairs: {', '.join(s.replace('USDT','') for s in TRINITY_SYMBOLS)} | Budget: {TRINITY_BUDGET_PCT*100:.0f}% of total\n"
         f"  Entry: 4h drop ≥{TRINITY_DROP_PCT*100:.0f}% | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | vol ≥{TRINITY_VOL_BURST:.1f}× | green candle\n"
         f"  TP: {TRINITY_TP_ATR_MULT}×ATR | SL: {TRINITY_SL_ATR_MULT}×ATR (cap {TRINITY_SL_MAX*100:.1f}%) | Max: {TRINITY_MAX_HOURS}h\n"
         f"\n🔄 <b>Reversal</b>  [bot-monitored]\n"
-        f"  TP: +{REVERSAL_TP*100:.1f}%  SL: cap-candle anchor  Max: {REVERSAL_MAX_HOURS}h\n"
+        f"  TP: +{REVERSAL_TP*100:.1f}% | SL: cap-candle anchor | Max: {REVERSAL_MAX_HOURS}h\n"
         f"  Partial TP: {REVERSAL_PARTIAL_TP_RATIO*100:.0f}% sold at +{REVERSAL_PARTIAL_TP_PCT*100:.1f}% → SL moves to entry\n"
-        f"\n🧠 Sentiment: {'✅ on (web search)' if SENTIMENT_ENABLED and WEB_SEARCH_ENABLED else '✅ on (no web search — /ask + journal only)' if SENTIMENT_ENABLED else '⚠️ off'}\n"
+        f"\n☠️ <b>Dead Coins</b>\n"
+        f"  Scalper floor: ${DEAD_COIN_VOL_SCALPER:,.0f} vol | Moonshot floor: ${DEAD_COIN_VOL_MOONSHOT:,.0f} vol\n"
+        f"  Spread cap: {DEAD_COIN_SPREAD_MAX*100:.1f}% | {DEAD_COIN_CONSECUTIVE} fails → {DEAD_COIN_BLACKLIST_HOURS}h blacklist\n"
+        f"  Active blacklist: {dead_active} symbols | Pending ({dead_pending} with strikes)\n"
+        f"\n🧠 <b>Sentiment</b>: {'✅ on (web search)' if SENTIMENT_ENABLED and WEB_SEARCH_ENABLED else '✅ on (no web search — /ask + journal only)' if SENTIMENT_ENABLED else '⚠️ off'}\n"
         f"\n{'⏸️ PAUSED' if _paused else '▶️ RUNNING'}"
     )
 
