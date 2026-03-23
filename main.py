@@ -98,6 +98,9 @@ MOONSHOT_MIN_DAYS   = 2
 MOONSHOT_NEW_DAYS   = 14
 MOONSHOT_MIN_VOL_BURST = 2.5
 MOONSHOT_MIN_VOL_RATIO = float(os.getenv("MOONSHOT_MIN_VOL_RATIO", "1.2"))  # require ≥ avg volume
+MOONSHOT_MIN_1H_VOL    = int(os.getenv("MOONSHOT_MIN_1H_VOL",   "10000"))  # min $10k in last hour — catches dead 24h vol
+MOONSHOT_VOL_DIVISOR   = float(os.getenv("MOONSHOT_VOL_DIVISOR", "500000")) # vol-weighted sizing: budget_pct = min(3%, 24h_vol / divisor)
+                                                                              # $500k vol → 1%, $1.5M → 3% (capped)
 
 # ── Moonshot graduated timeout ─────────────────────────────────
 # Hard clock replaced with P&L-aware timeouts:
@@ -1476,6 +1479,15 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
             vol_score = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
             if vol_ratio < MOONSHOT_MIN_VOL_RATIO:
                 return None  # below average volume — no momentum
+            # Recent 1h liquidity check — mirrors SCALPER_MIN_1H_VOL.
+            # A coin can have $200k 24h volume but $190k happened 18h ago.
+            # Candle count depends on interval: 4×15m = 1h, 1×60m = 1h.
+            recent_candles = 1 if is_new else 4  # 60m interval for new listings, 15m otherwise
+            recent_1h_vol = float(volume.iloc[-recent_candles:].sum()) * float(close.iloc[-1])
+            if recent_1h_vol < MOONSHOT_MIN_1H_VOL:
+                log.debug(f"[MOONSHOT] Skip {sym} — dead recently "
+                          f"(1h vol ${recent_1h_vol:,.0f} < ${MOONSHOT_MIN_1H_VOL:,})")
+                return None
             score     = rsi_score + ma_score + vol_score
             if score < MOONSHOT_MIN_SCORE:
                 return None
@@ -1499,6 +1511,7 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
                 "rsi":          round(rsi, 2),
                 "rsi_delta":    round(rsi_delta, 2),
                 "vol_ratio":    round(vol_ratio, 2),
+                "vol_1h_usdt":  round(recent_1h_vol, 0),
                 "price":        float(close.iloc[-1]),
                 "_df":          df_k,
                 "_is_new":      is_new,
@@ -3690,12 +3703,25 @@ def run():
                                                     exclude=_alt_excluded,
                                                     open_symbols=open_symbols)
                     if opp:
+                        # Volume-weighted position sizing — thin books get smaller positions.
+                        # Scales linearly: $500k vol → 1%, $1.5M → full 3% (capped).
+                        ticker_row = tickers[tickers["symbol"] == opp["symbol"]]
+                        if not ticker_row.empty:
+                            vol_24h = float(ticker_row["quoteVolume"].iloc[0])
+                            vol_pct = min(MOONSHOT_BUDGET_PCT, vol_24h / MOONSHOT_VOL_DIVISOR)
+                        else:
+                            vol_24h = None
+                            vol_pct = MOONSHOT_BUDGET_PCT  # ticker missing — use full budget, don't penalise
+                        budget     = max(min_alt, min(round(total_value * vol_pct, 2), balance))
+                        if vol_pct < MOONSHOT_BUDGET_PCT and vol_24h is not None:
+                            log.info(f"💰 [MOONSHOT] Vol-weighted: "
+                                     f"{vol_pct*100:.1f}% (24h vol ${vol_24h:,.0f}) → ${budget:.2f}")
                         trade = open_position(opp, budget, MOONSHOT_TP_INITIAL, MOONSHOT_SL,
                                               "MOONSHOT", max_hours=MOONSHOT_MAX_HOURS)
                         if trade:
                             alt_trades.append(trade); _alt_excluded = set()
                         else:
-                            _alt_excluded.discard(opp["symbol"])  # don't permanently exclude on failed open
+                            _alt_excluded.discard(opp["symbol"])
                     else:
                         opp = find_reversal_opportunity(tickers, budget,
                                                         exclude=_alt_excluded,
