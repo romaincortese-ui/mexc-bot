@@ -140,7 +140,21 @@ REVERSAL_CAP_SL_BUFFER   = 0.005  # place SL 0.5% below capitulation candle low
 REVERSAL_PARTIAL_TP_PCT  = 0.025  # sell first half at +2.5%
 REVERSAL_PARTIAL_TP_RATIO= 0.50   # fraction to sell at stage 1 (50%)
 
-# ── Shared ────────────────────────────────────────────────────
+# ── Trinity ───────────────────────────────────────────────────
+# Counter-trend recovery play on BTC/ETH/SOL only.
+# Deep liquidity → exchange TP limit order, tight spreads, no slippage risk.
+TRINITY_SYMBOLS       = ["SOLUSDT", "ETHUSDT", "BTCUSDT"]  # priority: fastest rebounders first
+TRINITY_BUDGET_PCT    = float(os.getenv("TRINITY_BUDGET_PCT",   "0.05"))   # 5% of total_value
+TRINITY_DROP_PCT      = float(os.getenv("TRINITY_DROP_PCT",     "0.03"))   # min 3% drop in last 4h
+TRINITY_MIN_RSI       = float(os.getenv("TRINITY_MIN_RSI",      "28"))     # oversold floor
+TRINITY_MAX_RSI       = float(os.getenv("TRINITY_MAX_RSI",      "42"))     # not just dipping
+TRINITY_TP_ATR_MULT   = float(os.getenv("TRINITY_TP_ATR_MULT",  "1.8"))   # TP = 1.8 × ATR
+TRINITY_SL_ATR_MULT   = float(os.getenv("TRINITY_SL_ATR_MULT",  "1.0"))   # SL = 1.0 × ATR
+TRINITY_SL_MAX        = float(os.getenv("TRINITY_SL_MAX",       "0.025"))  # SL capped at 2.5%
+TRINITY_TP_MIN        = float(os.getenv("TRINITY_TP_MIN",       "0.008"))  # TP floor (covers fees)
+TRINITY_MAX_HOURS     = int(os.getenv("TRINITY_MAX_HOURS",      "4"))
+TRINITY_VOL_BURST     = float(os.getenv("TRINITY_VOL_BURST",    "1.5"))    # entry candle vol ≥ 1.5× avg
+TRINITY_BREAKEVEN_ACT = float(os.getenv("TRINITY_BREAKEVEN_ACT","0.01"))   # lock SL to entry at +1%
 MIN_PRICE         = 0.001
 SCAN_INTERVAL     = 60
 STATE_FILE        = "state.json"  # persists open positions + history across restarts
@@ -1740,7 +1754,101 @@ def find_reversal_opportunity(tickers: pd.DataFrame, budget: float,
 
     return pick_tradeable(tradeable, budget, "REVERSAL")
 
-# ── Order execution ────────────────────────────────────────────
+
+# ── Scanner: Trinity ───────────────────────────────────────────
+
+def evaluate_trinity_candidate(sym: str) -> dict | None:
+    """
+    Evaluate a single BTC/ETH/SOL symbol for a Trinity recovery entry.
+
+    Conditions (ALL required):
+    1. Price down ≥ TRINITY_DROP_PCT in last 4h (16 × 15m candles)
+    2. RSI between TRINITY_MIN_RSI and TRINITY_MAX_RSI (oversold, not freefalling)
+    3. Price stabilising — last candle's close ≥ last candle's open (green candle)
+    4. Entry candle volume spike ≥ TRINITY_VOL_BURST × 20-candle avg (buyers confirming)
+
+    Returns opp dict with ATR-based TP/SL if all conditions pass, else None.
+    """
+    # 80 × 15m = 20h of data — enough for ATR(14) warmup + 4h drop check
+    df = parse_klines(sym, interval="15m", limit=80, min_len=30)
+    if df is None:
+        return None
+
+    close  = df["close"]
+    volume = df["volume"]
+    opens  = df["open"]
+
+    # ── 1. 4h drop check ──────────────────────────────────────
+    price_now  = float(close.iloc[-1])
+    price_4h   = float(close.iloc[-17])  # 16 candles back = 4h on 15m chart
+    drop_pct   = (price_4h - price_now) / price_4h
+    if drop_pct < TRINITY_DROP_PCT:
+        return None  # hasn't dropped enough to be interesting
+
+    # ── 2. RSI filter ─────────────────────────────────────────
+    rsi = calc_rsi(close)
+    if np.isnan(rsi) or not (TRINITY_MIN_RSI <= rsi <= TRINITY_MAX_RSI):
+        return None  # not in oversold recovery zone
+
+    # ── 3. Stabilising — entry candle must be green ───────────
+    if float(close.iloc[-1]) < float(opens.iloc[-1]):
+        return None  # still red — wait for buyers
+
+    # ── 4. Volume spike on entry candle ───────────────────────
+    avg_vol   = float(volume.iloc[-21:-1].mean())
+    curr_vol  = float(volume.iloc[-1])
+    vol_burst = (curr_vol / avg_vol) if avg_vol > 0 else 1.0
+    if vol_burst < TRINITY_VOL_BURST:
+        return None  # no volume confirmation — buyers not stepping in yet
+
+    # ── ATR-based TP/SL ───────────────────────────────────────
+    atr     = calc_atr(df, period=14)
+    atr_pct = atr / price_now if price_now > 0 else 0.01
+
+    tp_pct = max(TRINITY_TP_MIN, atr_pct * TRINITY_TP_ATR_MULT)
+    sl_pct = min(TRINITY_SL_MAX, atr_pct * TRINITY_SL_ATR_MULT)
+    # Ensure R:R is at least 1.5:1 — if SL too wide, skip
+    if sl_pct > 0 and tp_pct / sl_pct < 1.5:
+        tp_pct = sl_pct * 1.8  # enforce minimum R:R
+
+    log.info(f"⚡ [TRINITY] {sym} | drop {drop_pct*100:.1f}% | RSI {rsi:.0f} | "
+             f"vol {vol_burst:.1f}× | TP +{tp_pct*100:.2f}% SL -{sl_pct*100:.2f}% "
+             f"R:R {tp_pct/sl_pct:.1f}:1")
+
+    return {
+        "symbol":   sym,
+        "price":    price_now,
+        "rsi":      round(rsi, 2),
+        "vol_ratio":round(vol_burst, 2),
+        "atr_pct":  round(atr_pct, 6),
+        "tp_pct":   round(tp_pct, 6),
+        "sl_pct":   round(sl_pct, 6),
+        "drop_pct": round(drop_pct * 100, 2),
+    }
+
+
+def find_trinity_opportunity(balance: float,
+                              exclude: set, open_symbols: set) -> dict | None:
+    """
+    Scan BTC/ETH/SOL for a Trinity recovery entry.
+    Returns the first qualifying candidate in priority order (SOL > ETH > BTC).
+    Max one Trinity trade at a time — enforced by the caller checking alt_trades.
+    """
+    # Skip if a Trinity trade is already open
+    if any(t.get("label") == "TRINITY" for t in alt_trades):
+        return None
+
+    for sym in TRINITY_SYMBOLS:
+        if sym in open_symbols or sym in exclude or sym in _api_blacklist:
+            continue
+        opp = evaluate_trinity_candidate(sym)
+        if opp:
+            scanner_log(f"⚡ TRINITY: {sym} down {opp['drop_pct']:.1f}% | "
+                        f"RSI {opp['rsi']:.0f} | vol {opp['vol_ratio']:.1f}× | "
+                        f"TP +{opp['tp_pct']*100:.2f}%")
+            return opp
+
+    return None
 
 def place_market_buy(symbol, qty, label=""):
     if PAPER_TRADE:
@@ -2060,8 +2168,8 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     # SCALPER: tight 0.4% threshold — small TP, spread eats the profit.
     # MOONSHOT: wider 0.8% threshold — larger TP absorbs more, but still filter thin markets.
     # Check is advisory — never blocks on error.
-    spread_limit = SCALPER_MAX_SPREAD if label == "SCALPER" else MOONSHOT_MAX_SPREAD
-    if label in ("SCALPER", "MOONSHOT") and not PAPER_TRADE:
+    spread_limit = SCALPER_MAX_SPREAD if label in ("SCALPER", "TRINITY") else MOONSHOT_MAX_SPREAD
+    if label in ("SCALPER", "MOONSHOT", "TRINITY") and not PAPER_TRADE:
         try:
             depth    = public_get("/api/v3/depth", {"symbol": symbol, "limit": 5})
             bids     = depth.get("bids", [])
@@ -2125,11 +2233,11 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
 
     sl_price = round(actual_entry * (1 - actual_sl), 8)
 
-    # ── KEY FIX: SCALPER gets exchange TP limit order ─────────
+    # ── KEY FIX: SCALPER + TRINITY get exchange TP limit order ──
     # MOONSHOT/REVERSAL: NO limit order — bot-monitored only.
-    # This eliminates the cancel+market sell race condition on thin markets
-    # that was causing positions to stay open and bleed losses.
-    if label == "SCALPER":
+    # TRINITY shares the scalper approach: deep liquidity on BTC/ETH/SOL means
+    # exchange limit orders fill reliably with no slippage risk.
+    if label in ("SCALPER", "TRINITY"):
         tp_order_id = place_limit_sell(symbol, qty, tp_price, label, tag="TP")
         if not PAPER_TRADE and not tp_order_id:
             log.warning(f"[{label}] TP limit failed — monitoring manually.")
@@ -2165,10 +2273,12 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         "trail_pct":      opp.get("trail_pct", SCALPER_TRAIL_PCT) if label == "SCALPER" else None,
         # High-confidence scalper trades get fast breakeven: SL moves to entry at +1.5%
         # Moonshot trades get breakeven at +4% — prevents giving back gains before partial TP
+        # Trinity trades get breakeven at +1% — tight, liquid, small moves matter
         "breakeven_act":  (SCALPER_BREAKEVEN_ACT if (
                                label == "SCALPER" and
                                opp.get("score", 0) >= SCALPER_BREAKEVEN_SCORE
                            ) else MOONSHOT_BREAKEVEN_ACT if label == "MOONSHOT"
+                           else TRINITY_BREAKEVEN_ACT if label == "TRINITY"
                            else None),
         "breakeven_done": False,   # flips True once SL has been moved to entry
         # ── Partial TP (MOONSHOT / REVERSAL only) ─────────────
@@ -2578,21 +2688,17 @@ def close_position(trade, reason) -> bool:
     symbol = trade["symbol"]
 
     # For MOONSHOT/REVERSAL: market sell on ALL exits including TAKE_PROFIT
-    # (no exchange limit order was placed, so we always need to sell manually)
-    # For SCALPER: TAKE_PROFIT is handled by exchange limit, others need market sell
+    # For SCALPER/TRINITY: TAKE_PROFIT is handled by exchange limit, others need market sell
     needs_sell = (
         (label in ("MOONSHOT", "REVERSAL")) or
-        (label == "SCALPER" and reason in ("STOP_LOSS","TRAILING_STOP","TIMEOUT","FLAT_EXIT","ROTATION","VOL_COLLAPSE"))
+        (label == "SCALPER" and reason in ("STOP_LOSS","TRAILING_STOP","TIMEOUT","FLAT_EXIT","ROTATION","VOL_COLLAPSE")) or
+        (label == "TRINITY" and reason in ("STOP_LOSS","TIMEOUT"))
     )
 
     sell_order_id = None
     if needs_sell and not PAPER_TRADE:
-        # For SCALPER: if there's a live TP limit order, cancel it and verify
-        # it's gone before placing the market sell. Without this, the market sell
-        # can fail with "insufficient balance" because funds are still locked in
-        # the open TP order (MEXC processes cancels asynchronously).
         tp_order_id = trade.get("tp_order_id")
-        if label == "SCALPER" and tp_order_id:
+        if label in ("SCALPER", "TRINITY") and tp_order_id:
             cancel_order(symbol, tp_order_id, label)
             # Brief poll to confirm cancel — up to 3 checks × 0.3s = 0.9s max wait
             for _ in range(3):
@@ -2656,7 +2762,7 @@ def close_position(trade, reason) -> bool:
         if sell_order_id:
             known_sell_ids.add(sell_order_id)
 
-        retries    = 5 if (reason == "TAKE_PROFIT" and label == "SCALPER") else 3
+        retries    = 5 if (reason == "TAKE_PROFIT" and label in ("SCALPER", "TRINITY")) else 3
         exit_fills = get_actual_fills(
             symbol, since_ms=bought_at_ms, retries=retries,
             buy_order_id=buy_order_id,
@@ -3318,6 +3424,10 @@ def _cmd_config():
         f"  Max: {ALT_MAX_TRADES} trades | Min budget: max($2, {MOONSHOT_BUDGET_PCT*100:.0f}% of balance)\n"
         f"  SL: -{MOONSHOT_SL*100:.0f}%  Max: {MOONSHOT_TIMEOUT_MAX_MINS}min (no limit after partial TP)\n"
         f"  Partial TP: {MOONSHOT_PARTIAL_TP_RATIO*100:.0f}% sold at +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% → trail {MOONSHOT_TRAIL_PCT*100:.0f}% stop\n"
+        f"\n🔱 <b>Trinity</b>  [exchange TP + bot SL]\n"
+        f"  Pairs: {', '.join(s.replace('USDT','') for s in TRINITY_SYMBOLS)} | Budget: {TRINITY_BUDGET_PCT*100:.0f}% of total\n"
+        f"  Entry: 4h drop ≥{TRINITY_DROP_PCT*100:.0f}% | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | vol ≥{TRINITY_VOL_BURST:.1f}× | green candle\n"
+        f"  TP: {TRINITY_TP_ATR_MULT}×ATR | SL: {TRINITY_SL_ATR_MULT}×ATR (cap {TRINITY_SL_MAX*100:.1f}%) | Max: {TRINITY_MAX_HOURS}h\n"
         f"\n🔄 <b>Reversal</b>  [bot-monitored]\n"
         f"  TP: +{REVERSAL_TP*100:.1f}%  SL: cap-candle anchor  Max: {REVERSAL_MAX_HOURS}h\n"
         f"  Partial TP: {REVERSAL_PARTIAL_TP_RATIO*100:.0f}% sold at +{REVERSAL_PARTIAL_TP_PCT*100:.1f}% → SL moves to entry\n"
@@ -3613,6 +3723,8 @@ def startup() -> float:
         f"  Watchlist: top {WATCHLIST_SIZE} pairs, refresh every {WATCHLIST_TTL//60}min\n"
         f"\n🌙 <b>Moonshot</b> (max {ALT_MAX_TRADES} trades, {MOONSHOT_BUDGET_PCT*100:.0f}% each) [bot-monitored]\n"
         f"  SL: -{MOONSHOT_SL*100:.0f}% | Partial TP: +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% then {MOONSHOT_TRAIL_PCT*100:.0f}% trail | max {MOONSHOT_MAX_HOURS}h\n"
+        f"\n🔱 <b>Trinity</b> ({TRINITY_BUDGET_PCT*100:.0f}%) [exchange TP + bot SL]\n"
+        f"  {'/'.join(s.replace('USDT','') for s in TRINITY_SYMBOLS)} | drop ≥{TRINITY_DROP_PCT*100:.0f}% | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | max {TRINITY_MAX_HOURS}h\n"
         f"\n🔄 <b>Reversal</b> (5%) [bot-monitored]\n"
         f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%  max {REVERSAL_MAX_HOURS}h\n"
         f"\n🧠 <b>AI</b>: {'✅ Haiku + web search' if SENTIMENT_ENABLED and WEB_SEARCH_ENABLED else '✅ Haiku only (/ask + journal)' if SENTIMENT_ENABLED else '⚠️ disabled (set ANTHROPIC_API_KEY)'}\n"
@@ -3890,11 +4002,10 @@ def run():
                                     scalper_trades.append(new_t)
                                     _scalper_excluded.pop(best_opp["symbol"], None)
 
-            # ── Alt (Moonshot / Reversal) ─────────────────────
+            # ── Alt (Trinity / Moonshot / Reversal) ──────────────
             if not _paused and len(alt_trades) < ALT_MAX_TRADES:
                 ideal  = round(total_value * MOONSHOT_BUDGET_PCT, 2)
                 budget = min(ideal, balance)
-                # Floor: $2 minimum — below this fees eat the position entirely.
                 min_alt = MOONSHOT_MIN_NOTIONAL
 
                 if budget < min_alt:
@@ -3904,31 +4015,51 @@ def run():
                 else:
                     log.info(f"💰 Alt budget: ${budget:.2f} "
                              f"(ideal ${ideal:.2f} | free ${balance:.2f} | total ${total_value:.2f})")
-                    opp = find_moonshot_opportunity(tickers, budget,
-                                                    total_value,
-                                                    exclude=_alt_excluded,
-                                                    open_symbols=open_symbols)
+
+                    # ── 1. TRINITY — deep-liquid dip recovery (BTC/ETH/SOL)
+                    # Tried first: independent of micro-cap conditions, exchange TP,
+                    # no slippage risk, tight spread. Qualifies regardless of alt market.
+                    trinity_budget = max(min_alt, min(
+                        round(total_value * TRINITY_BUDGET_PCT, 2), balance))
+                    opp = find_trinity_opportunity(total_value,
+                                                   exclude=_alt_excluded,
+                                                   open_symbols=open_symbols)
                     if opp:
-                        # Volume-weighted position sizing — thin books get smaller positions.
-                        # Scales linearly: $500k vol → 1%, $1.5M → full 3% (capped).
-                        ticker_row = tickers[tickers["symbol"] == opp["symbol"]]
-                        if not ticker_row.empty:
-                            vol_24h = float(ticker_row["quoteVolume"].iloc[0])
-                            vol_pct = min(MOONSHOT_BUDGET_PCT, vol_24h / MOONSHOT_VOL_DIVISOR)
-                        else:
-                            vol_24h = None
-                            vol_pct = MOONSHOT_BUDGET_PCT  # ticker missing — use full budget, don't penalise
-                        budget     = max(min_alt, min(round(total_value * vol_pct, 2), balance))
-                        if vol_pct < MOONSHOT_BUDGET_PCT and vol_24h is not None:
-                            log.info(f"💰 [MOONSHOT] Vol-weighted: "
-                                     f"{vol_pct*100:.1f}% (24h vol ${vol_24h:,.0f}) → ${budget:.2f}")
-                        trade = open_position(opp, budget, MOONSHOT_TP_INITIAL, MOONSHOT_SL,
-                                              "MOONSHOT", max_hours=MOONSHOT_MAX_HOURS)
+                        trade = open_position(opp, trinity_budget,
+                                              opp["tp_pct"], opp["sl_pct"],
+                                              "TRINITY", max_hours=TRINITY_MAX_HOURS)
                         if trade:
                             alt_trades.append(trade); _alt_excluded = set()
                         else:
                             _alt_excluded.discard(opp["symbol"])
-                    else:
+
+                    # ── 2. MOONSHOT — micro-cap volume burst
+                    if not opp:
+                        opp = find_moonshot_opportunity(tickers, budget,
+                                                        total_value,
+                                                        exclude=_alt_excluded,
+                                                        open_symbols=open_symbols)
+                        if opp:
+                            ticker_row = tickers[tickers["symbol"] == opp["symbol"]]
+                            if not ticker_row.empty:
+                                vol_24h = float(ticker_row["quoteVolume"].iloc[0])
+                                vol_pct = min(MOONSHOT_BUDGET_PCT, vol_24h / MOONSHOT_VOL_DIVISOR)
+                            else:
+                                vol_24h = None
+                                vol_pct = MOONSHOT_BUDGET_PCT
+                            budget = max(min_alt, min(round(total_value * vol_pct, 2), balance))
+                            if vol_pct < MOONSHOT_BUDGET_PCT and vol_24h is not None:
+                                log.info(f"💰 [MOONSHOT] Vol-weighted: "
+                                         f"{vol_pct*100:.1f}% (24h vol ${vol_24h:,.0f}) → ${budget:.2f}")
+                            trade = open_position(opp, budget, MOONSHOT_TP_INITIAL, MOONSHOT_SL,
+                                                  "MOONSHOT", max_hours=MOONSHOT_MAX_HOURS)
+                            if trade:
+                                alt_trades.append(trade); _alt_excluded = set()
+                            else:
+                                _alt_excluded.discard(opp["symbol"])
+
+                    # ── 3. REVERSAL — oversold micro-cap bounce
+                    if not opp:
                         opp = find_reversal_opportunity(tickers, budget,
                                                         exclude=_alt_excluded,
                                                         open_symbols=open_symbols)
