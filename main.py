@@ -31,7 +31,12 @@ SCALPER_MAX_TRADES   = int(os.getenv("SCALPER_MAX_TRADES",   "3"))
 SCALPER_BUDGET_PCT   = float(os.getenv("SCALPER_BUDGET_PCT", "0.30"))  # max position cap
 SCALPER_RISK_PER_TRADE = float(os.getenv("SCALPER_RISK_PER_TRADE", "0.01"))  # 1% of balance risked per trade
 SCALPER_TRAIL_ACT    = 0.03      # trailing stop activates at +3%
-SCALPER_TRAIL_PCT    = 0.015     # trail 1.5% below highest price
+SCALPER_TRAIL_PCT    = 0.015     # static fallback trail (used if trade has no trail_pct)
+SCALPER_TRAIL_ATR_MULT = float(os.getenv("SCALPER_TRAIL_ATR_MULT", "1.5"))  # trail = 1.5× ATR at entry
+SCALPER_TRAIL_MIN    = float(os.getenv("SCALPER_TRAIL_MIN",   "0.010"))     # floor 1.0%
+SCALPER_TRAIL_MAX    = float(os.getenv("SCALPER_TRAIL_MAX",   "0.035"))     # ceiling 3.5%
+SCALPER_CONFLUENCE_BONUS = float(os.getenv("SCALPER_CONFLUENCE_BONUS", "15"))
+                                  # bonus pts when crossover + vol_ratio>2 + RSI rising simultaneously
 SCALPER_ATR_MULT     = 1.5       # EMA21 distance fallback multiplier in dynamic SL
 SCALPER_ATR_PERIOD   = 21        # ATR period — 21 candles smoother than 14, less SL hunting
 SCALPER_FLAT_MINS    = 30
@@ -113,6 +118,7 @@ MOONSHOT_VOL_COLLAPSE_RATIO  = 0.5   # exit if current vol < 50% of avg AND trad
 # Partial TP — capture first leg reliably, let remainder run to full target
 MOONSHOT_PARTIAL_TP_PCT      = 0.10  # sell first half at +10% (raised from 6% — better R:R with wider SL)
 MOONSHOT_PARTIAL_TP_RATIO    = 0.50  # fraction to sell at stage 1 (50%)
+MOONSHOT_BREAKEVEN_ACT       = float(os.getenv("MOONSHOT_BREAKEVEN_ACT", "0.04"))  # move SL to entry at +4%
 
 # ── Reversal ──────────────────────────────────────────────────
 REVERSAL_TP              = 0.040  # +4%
@@ -1120,6 +1126,8 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
     rsi    = calc_rsi(close)
     if np.isnan(rsi) or rsi > SCALPER_MAX_RSI:
         return None
+    rsi_prev  = calc_rsi(close.iloc[:-1])
+    rsi_delta = rsi - rsi_prev if not np.isnan(rsi_prev) else 0.0
 
     rsi_score      = max(0, 40 - rsi) if rsi < 50 else 0
     ema9           = calc_ema(close, 9)
@@ -1131,7 +1139,16 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
     avg_vol        = volume.iloc[-20:-1].mean()
     vol_ratio      = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
     vol_score      = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
-    score          = rsi_score + ma_score + vol_score - ema50_penalty
+
+    # Confluence bonus — non-linear reward when all three signals align simultaneously.
+    # A fresh crossover alone scores 30. A vol spike alone scores 30. But when both
+    # fire together with rising RSI momentum, this is a regime shift, not three
+    # independent signals — deserves a material bonus on top.
+    confluence_bonus = (SCALPER_CONFLUENCE_BONUS
+                        if crossed_now and vol_ratio > 2.0 and rsi_delta > 0
+                        else 0.0)
+
+    score          = rsi_score + ma_score + vol_score + confluence_bonus - ema50_penalty
 
     threshold = SCALPER_THRESHOLD if strict else max(5, SCALPER_THRESHOLD // 2)
     if score < threshold:
@@ -1174,17 +1191,23 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
     avg_candle_pct = float(raw_candle_pct) if not np.isnan(raw_candle_pct) else atr_pct
 
     result = {
-        "symbol":        sym,
-        "score":         round(score, 2),
-        "rsi":           round(rsi, 2),
-        "vol_ratio":     round(vol_ratio, 2),
-        "ema50_gap":     round(ema50_gap * 100, 2),     # % above/below 1H EMA50 (negative = below)
-        "ema50_penalty": ema50_penalty,                  # pts deducted from score
-        "price":         curr_close,
-        "atr_pct":       round(atr_pct, 6),
-        "crossed_now":   crossed_now,
-        "ema21_dist_pct":round(ema21_dist_pct, 6),
-        "avg_candle_pct":round(avg_candle_pct, 6),
+        "symbol":          sym,
+        "score":           round(score, 2),
+        "rsi":             round(rsi, 2),
+        "rsi_delta":       round(rsi_delta, 2),
+        "confluence_bonus":confluence_bonus,
+        "vol_ratio":       round(vol_ratio, 2),
+        "ema50_gap":       round(ema50_gap * 100, 2),
+        "ema50_penalty":   ema50_penalty,
+        "price":           curr_close,
+        "atr_pct":         round(atr_pct, 6),
+        # ATR-based trail width — stored here, transferred to trade dict at open_position.
+        # Computed once at scoring time so check_exit never needs to re-fetch klines.
+        "trail_pct":       round(min(SCALPER_TRAIL_MAX,
+                                     max(SCALPER_TRAIL_MIN, atr_pct * SCALPER_TRAIL_ATR_MULT)), 6),
+        "crossed_now":     crossed_now,
+        "ema21_dist_pct":  round(ema21_dist_pct, 6),
+        "avg_candle_pct":  round(avg_candle_pct, 6),
     }
     if strict:
         result["sentiment"] = sentiment_delta if sentiment_delta != 0 else None
@@ -1246,8 +1269,10 @@ def build_watchlist(tickers: pd.DataFrame):
 
     top   = _watchlist[0]
     top_line = (f"{top['symbol']} "
-                f"score={top['score']:.0f} RSI={top['rsi']:.0f} "
-                f"ATR={top['atr_pct']*100:.2f}% vol={top['vol_ratio']:.1f}×")
+                f"score={top['score']:.0f}"
+                + (" 🔥" if top.get("confluence_bonus") else "")
+                + f" RSI={top['rsi']:.0f} ATR={top['atr_pct']*100:.2f}% vol={top['vol_ratio']:.1f}×"
+                + (f" trail={top['trail_pct']*100:.1f}%" if top.get('trail_pct') else ""))
 
     # Explain why we're not entering right now
     why_not = []
@@ -2118,13 +2143,17 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         "opened_at":      datetime.now(timezone.utc).isoformat(),
         "score":          opp.get("score", 0),
         "rsi":            opp.get("rsi", 0),
-        "sentiment":      opp.get("sentiment"),  # sentiment score delta at entry
-        # High-confidence trades get fast breakeven: SL moves to entry at +1.5%
-        # preventing a winner from becoming a loser before the trailing stop kicks in
-        "breakeven_act":  SCALPER_BREAKEVEN_ACT if (
-                              label == "SCALPER" and
-                              opp.get("score", 0) >= SCALPER_BREAKEVEN_SCORE
-                          ) else None,
+        "sentiment":      opp.get("sentiment"),
+        # ATR-based trail width — set at entry from scorer, persisted across restarts.
+        # check_exit uses this instead of the static SCALPER_TRAIL_PCT constant.
+        "trail_pct":      opp.get("trail_pct", SCALPER_TRAIL_PCT) if label == "SCALPER" else None,
+        # High-confidence scalper trades get fast breakeven: SL moves to entry at +1.5%
+        # Moonshot trades get breakeven at +4% — prevents giving back gains before partial TP
+        "breakeven_act":  (SCALPER_BREAKEVEN_ACT if (
+                               label == "SCALPER" and
+                               opp.get("score", 0) >= SCALPER_BREAKEVEN_SCORE
+                           ) else MOONSHOT_BREAKEVEN_ACT if label == "MOONSHOT"
+                           else None),
         "breakeven_done": False,   # flips True once SL has been moved to entry
         # ── Partial TP (MOONSHOT / REVERSAL only) ─────────────
         # Stage 1: sell partial_tp_ratio of qty at partial_tp_price.
@@ -2211,7 +2240,10 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         f"{breakeven_line}"
         f"{timeout_line}"
         f"{tp_status}\n"
-        f"Score: {opp.get('score',0)} | RSI: {opp.get('rsi','?')} ({opp.get('rsi_delta',0):+.1f}) | Vol: {opp.get('vol_ratio','?')}x"
+        f"Score: {opp.get('score',0)}"
+        + (f" 🔥 (confluence +{opp.get('confluence_bonus',0):.0f})" if opp.get('confluence_bonus') else "")
+        + f" | RSI: {opp.get('rsi','?')} ({opp.get('rsi_delta',0):+.1f}) | Vol: {opp.get('vol_ratio','?')}x"
+        + (f" | Trail: {opp.get('trail_pct', SCALPER_TRAIL_PCT)*100:.1f}%" if label == "SCALPER" else "")
     )
     save_state()
     return trade
@@ -2348,23 +2380,26 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             except Exception:
                 pass  # never block an exit check on a kline failure
 
-    if label == "SCALPER":
-        # ── Breakeven trail (high-confidence trades only) ─────────
-        # If score ≥ SCALPER_BREAKEVEN_SCORE and trade is up SCALPER_BREAKEVEN_ACT,
-        # ratchet SL up to entry price — turns a potential loser into a break-even.
-        # This fires once only, before the normal trailing stop activates.
-        breakeven_act = trade.get("breakeven_act")
-        if breakeven_act and not trade.get("breakeven_done") and pct >= breakeven_act * 100:
-            if trade["sl_price"] < trade["entry_price"]:
-                trade["sl_price"]      = trade["entry_price"]
-                trade["breakeven_done"] = True
-                log.info(f"🔒 [{label}] Breakeven locked: {symbol} | {pct:+.2f}% | "
-                         f"SL moved to entry ${trade['entry_price']:.6f}")
+    # ── Breakeven lock (any label with breakeven_act set) ────────
+    # Fires once when trade reaches breakeven_act — moves SL to entry.
+    # Scalper: high-confidence trades at +1.5%. Moonshot: all trades at +4%.
+    breakeven_act = trade.get("breakeven_act")
+    if breakeven_act and not trade.get("breakeven_done") and pct >= breakeven_act * 100:
+        if trade["sl_price"] < trade["entry_price"]:
+            trade["sl_price"]       = trade["entry_price"]
+            trade["breakeven_done"] = True
+            log.info(f"🔒 [{label}] Breakeven locked: {symbol} | {pct:+.2f}% | "
+                     f"SL moved to entry ${trade['entry_price']:.6f}")
 
+    if label == "SCALPER":
         # ── Trailing stop ─────────────────────────────────────────
+        # trail_pct is computed at entry from ATR — wider on volatile coins,
+        # tighter on calm ones. Falls back to static constant for old trades.
+        trail_pct = trade.get("trail_pct") or SCALPER_TRAIL_PCT
         if trade["highest_price"] >= trade["entry_price"] * (1 + SCALPER_TRAIL_ACT):
-            if price <= trade["highest_price"] * (1 - SCALPER_TRAIL_PCT):
-                log.info(f"📉 [{label}] Trailing stop: {symbol} | {pct:+.2f}%")
+            if price <= trade["highest_price"] * (1 - trail_pct):
+                log.info(f"📉 [{label}] Trailing stop: {symbol} | {pct:+.2f}% "
+                         f"(trail {trail_pct*100:.1f}%)")
                 if not PAPER_TRADE and tp_order_id:
                     cancel_order(symbol, tp_order_id, label)
                 return True, "TRAILING_STOP"
