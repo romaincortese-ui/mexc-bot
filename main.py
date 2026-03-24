@@ -130,6 +130,14 @@ MOONSHOT_MIN_DAYS   = 2
 MOONSHOT_NEW_DAYS   = 14
 MOONSHOT_MIN_VOL_BURST = 2.5
 MOONSHOT_MIN_VOL_RATIO = float(os.getenv("MOONSHOT_MIN_VOL_RATIO", "1.2"))  # require ≥ avg volume
+# ── Volume Z-Score — statistically grounded burst detection ───
+# Instead of a fixed "N× average" threshold, measure how many standard deviations
+# the current volume is above the coin's own normal pattern. A spiky coin needs
+# a bigger absolute spike to be meaningful; a stable coin needs less.
+# Z-score ≥ 2.0 = volume is 2 stdev above normal (statistically unusual).
+# vol_ratio floor ensures absolute magnitude: even z=3 on a near-zero volume coin is noise.
+VOL_ZSCORE_MIN       = float(os.getenv("VOL_ZSCORE_MIN",       "2.0"))   # min z-score to qualify as burst
+VOL_RATIO_FLOOR      = float(os.getenv("VOL_RATIO_FLOOR",      "1.5"))   # min vol_ratio alongside z-score
 MOONSHOT_LIQUIDITY_RATIO = float(os.getenv("MOONSHOT_LIQUIDITY_RATIO", "200"))
                                    # min 1h vol = balance × this ratio
                                    # scales position liquidity requirement with account size
@@ -139,7 +147,7 @@ MOONSHOT_VOL_DIVISOR   = float(os.getenv("MOONSHOT_VOL_DIVISOR", "500000")) # vo
 
 # ── Moonshot graduated timeout ─────────────────────────────────
 # Hard clock replaced with P&L-aware timeouts:
-MOONSHOT_TIMEOUT_FLAT_MINS   = 30    # exit if pct < 0.5% after this many minutes
+MOONSHOT_TIMEOUT_FLAT_MINS   = 45    # exit if near-breakeven after this many minutes
 MOONSHOT_TIMEOUT_MARGINAL_MINS= 60   # exit if pct < 5.0% after this many minutes
 MOONSHOT_TIMEOUT_MAX_MINS    = 120   # absolute ceiling regardless of P&L
 # Mid-hold vol re-check — if volume collapses the pump is over
@@ -1342,6 +1350,33 @@ def calc_atr(df: pd.DataFrame, period=14) -> float:
     return float(atr) if not np.isnan(atr) else 0.0
 
 
+def calc_vol_zscore(volume: pd.Series, lookback: int = 20) -> float:
+    """
+    Compute the z-score of the latest candle's volume relative to the
+    preceding `lookback` candles.
+
+    z = (current_vol - mean) / stdev
+
+    A coin with erratic volume (high stdev) needs a larger absolute spike
+    to produce a high z-score — this automatically filters out coins where
+    6× volume is routine noise vs. coins where 3× is genuinely unusual.
+
+    Returns 0.0 on any error or insufficient data (never blocks).
+    """
+    try:
+        if len(volume) < lookback + 1:
+            return 0.0
+        window  = volume.iloc[-(lookback + 1):-1]  # exclude current candle
+        current = float(volume.iloc[-1])
+        mean    = float(window.mean())
+        std     = float(window.std())
+        if std <= 0 or mean <= 0:
+            return 0.0
+        return (current - mean) / std
+    except Exception:
+        return 0.0
+
+
 # ── Move Maturity Filter ─────────────────────────────────────
 
 def calc_move_maturity(df: pd.DataFrame, lookback: int = None) -> float:
@@ -1814,6 +1849,17 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
     avg_vol        = volume.iloc[-20:-1].mean()
     vol_ratio      = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
     vol_score      = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
+
+    # ── TREND signal RSI gate — block entries with decaying momentum ──
+    # TREND is the weakest signal (no crossover, no vol spike, not oversold).
+    # Without a catalyst, require RSI to at least be rising — entering a naked
+    # trend with falling RSI is chasing a dying move. Stronger signals (CROSSOVER,
+    # VOL_SPIKE, OVERSOLD) have their own catalyst and skip this check.
+    if strict and not crossed_now and vol_ratio < 3.0 and rsi >= 40:
+        if rsi_delta < 1.0:
+            log.debug(f"[SCALPER] Skip {sym} — TREND signal with declining RSI "
+                      f"(delta {rsi_delta:+.1f})")
+            return None
 
     # Confluence bonus — non-linear reward when all three signals align simultaneously.
     # A fresh crossover alone scores 30. A vol spike alone scores 30. But when both
@@ -2319,12 +2365,15 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
         # 24h change — kept for logging only, not used as a filter.
         # EMA crossover + vol_ratio in the scorer already enforce upward momentum.
         change_1h = ticker_change_map.get(sym, 0.0)
+        # Volume z-score — how unusual is this spike for THIS specific coin?
+        vol_zscore = round(calc_vol_zscore(volume), 2)
         return {
             "symbol":       sym,
             "score":        final_score,
             "rsi":          round(rsi, 2),
             "rsi_delta":    round(rsi_delta, 2),
             "vol_ratio":    round(vol_ratio, 2),
+            "vol_zscore":   vol_zscore,
             "vol_1h_usdt":  round(recent_1h_vol, 0),
             "entry_signal": classify_entry_signal(crossed_now=crossed,
                                                    vol_ratio=vol_ratio, rsi=rsi,
@@ -2366,9 +2415,10 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
     trend_tag = "🔥" if best.get("_is_trending") else ("🆕" if best.get("_is_new") else "")
     scanner_log(f"🌙 [MOONSHOT] Top: {best['symbol']}{trend_tag} | "
                 f"Score: {best['score']}/100 | 1h: {best['_1h_chg']:+.1f}% | RSI: {best['rsi']}"
+                + (f" | z={best.get('vol_zscore',0):.1f}" if best.get('vol_zscore') else "")
                 + (f" | 🔥 {best['_trend_reason']}" if best.get("_trend_reason") else ""))
 
-    # Burst detection — tightened: single threshold of MOONSHOT_MIN_VOL_BURST for both types
+    # Burst detection — z-score based: is this spike statistically unusual for THIS coin?
     tradeable = []
     for s in scores:
         df_k   = s.pop("_df", None)
@@ -2381,17 +2431,25 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
             tradeable.append(s); continue
 
         close  = df_k["close"]; volume = df_k["volume"]; opens = df_k["open"]
-        avg_vol     = volume.iloc[-11:-1].mean()
-        vol_burst   = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
-        safe_opens  = opens.replace(0, np.nan)  # avoid division by zero on thin pairs
+
+        # Price burst — how big is the current candle relative to recent candles?
+        safe_opens  = opens.replace(0, np.nan)
         candle_moves= (close - opens).abs() / safe_opens * 100
         avg_move    = candle_moves.iloc[-11:-1].mean()
         price_burst = (float(candle_moves.iloc[-1]) / avg_move) if avg_move > 0 else 1.0
         greens      = sum(1 for i in [-2, -1] if close.iloc[i] > opens.iloc[i])
 
-        # Require either strong volume OR strong price burst (not both required)
-        if vol_burst < MOONSHOT_MIN_VOL_BURST and price_burst < 2.0:
-            log.info(f"[MOONSHOT] Skip {s['symbol']} — burst too weak (vol:{vol_burst:.1f}x price:{price_burst:.1f}x)")
+        # Volume check: require EITHER statistically significant volume spike
+        # (z-score ≥ threshold AND absolute vol_ratio above floor) OR strong price burst.
+        # Z-score adapts per coin: a spiky coin needs bigger absolute spike to qualify.
+        vol_zscore   = s.get("vol_zscore", 0.0)
+        vol_ratio_ok = s.get("vol_ratio", 1.0) >= VOL_RATIO_FLOOR
+        zscore_ok    = vol_zscore >= VOL_ZSCORE_MIN and vol_ratio_ok
+
+        if not zscore_ok and price_burst < 2.0:
+            log.info(f"[MOONSHOT] Skip {s['symbol']} — burst not significant "
+                     f"(z={vol_zscore:.1f} ratio={s.get('vol_ratio',0):.1f}× "
+                     f"price_burst={price_burst:.1f}×)")
             continue
         if greens == 0:
             log.info(f"[MOONSHOT] Skip {s['symbol']} — both candles red")
@@ -3418,7 +3476,9 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
     # ── MOONSHOT-specific exits ───────────────────────────────
     if label == "MOONSHOT":
         # Graduated timeout — give winning trades more time
-        if pct < 0.5 and held_min >= MOONSHOT_TIMEOUT_FLAT_MINS:
+        # Flat timeout: only fires near breakeven (-1% to +0.5%).
+        # If deeply negative, the SL handles it — don't pre-empt a potential recovery.
+        if -1.0 <= pct < 0.5 and held_min >= MOONSHOT_TIMEOUT_FLAT_MINS:
             log.info(f"😴 [{label}] Flat timeout: {symbol} | {pct:+.2f}% after {held_min:.0f}min")
             return True, "TIMEOUT"
         if pct < 5.0 and held_min >= MOONSHOT_TIMEOUT_MARGINAL_MINS:
