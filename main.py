@@ -1,12 +1,17 @@
 """
-MEXC Trading Bot — 3 Strategies
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  1. SCALPER  — Max 3 trades (30% cap, 1% risk) | Dynamic ATR TP/SL | 1H trend | 10min watchlist
-               Watchlist blends top-volume AND top-movers; BTC rebound triggers early rebuild.
-  2. MOONSHOT — Max 2 trades (3%) | SL -8% | Partial TP +10% → 8% trail | RSI 35-70 gate
-               Rebound context relaxes RSI ceiling to 78 when vol_ratio>2 + RSI accelerating.
-  3. REVERSAL — Max 2 trades (5%) | TP +4% | SL cap-candle anchor | Oversold bounce + vol capitulation
-     Moonshot and Reversal share the alt slot.
+MEXC Trading Bot — 5 Strategies + Adaptive Learning
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. SCALPER      — Max 3 trades (dynamic cap) | Signal-aware ATR TP/SL | 1H trend | 10min watchlist
+                    TREND RSI gate | Move maturity filter | Confluence + Keltner bonuses.
+  2. MOONSHOT     — Max 2 trades (dynamic) | SL -8% | Micro TP 30%@+2% → Partial 50%@+10% → 8% trail
+                    Z-score volume burst | Rebound RSI relaxation | Momentum-decay exit.
+  3. PRE-BREAKOUT — Via moonshot slot | +8%/-3% | Accumulation/Squeeze/Base-spring patterns
+                    Enters BEFORE the spike rather than chasing it.
+  4. REVERSAL     — Max 2 trades (5%) | TP +4% | SL cap-candle anchor | Oversold bounce
+  5. TRINITY      — BTC/ETH/SOL dip recovery (5%) | Multi-window drop (4h/8h) | RSI 25-50
+                    Exchange TP limit + bot SL | ATR-based sizing.
+     Moonshot, Pre-Breakout, Reversal and Trinity share the alt slot.
+  Adaptive: per-signal tracking | rolling threshold tuning | budget rebalancing | giveback analysis.
 """
 
 import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re, math
@@ -155,8 +160,27 @@ MOONSHOT_VOL_CHECK_MINS      = 15    # start checking vol after this many minute
 MOONSHOT_VOL_COLLAPSE_RATIO  = 0.5   # exit if current vol < 50% of avg AND trade barely up
 # Partial TP — capture first leg reliably, let remainder run to full target
 MOONSHOT_PARTIAL_TP_PCT      = 0.10  # sell first half at +10% (raised from 6% — better R:R with wider SL)
-MOONSHOT_PARTIAL_TP_RATIO    = 0.50  # fraction to sell at stage 1 (50%)
-MOONSHOT_BREAKEVEN_ACT       = float(os.getenv("MOONSHOT_BREAKEVEN_ACT", "0.04"))  # move SL to entry at +4%
+MOONSHOT_PARTIAL_TP_RATIO    = 0.50  # fraction to sell at stage 2 (50% of remaining after micro)
+MOONSHOT_BREAKEVEN_ACT       = float(os.getenv("MOONSHOT_BREAKEVEN_ACT", "0.02"))  # move SL to entry at +2%
+# Micro-partial TP — lock in small profit on the consistent +2-3% pops
+# Fires before the main partial TP: sell 30% at +2%, move SL to entry.
+# Remaining 70% runs for the +10% partial and beyond.
+MOONSHOT_MICRO_TP_PCT        = float(os.getenv("MOONSHOT_MICRO_TP_PCT",   "0.02"))  # +2% micro TP
+MOONSHOT_MICRO_TP_RATIO      = float(os.getenv("MOONSHOT_MICRO_TP_RATIO", "0.30"))  # sell 30% at micro TP
+
+# ── Pre-Breakout Detection ────────────────────────────────────
+# Enters BEFORE the spike rather than chasing it. Three patterns:
+#   ACCUMULATION: volume rising, price flat — someone absorbing supply
+#   SQUEEZE:      ATR at N-candle low in uptrend — coiling for breakout
+#   BASE_SPRING:  support tested 2+ times with declining red volume
+PRE_BREAKOUT_TP             = float(os.getenv("PRE_BREAKOUT_TP",             "0.08"))   # +8% TP (entering at base)
+PRE_BREAKOUT_SL             = float(os.getenv("PRE_BREAKOUT_SL",             "0.03"))   # -3% SL (tight, below structure)
+PRE_BREAKOUT_MAX_HOURS      = int(os.getenv("PRE_BREAKOUT_MAX_HOURS",        "3"))
+PRE_BREAKOUT_MIN_VOL        = int(os.getenv("PRE_BREAKOUT_MIN_VOL",          "100000")) # 24h vol floor
+PRE_BREAKOUT_ACCUM_CANDLES  = int(os.getenv("PRE_BREAKOUT_ACCUM_CANDLES",    "5"))      # vol rising N candles
+PRE_BREAKOUT_ACCUM_PRICE_RANGE = float(os.getenv("PRE_BREAKOUT_ACCUM_PRICE_RANGE", "0.01"))  # price flat <1%
+PRE_BREAKOUT_SQUEEZE_LOOKBACK  = int(os.getenv("PRE_BREAKOUT_SQUEEZE_LOOKBACK",  "20"))  # ATR low over N candles
+PRE_BREAKOUT_BASE_TESTS     = int(os.getenv("PRE_BREAKOUT_BASE_TESTS",       "2"))      # min support touches
 
 # ── Note 4 — Dead Coins: proactive liquidity blacklist ─────────
 # Coins that fail the volume/spread check 3× in a row are blacklisted for 24h.
@@ -216,16 +240,19 @@ REVERSAL_PARTIAL_TP_RATIO= 0.50   # fraction to sell at stage 1 (50%)
 # Deep liquidity → exchange TP limit order, tight spreads, no slippage risk.
 TRINITY_SYMBOLS       = ["SOLUSDT", "ETHUSDT", "BTCUSDT"]  # priority: fastest rebounders first
 TRINITY_BUDGET_PCT    = float(os.getenv("TRINITY_BUDGET_PCT",   "0.05"))   # 5% of total_value
-TRINITY_DROP_PCT      = float(os.getenv("TRINITY_DROP_PCT",     "0.03"))   # min 3% drop in last 4h
-TRINITY_MIN_RSI       = float(os.getenv("TRINITY_MIN_RSI",      "28"))     # oversold floor
-TRINITY_MAX_RSI       = float(os.getenv("TRINITY_MAX_RSI",      "42"))     # not just dipping
+TRINITY_DROP_PCT      = float(os.getenv("TRINITY_DROP_PCT",     "0.02"))   # min 2% drop (lowered: 3% rarely happens in 8h)
+TRINITY_MIN_RSI       = float(os.getenv("TRINITY_MIN_RSI",      "25"))     # oversold floor (lowered from 28)
+TRINITY_MAX_RSI       = float(os.getenv("TRINITY_MAX_RSI",      "50"))     # widened: RSI 35-45 is already oversold for BTC/ETH/SOL
 TRINITY_TP_ATR_MULT   = float(os.getenv("TRINITY_TP_ATR_MULT",  "1.8"))   # TP = 1.8 × ATR
 TRINITY_SL_ATR_MULT   = float(os.getenv("TRINITY_SL_ATR_MULT",  "1.0"))   # SL = 1.0 × ATR
 TRINITY_SL_MAX        = float(os.getenv("TRINITY_SL_MAX",       "0.025"))  # SL capped at 2.5%
 TRINITY_TP_MIN        = float(os.getenv("TRINITY_TP_MIN",       "0.008"))  # TP floor (covers fees)
-TRINITY_MAX_HOURS     = int(os.getenv("TRINITY_MAX_HOURS",      "4"))
-TRINITY_VOL_BURST     = float(os.getenv("TRINITY_VOL_BURST",    "1.5"))    # entry candle vol ≥ 1.5× avg
+TRINITY_MAX_HOURS     = int(os.getenv("TRINITY_MAX_HOURS",      "6"))      # extended from 4h — recovery takes time
+TRINITY_VOL_BURST     = float(os.getenv("TRINITY_VOL_BURST",    "1.2"))    # entry candle vol ≥ 1.2× avg (lowered: turns are quiet)
 TRINITY_BREAKEVEN_ACT = float(os.getenv("TRINITY_BREAKEVEN_ACT","0.01"))   # lock SL to entry at +1%
+# Drop lookback — check multiple windows and use the deepest drop found.
+# Institutional dips on BTC/ETH/SOL play out over 6-12h, not 4h.
+TRINITY_DROP_LOOKBACK_CANDLES = [16, 32]  # 4h and 8h on 15m chart
 MIN_PRICE         = 0.001
 SCAN_INTERVAL     = 60
 STATE_FILE        = "state.json"  # persists open positions + history across restarts
@@ -2580,6 +2607,205 @@ def find_reversal_opportunity(tickers: pd.DataFrame, budget: float,
     return pick_tradeable(tradeable, budget, "REVERSAL")
 
 
+# ── Scanner: Pre-Breakout ─────────────────────────────────────
+
+def evaluate_prebreakout_candidate(sym: str) -> dict | None:
+    """
+    Detect accumulation/compression patterns that precede breakouts.
+
+    Instead of chasing volume spikes (entering at the top), this identifies
+    the pressure building BEFORE the explosion and positions at the base.
+
+    Three independent patterns (first match wins):
+
+    1. ACCUMULATION: volume rising over N candles but price flat (<1% range).
+       Someone is buying large quantities without moving the price — absorbing
+       sell orders patiently. When sellers exhaust, price breaks upward.
+
+    2. SQUEEZE: ATR contracts to its lowest point in 20 candles AND price is
+       above EMA21. Volatility compression in an uptrend almost always resolves
+       with an explosive move upward (65-70% probability).
+
+    3. BASE_SPRING: price tests a support level 2+ times in the last 30 candles
+       with declining red-candle volume on each test. Sellers are exhausting —
+       the next volume burst off this base is the real move.
+
+    Returns an opp dict with entry_signal set to the pattern name, or None.
+    """
+    df = parse_klines(sym, interval="5m", limit=60, min_len=30)
+    if df is None:
+        return None
+
+    close  = df["close"]
+    high   = df["high"]
+    low    = df["low"]
+    volume = df["volume"]
+    opens  = df["open"]
+
+    price_now = float(close.iloc[-1])
+    if price_now <= 0:
+        return None
+
+    rsi = calc_rsi(close)
+    if np.isnan(rsi) or rsi > 70 or rsi < 25:
+        return None  # not in the right zone — overbought or freefalling
+
+    ema21 = calc_ema(close, 21)
+    above_ema21 = price_now > float(ema21.iloc[-1])
+
+    atr     = calc_atr(df, period=14)
+    atr_pct = atr / price_now if price_now > 0 else 0.01
+
+    pattern = None
+    score   = 0.0
+
+    # ── Pattern 1: ACCUMULATION ───────────────────────────────
+    # Volume rising for N candles, price essentially flat
+    n = PRE_BREAKOUT_ACCUM_CANDLES
+    if len(volume) >= n + 2:
+        recent_vol = volume.iloc[-(n + 1):]
+        vol_vals   = [float(v) for v in recent_vol.values]
+        # Check volume is generally rising (at least N-1 of N steps are up)
+        vol_ups = sum(1 for i in range(len(vol_vals) - 1) if vol_vals[i + 1] > vol_vals[i])
+        if vol_ups >= n - 1:
+            # Check price range over same window is tight
+            recent_close = [float(c) for c in close.iloc[-(n + 1):].values]
+            p_high, p_low = max(recent_close), min(recent_close)
+            p_mid = (p_high + p_low) / 2 if (p_high + p_low) > 0 else 1.0
+            p_range = (p_high - p_low) / p_mid
+            if p_range < PRE_BREAKOUT_ACCUM_PRICE_RANGE:
+                pattern = "ACCUMULATION"
+                # Score: volume acceleration strength + how flat the price is
+                vol_growth = vol_vals[-1] / vol_vals[0] if vol_vals[0] > 0 else 1.0
+                score = 30 + min(30, vol_growth * 10) + max(0, (1.0 - p_range / PRE_BREAKOUT_ACCUM_PRICE_RANGE) * 20)
+
+    # ── Pattern 2: SQUEEZE ────────────────────────────────────
+    # ATR at N-candle low + price above EMA21 (uptrend compression)
+    if pattern is None and above_ema21:
+        lookback = min(PRE_BREAKOUT_SQUEEZE_LOOKBACK, len(df) - 5)
+        if lookback >= 10:
+            # Compute rolling ATR for comparison
+            tr = pd.concat([
+                high - low,
+                (high - close.shift(1)).abs(),
+                (low  - close.shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            atr_series = tr.ewm(alpha=1.0 / 14, adjust=False).mean()
+            recent_atrs = atr_series.iloc[-lookback:]
+            current_atr = float(atr_series.iloc[-1])
+            min_atr     = float(recent_atrs.min())
+            # Current ATR within 10% of the lookback minimum = squeeze
+            if current_atr > 0 and current_atr <= min_atr * 1.10:
+                pattern = "SQUEEZE"
+                # Score: how tight the squeeze is + uptrend strength
+                ema_dist = (price_now / float(ema21.iloc[-1]) - 1)
+                score = 35 + min(20, ema_dist * 500) + min(25, (1.0 - current_atr / float(recent_atrs.mean())) * 50)
+
+    # ── Pattern 3: BASE_SPRING ────────────────────────────────
+    # Support tested multiple times with declining red-candle volume
+    if pattern is None:
+        lookback = 30
+        if len(df) >= lookback:
+            recent = df.iloc[-lookback:]
+            # Find approximate support level — lowest low tested multiple times
+            lows_window = recent["low"].values
+            # Cluster lows within 0.5% of each other
+            support_level = float(min(lows_window))
+            tolerance     = support_level * 0.005
+            # Count candles that touched within tolerance of support
+            touches = []
+            for i, l in enumerate(lows_window):
+                if abs(float(l) - support_level) <= tolerance:
+                    touches.append(i)
+
+            if len(touches) >= PRE_BREAKOUT_BASE_TESTS:
+                # Check red candle volume is declining across touches
+                red_vols_at_touches = []
+                for idx in touches:
+                    c = float(recent["close"].iloc[idx])
+                    o = float(recent["open"].iloc[idx])
+                    if c < o:  # red candle at support
+                        red_vols_at_touches.append(float(recent["volume"].iloc[idx]))
+                if len(red_vols_at_touches) >= 2:
+                    # Volume declining? At least last touch has less vol than first
+                    if red_vols_at_touches[-1] < red_vols_at_touches[0] * 0.8:
+                        # Current price should be bouncing off support, not sitting on it
+                        if price_now > support_level * 1.005:
+                            pattern = "BASE_SPRING"
+                            vol_decline = 1.0 - (red_vols_at_touches[-1] / red_vols_at_touches[0])
+                            score = 30 + len(touches) * 5 + min(25, vol_decline * 40)
+
+    if pattern is None:
+        return None
+
+    score = round(min(score, 100), 2)
+
+    log.debug(f"🔮 [PRE_BREAKOUT] {sym} {pattern} | score={score:.0f} | "
+              f"RSI={rsi:.0f} | ATR={atr_pct*100:.2f}%")
+
+    return {
+        "symbol":       sym,
+        "price":        price_now,
+        "score":        score,
+        "rsi":          round(rsi, 2),
+        "atr_pct":      round(atr_pct, 6),
+        "entry_signal": pattern,
+        "vol_ratio":    round(float(volume.iloc[-1]) / float(volume.iloc[-20:-1].mean())
+                              if float(volume.iloc[-20:-1].mean()) > 0 else 1.0, 2),
+    }
+
+
+def find_prebreakout_opportunity(tickers: pd.DataFrame, budget: float,
+                                  exclude: set, open_symbols: set) -> dict | None:
+    """
+    Scan for pre-breakout setups: accumulation, squeeze, or base-spring patterns.
+    Runs after moonshot burst scan — catches what moonshot can't see because
+    no spike has happened yet.
+    """
+    df = tickers.copy()
+    df = df[df["quoteVolume"] >= PRE_BREAKOUT_MIN_VOL]
+    df = df[df["lastPrice"]   >= MIN_PRICE]
+    df = df[~df["symbol"].isin(open_symbols | exclude | _api_blacklist)]
+    # Filter out dead coins from liquidity blacklist
+    now_ts = time.time()
+    df = df[~df["symbol"].apply(lambda s: _liquidity_blacklist.get(s, 0) > now_ts)]
+    # Focus on coins with moderate recent movement — not dead, not already pumped
+    df = df[(df["priceChangePercent"].abs() >= 0.5) & (df["priceChangePercent"].abs() <= 10)]
+    candidates = df.sort_values("quoteVolume", ascending=False).head(30)["symbol"].tolist()
+
+    log.info(f"🔮 [PRE_BREAKOUT] Scanning {len(candidates)} candidates")
+    if not candidates:
+        return None
+
+    # Pre-build vol lookup for dead coin check inside scorer
+    ticker_vol_map = dict(zip(df["symbol"], df["quoteVolume"].fillna(0)))
+
+    scored = []
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {ex.submit(evaluate_prebreakout_candidate, sym): sym for sym in candidates}
+        for f in as_completed(futures):
+            try:
+                result = f.result()
+                if result and result["score"] >= 30:
+                    # Dead coin check using 24h vol from ticker
+                    vol_24h = ticker_vol_map.get(result["symbol"], 0)
+                    if not check_dead_coin(result["symbol"], vol_24h, 0.0, "MOONSHOT"):
+                        scored.append(result)
+            except Exception as e:
+                log.debug(f"[PRE_BREAKOUT] Score failed for {futures[f]}: {e}")
+
+    if not scored:
+        scanner_log("🔮 [PRE_BREAKOUT] No qualifying patterns.")
+        return None
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    best = scored[0]
+    scanner_log(f"🔮 [PRE_BREAKOUT] Top: {best['symbol']} | {best['entry_signal']} | "
+                f"Score: {best['score']:.0f} | RSI: {best['rsi']}")
+
+    return pick_tradeable(scored, budget, "PRE_BREAKOUT")
+
+
 # ── Scanner: Trinity ───────────────────────────────────────────
 
 def evaluate_trinity_candidate(sym: str) -> dict | None:
@@ -2587,15 +2813,19 @@ def evaluate_trinity_candidate(sym: str) -> dict | None:
     Evaluate a single BTC/ETH/SOL symbol for a Trinity recovery entry.
 
     Conditions (ALL required):
-    1. Price down ≥ TRINITY_DROP_PCT in last 4h (16 × 15m candles)
-    2. RSI between TRINITY_MIN_RSI and TRINITY_MAX_RSI (oversold, not freefalling)
-    3. Price stabilising — last candle's close ≥ last candle's open (green candle)
-    4. Entry candle volume spike ≥ TRINITY_VOL_BURST × 20-candle avg (buyers confirming)
+    1. Price down ≥ TRINITY_DROP_PCT across ANY lookback window (4h or 8h)
+       — institutional dips play out over hours, not minutes.
+    2. RSI between TRINITY_MIN_RSI and TRINITY_MAX_RSI
+       — widened: RSI 35-45 is already significantly oversold for these assets.
+    3. Price stabilising — last candle green OR second-to-last green
+       — allows entry one candle after the turn, not just on the exact bar.
+    4. Volume recovery — entry candle vol ≥ TRINITY_VOL_BURST × avg
+       — lowered: the turn itself is often quiet, the burst comes after.
 
     Returns opp dict with ATR-based TP/SL if all conditions pass, else None.
     """
-    # 80 × 15m = 20h of data — enough for ATR(14) warmup + 4h drop check
-    df = parse_klines(sym, interval="15m", limit=80, min_len=30)
+    # 120 × 15m = 30h of data — enough for ATR(14) warmup + 8h drop check
+    df = parse_klines(sym, interval="15m", limit=120, min_len=40)
     if df is None:
         return None
 
@@ -2603,28 +2833,41 @@ def evaluate_trinity_candidate(sym: str) -> dict | None:
     volume = df["volume"]
     opens  = df["open"]
 
-    # ── 1. 4h drop check ──────────────────────────────────────
-    price_now  = float(close.iloc[-1])
-    price_4h   = float(close.iloc[-17])  # 16 candles back = 4h on 15m chart
-    drop_pct   = (price_4h - price_now) / price_4h
-    if drop_pct < TRINITY_DROP_PCT:
-        return None  # hasn't dropped enough to be interesting
+    price_now = float(close.iloc[-1])
+
+    # ── 1. Multi-window drop check ────────────────────────────
+    # Check across multiple lookback periods — use the deepest drop found.
+    # This catches both sharp 4h crashes and gradual 8h selloffs.
+    best_drop = 0.0
+    for candles_back in TRINITY_DROP_LOOKBACK_CANDLES:
+        if len(close) > candles_back + 1:
+            price_then = float(close.iloc[-(candles_back + 1)])
+            drop = (price_then - price_now) / price_then if price_then > 0 else 0.0
+            best_drop = max(best_drop, drop)
+
+    if best_drop < TRINITY_DROP_PCT:
+        return None  # hasn't dropped enough in any window
 
     # ── 2. RSI filter ─────────────────────────────────────────
     rsi = calc_rsi(close)
     if np.isnan(rsi) or not (TRINITY_MIN_RSI <= rsi <= TRINITY_MAX_RSI):
-        return None  # not in oversold recovery zone
+        return None  # not in recovery zone
 
-    # ── 3. Stabilising — entry candle must be green ───────────
-    if float(close.iloc[-1]) < float(opens.iloc[-1]):
-        return None  # still red — wait for buyers
+    # ── 3. Stabilising — recent green candle ──────────────────
+    # Allow entry if EITHER the current or prior candle is green.
+    # The exact bottom candle is often a doji or small red; the
+    # confirmation green comes one bar later.
+    curr_green = float(close.iloc[-1]) >= float(opens.iloc[-1])
+    prev_green = float(close.iloc[-2]) >= float(opens.iloc[-2])
+    if not (curr_green or prev_green):
+        return None  # no stabilisation signal yet
 
-    # ── 4. Volume spike on entry candle ───────────────────────
+    # ── 4. Volume recovery ────────────────────────────────────
     avg_vol   = float(volume.iloc[-21:-1].mean())
     curr_vol  = float(volume.iloc[-1])
     vol_burst = (curr_vol / avg_vol) if avg_vol > 0 else 1.0
     if vol_burst < TRINITY_VOL_BURST:
-        return None  # no volume confirmation — buyers not stepping in yet
+        return None  # no volume confirmation
 
     # ── ATR-based TP/SL ───────────────────────────────────────
     atr     = calc_atr(df, period=14)
@@ -2636,7 +2879,7 @@ def evaluate_trinity_candidate(sym: str) -> dict | None:
     if sl_pct > 0 and tp_pct / sl_pct < 1.5:
         tp_pct = sl_pct * 1.8  # enforce minimum R:R
 
-    log.info(f"⚡ [TRINITY] {sym} | drop {drop_pct*100:.1f}% | RSI {rsi:.0f} | "
+    log.info(f"⚡ [TRINITY] {sym} | drop {best_drop*100:.1f}% | RSI {rsi:.0f} | "
              f"vol {vol_burst:.1f}× | TP +{tp_pct*100:.2f}% SL -{sl_pct*100:.2f}% "
              f"R:R {tp_pct/sl_pct:.1f}:1")
 
@@ -2649,7 +2892,7 @@ def evaluate_trinity_candidate(sym: str) -> dict | None:
         "atr_pct":      round(atr_pct, 6),
         "tp_pct":   round(tp_pct, 6),
         "sl_pct":   round(sl_pct, 6),
-        "drop_pct": round(drop_pct * 100, 2),
+        "drop_pct": round(best_drop * 100, 2),
     }
 
 
@@ -3156,10 +3399,17 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
                            else None),
         "breakeven_done": False,   # flips True once SL has been moved to entry
         # ── Partial TP (MOONSHOT / REVERSAL / high-score SCALPER) ──
-        # Stage 1: sell partial_tp_ratio at partial_tp_price.
-        # After stage 1: sl_price → entry (risk-free), qty/budget_used reduced.
+        # Moonshot has two stages: micro (30% at +2%) then main (50% at +10%).
+        # Stage 1 (micro): sell 30%, SL → entry. Captures the consistent +2-3% pops.
+        # Stage 2 (main):  sell 50% of remaining, trailing stop activates.
         # Note 11: high-score scalper trades sell 30% at the normal TP price;
         # the remaining 70% rides a wider 2×ATR trailing stop with no hard cap.
+        "micro_tp_price": (
+            round_price_to_tick(actual_entry * (1 + MOONSHOT_MICRO_TP_PCT), tick_size)
+            if label == "MOONSHOT" else None
+        ),
+        "micro_tp_ratio":   MOONSHOT_MICRO_TP_RATIO if label == "MOONSHOT" else None,
+        "micro_tp_hit":     False,
         "partial_tp_price": (
             tp_price  # SCALPER: partial fires at the same TP level already on the exchange
             if (label == "SCALPER" and opp.get("score", 0) >= SCALPER_PARTIAL_TP_SCORE) else
@@ -3173,7 +3423,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
             MOONSHOT_PARTIAL_TP_RATIO if label == "MOONSHOT" else
             REVERSAL_PARTIAL_TP_RATIO if label == "REVERSAL" else None
         ),
-        "partial_tp_hit":   False,   # flips True once stage 1 fires
+        "partial_tp_hit":   False,   # flips True once stage 2 fires
     }
 
     mode         = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
@@ -3216,6 +3466,13 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         sl_display = f"Stop loss:   <b>${sl_price:.6f}</b>  (-{actual_sl*100:.1f}%) [market]\n"
 
     partial_tp_line = ""
+    micro_tp_line   = ""
+    if trade.get("micro_tp_price") and label == "MOONSHOT":
+        micro_ratio_pct = (trade["micro_tp_ratio"] or 0.3) * 100
+        micro_pct       = (trade["micro_tp_price"] / actual_entry - 1) * 100
+        micro_tp_line   = (f"Micro TP:    {micro_ratio_pct:.0f}% @ "
+                           f"<b>${trade['micro_tp_price']:.6f}</b>"
+                           f"  (+{micro_pct:.1f}%) → SL → entry 🔒\n")
     if trade.get("partial_tp_price") and label == "MOONSHOT":
         ratio_pct   = (trade["partial_tp_ratio"] or 0.5) * 100
         partial_pct = (trade["partial_tp_price"] / actual_entry - 1) * 100
@@ -3252,6 +3509,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         f"{keltner_line}"
         f"{tp_display}"
         f"{sl_display}"
+        f"{micro_tp_line}"
         f"{partial_tp_line}"
         f"{breakeven_line}"
         f"{timeout_line}"
@@ -3295,7 +3553,8 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
         if label == "MOONSHOT":
             # Once partial TP has fired the trade is risk-free — let the trailing
             # stop run it. Only apply the hard timeout to trades still in stage 1.
-            if not trade.get("partial_tp_hit") and held_min >= MOONSHOT_TIMEOUT_MAX_MINS:
+            if (not trade.get("partial_tp_hit") and not trade.get("micro_tp_hit")
+                    and held_min >= MOONSHOT_TIMEOUT_MAX_MINS):
                 log.info(f"⏰ [{label}] Max timeout ({MOONSHOT_TIMEOUT_MAX_MINS}min): {symbol}")
                 return True, "TIMEOUT"
         else:
@@ -3335,9 +3594,20 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             cancel_order(symbol, tp_order_id, label)
         return True, "STOP_LOSS"
 
-    # ── Partial TP (MOONSHOT / REVERSAL) ──────────────────────
-    # Stage 1: fire when price hits partial_tp_price and stage hasn't fired yet.
-    # After this, execute_partial_tp() sells half, moves SL to entry, trade continues.
+    # ── Micro TP (MOONSHOT stage 1 — sell 30% at +2%) ───────────
+    # Fires before the main partial TP. Captures the consistent +2-3% pops
+    # that moonshots produce before reversing. Moves SL to entry (risk-free).
+    if (label == "MOONSHOT"
+            and not trade.get("micro_tp_hit")
+            and trade.get("micro_tp_price")
+            and price >= trade["micro_tp_price"]):
+        log.info(f"🎯μ [{label}] Micro TP: {symbol} | {pct:+.2f}%")
+        return True, "MICRO_TP"
+
+    # ── Partial TP (MOONSHOT stage 2 / REVERSAL) ──────────────
+    # MOONSHOT: fires at +10% AFTER micro has already taken 30%.
+    # REVERSAL: fires at +2.5% (no micro stage).
+    # After this, execute_partial_tp() sells half of remaining, trailing stop activates.
     if (label in ("MOONSHOT", "REVERSAL")
             and not trade.get("partial_tp_hit")
             and trade.get("partial_tp_price")
@@ -3475,13 +3745,17 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
 
     # ── MOONSHOT-specific exits ───────────────────────────────
     if label == "MOONSHOT":
+        # After micro or partial TP, trade is risk-free (SL at entry) — let trailing
+        # stop handle it. Only apply timeouts to trades still carrying risk.
+        _risk_free = trade.get("micro_tp_hit") or trade.get("partial_tp_hit")
+
         # Graduated timeout — give winning trades more time
         # Flat timeout: only fires near breakeven (-1% to +0.5%).
         # If deeply negative, the SL handles it — don't pre-empt a potential recovery.
-        if -1.0 <= pct < 0.5 and held_min >= MOONSHOT_TIMEOUT_FLAT_MINS:
+        if not _risk_free and -1.0 <= pct < 0.5 and held_min >= MOONSHOT_TIMEOUT_FLAT_MINS:
             log.info(f"😴 [{label}] Flat timeout: {symbol} | {pct:+.2f}% after {held_min:.0f}min")
             return True, "TIMEOUT"
-        if pct < 5.0 and held_min >= MOONSHOT_TIMEOUT_MARGINAL_MINS:
+        if not _risk_free and pct < 5.0 and held_min >= MOONSHOT_TIMEOUT_MARGINAL_MINS:
             log.info(f"⏰ [{label}] Marginal timeout: {symbol} | {pct:+.2f}% after {held_min:.0f}min")
             return True, "TIMEOUT"
 
@@ -3489,7 +3763,7 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
         # Replaces the old single-candle VOL_COLLAPSE ratio check which was too
         # aggressive on normal consolidation patterns. The decay detector requires
         # N consecutive declining-volume candles with flat price — a much stronger signal.
-        if held_min >= MOMENTUM_DECAY_MIN_HELD and pct < 5.0:
+        if not _risk_free and held_min >= MOMENTUM_DECAY_MIN_HELD and pct < 5.0:
             if detect_momentum_decay(symbol):
                 log.info(f"📉 [{label}] Momentum decay: {symbol} | {pct:+.2f}%")
                 return True, "VOL_COLLAPSE"
@@ -3533,23 +3807,28 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
     return False, ""
 
 
-def execute_partial_tp(trade) -> bool:
+def execute_partial_tp(trade, micro: bool = False) -> bool:
     """
-    Sell partial_tp_ratio of the position at market price (stage 1 TP).
+    Sell a portion of the position at market price.
     Mutates the trade dict in place — the trade stays live with reduced qty.
 
+    Two modes:
+      micro=True  — Moonshot stage 1: sell 30% at +2%, SL → entry.
+      micro=False — Normal partial TP: sell 50% at +10% (Moonshot) or +2.5% (Reversal).
+
     After firing:
-      - partial_tp_hit  = True
-      - qty             = remaining qty after partial sell
-      - budget_used     = proportional remaining cost basis
-      - sl_price        = entry_price (remainder is now risk-free)
+      - qty/budget_used reduced proportionally
+      - sl_price → entry_price (remainder is risk-free)
+      - micro_tp_hit or partial_tp_hit set to True
       - A partial P&L entry is appended to trade_history
 
     Returns True if partial sell succeeded, False if it failed hard.
     """
     label   = trade["label"]
     symbol  = trade["symbol"]
-    ratio   = trade.get("partial_tp_ratio", 0.5)
+    ratio   = (trade.get("micro_tp_ratio", MOONSHOT_MICRO_TP_RATIO) if micro
+               else trade.get("partial_tp_ratio", 0.5))
+    reason_tag = "MICRO_TP" if micro else "PARTIAL_TP"
 
     min_qty, step_size, _, _ = get_symbol_rules(symbol)
     full_qty = trade["qty"]
@@ -3565,10 +3844,13 @@ def execute_partial_tp(trade) -> bool:
 
     # Safety: don't fire if either partial or remaining qty would be below min
     if partial_qty < min_qty or remaining_qty < min_qty:
-        log.warning(f"[{label}] Partial TP skipped — qty too small "
+        log.warning(f"[{label}] {reason_tag} skipped — qty too small "
                     f"(partial={partial_qty}, remaining={remaining_qty}, min={min_qty})")
-        # Skip partial, just let the full TP run
-        trade["partial_tp_hit"] = True   # mark as hit so we don't retry
+        # Skip this stage so we don't retry
+        if micro:
+            trade["micro_tp_hit"] = True
+        else:
+            trade["partial_tp_hit"] = True
         return True
 
     partial_sell_id  = None
@@ -3611,7 +3893,8 @@ def execute_partial_tp(trade) -> bool:
     try:
         ticker_price = float(public_get("/api/v3/ticker/price", {"symbol": symbol})["price"])
     except Exception:
-        ticker_price = trade["partial_tp_price"]
+        ticker_price = (trade.get("micro_tp_price") if micro
+                        else trade.get("partial_tp_price", trade["entry_price"]))
 
     actual_entry = partial_fills.get("avg_buy_price")  or trade["entry_price"]
     actual_exit  = partial_fills.get("avg_sell_price") or ticker_price
@@ -3630,7 +3913,7 @@ def execute_partial_tp(trade) -> bool:
         "budget_used":   partial_cost,
         "exit_price":    actual_exit,
         "exit_ticker":   ticker_price,
-        "exit_reason":   "PARTIAL_TP",
+        "exit_reason":   reason_tag,
         "closed_at":     datetime.now(timezone.utc).isoformat(),
         "fee_usdt":      fee_usdt,
         "cost_usdt":     partial_cost,
@@ -3645,7 +3928,10 @@ def execute_partial_tp(trade) -> bool:
     trade["qty"]               = remaining_qty
     trade["budget_used"]       = round(trade["budget_used"] * (1 - ratio), 4)
     trade["sl_price"]          = trade["entry_price"]   # remainder is now risk-free
-    trade["partial_tp_hit"]    = True
+    if micro:
+        trade["micro_tp_hit"]  = True
+    else:
+        trade["partial_tp_hit"]= True
     # close_position uses this as bought_at_ms so fill query only sees remaining fills
     trade["bought_at_ms"]      = partial_sold_at_ms
 
@@ -3668,13 +3954,14 @@ def execute_partial_tp(trade) -> bool:
 
     mode      = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
     fills_note= "✅ actual fills" if partial_fills.get("avg_sell_price") else "⚠️ estimated"
-    icon      = {"MOONSHOT":"🌙","REVERSAL":"🔄"}.get(label, "🎯")
+    icon      = "🎯μ" if micro else {"MOONSHOT":"🌙","REVERSAL":"🔄"}.get(label, "🎯")
+    stage_str = "Micro TP" if micro else "Partial TP"
 
-    log.info(f"🎯½ [{label}] Partial TP {symbol}: sold {partial_qty} @ ${actual_exit:.6f} "
+    log.info(f"{icon} [{label}] {stage_str} {symbol}: sold {partial_qty} @ ${actual_exit:.6f} "
              f"P&L ${partial_pnl:+.4f} ({partial_pct:+.2f}%) | "
              f"Remaining: {remaining_qty} @ SL entry")
     telegram(
-        f"🎯½ <b>Partial TP — {label}</b> [{mode}]\n"
+        f"{icon} <b>{stage_str} — {label}</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Pair:      <b>{symbol}</b>\n"
         f"Sold:      {partial_qty} ({ratio*100:.0f}%) @ <b>${actual_exit:.6f}</b>  [{fills_note}]\n"
@@ -3682,7 +3969,9 @@ def execute_partial_tp(trade) -> bool:
         f"━━━━━━━━━━━━━━━\n"
         f"Remaining: {remaining_qty} still open\n"
         f"SL moved:  entry ${trade['entry_price']:.6f} (risk-free 🔒)\n"
-        + (f"Trail:     {MOONSHOT_TRAIL_PCT*100:.0f}% below highest price (uncapped)"
+        + (f"Next:      partial TP at +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}%"
+           if micro and label == "MOONSHOT" else
+           f"Trail:     {MOONSHOT_TRAIL_PCT*100:.0f}% below highest price (uncapped)"
            if label == "MOONSHOT" else
            f"Target:    ${trade['tp_price']:.6f}  (+{trade['tp_pct']*100:.0f}%)")
     )
@@ -3884,6 +4173,7 @@ def close_position(trade, reason) -> bool:
         "TIMEOUT":       ("⏰","Timeout Exit"),
         "VOL_COLLAPSE":  ("📉","Volume Collapsed"),
         "PARTIAL_TP":    ("🎯½","Partial Take Profit"),
+        "MICRO_TP":      ("🎯μ","Micro Take Profit"),
     }
     emoji, reason_label = icons.get(reason, ("✅", reason))
 
@@ -4549,12 +4839,16 @@ def _cmd_config():
         f"\n🌙 <b>Moonshot</b>  [bot-monitored]\n"
         f"  Max: {ALT_MAX_TRADES} trades | Budget: max($2, {MOONSHOT_BUDGET_PCT*100:.0f}% of balance)\n"
         f"  SL: -{MOONSHOT_SL*100:.0f}% | Breakeven: +{MOONSHOT_BREAKEVEN_ACT*100:.0f}%\n"
+        f"  Micro TP: {MOONSHOT_MICRO_TP_RATIO*100:.0f}% sold at +{MOONSHOT_MICRO_TP_PCT*100:.0f}% → SL → entry\n"
         f"  Partial TP: {MOONSHOT_PARTIAL_TP_RATIO*100:.0f}% sold at +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}%\n"
         f"  Trail after partial: {MOONSHOT_TRAIL_PCT*100:.0f}% (widens to {MOONSHOT_TRAIL_ATR_WIDE*100:.0f}% once +{MOONSHOT_TRAIL_WIDE_THRESH:.0f}×ATR)\n"
         f"  Timeout: flat {MOONSHOT_TIMEOUT_FLAT_MINS}min | marginal {MOONSHOT_TIMEOUT_MARGINAL_MINS}min | hard {MOONSHOT_TIMEOUT_MAX_MINS}min\n"
+        f"\n🔮 <b>Pre-Breakout</b>  [via moonshot slot]\n"
+        f"  Patterns: accumulation | squeeze | base-spring\n"
+        f"  TP: +{PRE_BREAKOUT_TP*100:.0f}% | SL: -{PRE_BREAKOUT_SL*100:.0f}% | Max: {PRE_BREAKOUT_MAX_HOURS}h\n"
         f"\n🔱 <b>Trinity</b>  [exchange TP + bot SL]\n"
         f"  Pairs: {', '.join(s.replace('USDT','') for s in TRINITY_SYMBOLS)} | Budget: {TRINITY_BUDGET_PCT*100:.0f}% of total\n"
-        f"  Entry: 4h drop ≥{TRINITY_DROP_PCT*100:.0f}% | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | vol ≥{TRINITY_VOL_BURST:.1f}× | green candle\n"
+        f"  Entry: drop ≥{TRINITY_DROP_PCT*100:.0f}% (4h/8h) | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | vol ≥{TRINITY_VOL_BURST:.1f}× | green candle\n"
         f"  TP: {TRINITY_TP_ATR_MULT}×ATR | SL: {TRINITY_SL_ATR_MULT}×ATR (cap {TRINITY_SL_MAX*100:.1f}%) | Max: {TRINITY_MAX_HOURS}h\n"
         f"\n🔄 <b>Reversal</b>  [bot-monitored]\n"
         f"  TP: +{REVERSAL_TP*100:.1f}% | SL: cap-candle anchor | Max: {REVERSAL_MAX_HOURS}h\n"
@@ -4887,7 +5181,9 @@ def startup() -> float:
         f"  Watchlist: top {WATCHLIST_SIZE} pairs, refresh every {WATCHLIST_TTL//60}min "
         f"(+early rebuild on BTC ≥{BTC_REBOUND_PCT*100:.0f}% rebound)\n"
         f"\n🌙 <b>Moonshot</b> (max {ALT_MAX_TRADES} trades, {MOONSHOT_BUDGET_PCT*100:.0f}% each) [bot-monitored]\n"
-        f"  SL: -{MOONSHOT_SL*100:.0f}% | Partial TP: +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% then {MOONSHOT_TRAIL_PCT*100:.0f}% trail | max {MOONSHOT_MAX_HOURS}h\n"
+        f"  SL: -{MOONSHOT_SL*100:.0f}% | Micro TP: {MOONSHOT_MICRO_TP_RATIO*100:.0f}% @ +{MOONSHOT_MICRO_TP_PCT*100:.0f}% → SL entry\n"
+        f"  Partial TP: +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% then {MOONSHOT_TRAIL_PCT*100:.0f}% trail | max {MOONSHOT_MAX_HOURS}h\n"
+        f"  Pre-breakout: accumulation/squeeze/base patterns → +{PRE_BREAKOUT_TP*100:.0f}%/-{PRE_BREAKOUT_SL*100:.0f}% | {PRE_BREAKOUT_MAX_HOURS}h\n"
         f"\n🔱 <b>Trinity</b> ({TRINITY_BUDGET_PCT*100:.0f}%) [exchange TP + bot SL]\n"
         f"  {'/'.join(s.replace('USDT','') for s in TRINITY_SYMBOLS)} | drop ≥{TRINITY_DROP_PCT*100:.0f}% | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | max {TRINITY_MAX_HOURS}h\n"
         f"\n🔄 <b>Reversal</b> (5%) [bot-monitored]\n"
@@ -5289,12 +5585,42 @@ def run():
                             else:
                                 _alt_excluded.discard(opp["symbol"])
 
+                    # ── 4. PRE_BREAKOUT — accumulation/squeeze/base patterns
+                    # Enters BEFORE the spike. Tighter SL (below structure),
+                    # better R:R than chasing volume bursts.
+                    if not opp:
+                        opp = find_prebreakout_opportunity(tickers, budget,
+                                                           exclude=_alt_excluded,
+                                                           open_symbols=open_symbols)
+                        if opp:
+                            trade = open_position(opp, budget, PRE_BREAKOUT_TP, PRE_BREAKOUT_SL,
+                                                  "MOONSHOT", max_hours=PRE_BREAKOUT_MAX_HOURS)
+                            if trade:
+                                alt_trades.append(trade); _alt_excluded = set()
+                            else:
+                                _alt_excluded.discard(opp["symbol"])
+
+                    # ── 4. PRE-BREAKOUT — accumulation/squeeze/base patterns
+                    if not opp:
+                        opp = find_prebreakout_opportunity(tickers, budget,
+                                                           exclude=_alt_excluded,
+                                                           open_symbols=open_symbols)
+                        if opp:
+                            trade = open_position(opp, budget,
+                                                  PRE_BREAKOUT_TP, PRE_BREAKOUT_SL,
+                                                  "MOONSHOT",  # shares moonshot label for exit logic
+                                                  max_hours=PRE_BREAKOUT_MAX_HOURS)
+                            if trade:
+                                alt_trades.append(trade); _alt_excluded = set()
+                            else:
+                                _alt_excluded.discard(opp["symbol"])
+
             for trade in alt_trades[:]:
                 should_exit, reason = check_exit(trade)
                 if should_exit:
-                    if reason == "PARTIAL_TP":
-                        # Sell half, update trade in place — do NOT remove from list
-                        execute_partial_tp(trade)
+                    if reason in ("PARTIAL_TP", "MICRO_TP"):
+                        # Both micro and partial TP: sell a portion, trade stays live
+                        execute_partial_tp(trade, micro=(reason == "MICRO_TP"))
                     else:
                         _alt_excluded.add(trade["symbol"])
                         if close_position(trade, reason):
