@@ -222,6 +222,67 @@ MIN_PRICE         = 0.001
 SCAN_INTERVAL     = 60
 STATE_FILE        = "state.json"  # persists open positions + history across restarts
 
+# ═══════════════════════════════════════════════════════════════
+#  ADAPTIVE LEARNING — Self-Tuning Systems
+# ═══════════════════════════════════════════════════════════════
+
+# ── A. Move Maturity Filter ───────────────────────────────────
+# Measures WHERE in the current move the price is (0.0 = at lows, 1.0 = at highs).
+# High maturity = entering late in a pump → score penalty.
+# Penalty is proportional: maturity 0.80 → 0.80 × MULT × base penalty.
+# "base penalty" is dynamically derived from the candidate's own score so the filter
+# self-scales across volatile vs. calm conditions — no fixed constant.
+MATURITY_LOOKBACK       = int(os.getenv("MATURITY_LOOKBACK",       "20"))  # candles to measure range
+MATURITY_PENALTY_MULT   = float(os.getenv("MATURITY_PENALTY_MULT", "0.5"))  # fraction of score lost at maturity=1.0
+MATURITY_THRESHOLD      = float(os.getenv("MATURITY_THRESHOLD",    "0.75")) # below this: no penalty
+# Moonshot is more tolerant of late entries since it targets bigger moves
+MATURITY_MOONSHOT_THRESHOLD = float(os.getenv("MATURITY_MOONSHOT_THRESHOLD", "0.85"))
+
+# ── B. Momentum-Decay Exit (replaces flat VOL_COLLAPSE ratio) ─
+# Instead of comparing volume to a single average, track the SLOPE of volume.
+# A healthy consolidation has flat/rising vol; a dying pump has declining vol + flat price.
+MOMENTUM_DECAY_CANDLES  = int(os.getenv("MOMENTUM_DECAY_CANDLES",   "4"))   # consecutive declining-vol candles
+MOMENTUM_DECAY_PRICE_RANGE = float(os.getenv("MOMENTUM_DECAY_PRICE_RANGE", "0.003"))
+                                   # price must also be flat (< 0.3% range) for decay to trigger
+MOMENTUM_DECAY_MIN_HELD = float(os.getenv("MOMENTUM_DECAY_MIN_HELD", "10"))  # minutes before checking
+
+# ── C. Adaptive Score Threshold ───────────────────────────────
+# Rolling performance tracker that adjusts entry thresholds based on recent results.
+# When the last N trades have negative Sharpe, tighten the threshold.
+# When positive Sharpe, relax it (but never below the base).
+# Adjustments are small (+/- 3-5 pts) and bounded to prevent runaway.
+ADAPTIVE_WINDOW         = int(os.getenv("ADAPTIVE_WINDOW",         "12"))   # trades to compute rolling stats
+ADAPTIVE_TIGHTEN_STEP   = float(os.getenv("ADAPTIVE_TIGHTEN_STEP", "5"))    # pts added when Sharpe < 0
+ADAPTIVE_RELAX_STEP     = float(os.getenv("ADAPTIVE_RELAX_STEP",   "3"))    # pts removed when Sharpe > 0.5
+ADAPTIVE_MAX_OFFSET     = float(os.getenv("ADAPTIVE_MAX_OFFSET",   "20"))   # max pts above base threshold
+ADAPTIVE_MIN_OFFSET     = float(os.getenv("ADAPTIVE_MIN_OFFSET",   "-5"))   # max pts below base (conservative)
+
+# ── D. Performance-Based Budget Allocation ────────────────────
+# Every PERF_REBALANCE_TRADES completed trades, shift budget allocation toward
+# whichever strategy has better Sharpe. The allocation is bounded so no strategy
+# goes below a floor or above a ceiling.
+PERF_REBALANCE_TRADES   = int(os.getenv("PERF_REBALANCE_TRADES",   "20"))   # rebalance after every N total trades
+PERF_SCALPER_FLOOR      = float(os.getenv("PERF_SCALPER_FLOOR",    "0.10")) # scalper never below 10%
+PERF_SCALPER_CEIL       = float(os.getenv("PERF_SCALPER_CEIL",     "0.40")) # scalper never above 40%
+PERF_MOONSHOT_FLOOR     = float(os.getenv("PERF_MOONSHOT_FLOOR",   "0.02")) # moonshot never below 2%
+PERF_MOONSHOT_CEIL      = float(os.getenv("PERF_MOONSHOT_CEIL",    "0.08")) # moonshot never above 8%
+PERF_SHIFT_STEP         = float(os.getenv("PERF_SHIFT_STEP",       "0.01")) # shift 1% per rebalance
+
+# ── E. Fee-Aware TP Floor ─────────────────────────────────────
+# Instead of a fixed TP minimum, compute from actual fee tier + slippage buffer.
+# MEXC market order fee = 0.1% each side (taker). VIP tiers vary.
+# The TP floor = 2 × single_fee + slippage + min_profit.
+# Dynamically reads from recent trade fills if available, else uses the conservative default.
+FEE_RATE_TAKER          = float(os.getenv("FEE_RATE_TAKER",        "0.001"))  # 0.1% per side (MEXC default)
+FEE_SLIPPAGE_BUFFER     = float(os.getenv("FEE_SLIPPAGE_BUFFER",   "0.002"))  # 0.2% assumed slippage
+FEE_MIN_PROFIT          = float(os.getenv("FEE_MIN_PROFIT",        "0.010"))  # 1.0% min profit after costs
+
+# ── F. Giveback Tracking ─────────────────────────────────────
+# Logged at close time to tune trailing stops.
+# Target giveback ratio: 30-35% of peak profit.
+GIVEBACK_TARGET_LOW     = float(os.getenv("GIVEBACK_TARGET_LOW",    "0.25"))
+GIVEBACK_TARGET_HIGH    = float(os.getenv("GIVEBACK_TARGET_HIGH",   "0.40"))
+
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -361,6 +422,17 @@ _paused               = False
 # Rotation scan cooldown — don't hammer 40+ API calls every 5s
 _last_rotation_scan    = 0.0
 ROTATION_SCAN_INTERVAL = 30  # seconds between rotation scans
+
+# ── Adaptive learning state ───────────────────────────────────
+# Per-strategy threshold offsets — persist across restarts.
+# Positive = stricter than base, negative = more lenient.
+_adaptive_offsets: dict = {"SCALPER": 0.0, "MOONSHOT": 0.0}
+# Track the trade count at which we last rebalanced budgets
+_last_rebalance_count  = 0
+# Dynamic budget overrides — computed by perf-based allocation
+# None means "use the static config value"
+_dynamic_scalper_budget: float | None  = None
+_dynamic_moonshot_budget: float | None = None
 
 # New listings cache — scanning 60 symbols takes 3+ seconds, cache for 5 min
 _new_listings_cache    = []
@@ -587,6 +659,11 @@ def save_state():
             "api_blacklist":        list(_api_blacklist),
             "liquidity_blacklist":  _liquidity_blacklist,
             "liquidity_fail_count": _liquidity_fail_count,
+            # ── Adaptive learning state ──
+            "adaptive_offsets":       _adaptive_offsets,
+            "last_rebalance_count":   _last_rebalance_count,
+            "dynamic_scalper_budget": _dynamic_scalper_budget,
+            "dynamic_moonshot_budget":_dynamic_moonshot_budget,
             "saved_at":             datetime.now(timezone.utc).isoformat(),
         }
         tmp = STATE_FILE + ".tmp"
@@ -597,18 +674,22 @@ def save_state():
         log.warning(f"State save failed: {e}")
 
 
-def load_state() -> tuple[list, list, list, int, float, float, bool, dict, set, set, dict, dict]:
+def load_state() -> tuple:
     """
     Load persisted state from STATE_FILE.
     Returns (scalper_trades, alt_trades, trade_history,
              consecutive_losses, win_rate_pause_until, streak_paused_at,
              paused, scalper_excluded, alt_excluded, api_blacklist,
-             liquidity_blacklist, liquidity_fail_count).
+             liquidity_blacklist, liquidity_fail_count,
+             adaptive_offsets, last_rebalance_count,
+             dynamic_scalper_budget, dynamic_moonshot_budget).
     Returns empty defaults if file is missing or unreadable.
     """
+    defaults = ([], [], [], 0, 0.0, 0.0, False, {}, set(), set(), {}, {},
+                {"SCALPER": 0.0, "MOONSHOT": 0.0}, 0, None, None)
     try:
         if not os.path.exists(STATE_FILE):
-            return [], [], [], 0, 0.0, 0.0, False, {}, set(), set(), {}, {}
+            return defaults
         with open(STATE_FILE) as f:
             d = json.load(f)
         age = (datetime.now(timezone.utc) -
@@ -631,10 +712,14 @@ def load_state() -> tuple[list, list, list, int, float, float, bool, dict, set, 
             set(d.get("api_blacklist",    [])),
             d.get("liquidity_blacklist",  {}),
             d.get("liquidity_fail_count", {}),
+            d.get("adaptive_offsets",       {"SCALPER": 0.0, "MOONSHOT": 0.0}),
+            d.get("last_rebalance_count",   0),
+            d.get("dynamic_scalper_budget", None),
+            d.get("dynamic_moonshot_budget",None),
         )
     except Exception as e:
         log.warning(f"State load failed ({e}) — starting fresh")
-        return [], [], [], 0, 0.0, 0.0, False, {}, set(), set(), {}, {}
+        return defaults
 
 def _get_session() -> requests.Session:
     """Return a thread-local requests.Session, creating one if needed."""
@@ -1256,6 +1341,275 @@ def calc_atr(df: pd.DataFrame, period=14) -> float:
     atr = tr.ewm(alpha=1.0 / period, adjust=False).mean().iloc[-1]
     return float(atr) if not np.isnan(atr) else 0.0
 
+
+# ── Move Maturity Filter ─────────────────────────────────────
+
+def calc_move_maturity(df: pd.DataFrame, lookback: int = None) -> float:
+    """
+    Measure where in the current move the price sits (0.0–1.0).
+
+    0.0 = price at the bottom of the recent range (early/dip entry)
+    1.0 = price at the top of the recent range (late/chasing entry)
+
+    Uses high/low of the last `lookback` candles to define the range.
+    Returns 0.5 on any error so it never blocks an entry.
+    """
+    if lookback is None:
+        lookback = MATURITY_LOOKBACK
+    try:
+        if df is None or len(df) < lookback:
+            return 0.5
+        window  = df.iloc[-lookback:]
+        high    = float(window["high"].max())
+        low     = float(window["low"].min())
+        current = float(df["close"].iloc[-1])
+        if high <= low:
+            return 0.5  # zero range — flat, no meaningful maturity
+        return max(0.0, min(1.0, (current - low) / (high - low)))
+    except Exception:
+        return 0.5
+
+
+def maturity_penalty(maturity: float, raw_score: float,
+                     threshold: float = None) -> float:
+    """
+    Score penalty for entering late in a move.
+
+    Dynamically proportional: the penalty scales with the candidate's OWN score
+    so that a 90-score candidate in a late move gets a larger absolute penalty
+    than a 45-score candidate — but both lose the same *fraction* of their score.
+
+    No penalty below the threshold (default: MATURITY_THRESHOLD).
+    """
+    if threshold is None:
+        threshold = MATURITY_THRESHOLD
+    if maturity <= threshold:
+        return 0.0
+    # How far past the threshold (0.0–1.0 normalized)
+    overshoot = (maturity - threshold) / (1.0 - threshold) if threshold < 1.0 else 0.0
+    # Penalty = fraction of the raw score
+    penalty = raw_score * MATURITY_PENALTY_MULT * overshoot
+    return round(penalty, 1)
+
+
+# ── Momentum-Decay Detection ─────────────────────────────────
+
+def detect_momentum_decay(symbol: str, min_candles: int = None,
+                          price_range: float = None) -> bool:
+    """
+    True if a pump is dying: volume declining over N consecutive candles
+    while price is flat (range < threshold).
+
+    Replaces the old single-candle VOL_COLLAPSE ratio check which was too
+    aggressive and triggered on normal consolidation patterns.
+    """
+    if min_candles is None:
+        min_candles = MOMENTUM_DECAY_CANDLES
+    if price_range is None:
+        price_range = MOMENTUM_DECAY_PRICE_RANGE
+    try:
+        # Need min_candles + 1 candles to check N consecutive declines
+        needed = max(min_candles + 2, 8)
+        df = parse_klines(symbol, interval="5m", limit=needed + 5, min_len=needed)
+        if df is None:
+            return False
+
+        vol   = df["volume"].iloc[-(min_candles + 1):]
+        close = df["close"].iloc[-min_candles:]
+
+        # Check volume declining for N consecutive candles
+        vol_vals = vol.values
+        declining = all(
+            float(vol_vals[i + 1]) < float(vol_vals[i])
+            for i in range(len(vol_vals) - 1)
+        )
+        if not declining:
+            return False
+
+        # Check price is flat — range of last N candles < threshold
+        close_vals  = [float(c) for c in close.values]
+        price_high  = max(close_vals)
+        price_low   = min(close_vals)
+        mid         = (price_high + price_low) / 2 if (price_high + price_low) > 0 else 1.0
+        flat_range  = (price_high - price_low) / mid
+
+        if flat_range >= price_range:
+            return False  # price is still moving — not a decay, just volume normalising
+
+        log.info(f"📉 [MOMENTUM_DECAY] {symbol} — vol declining {min_candles} candles, "
+                 f"price range {flat_range*100:.3f}%")
+        return True
+    except Exception:
+        return False
+
+
+# ── Adaptive Threshold System ─────────────────────────────────
+
+def update_adaptive_thresholds():
+    """
+    Adjust entry score thresholds based on rolling per-strategy performance.
+
+    Called after every close_position. Reads trade_history, computes a rolling
+    Sharpe over the last ADAPTIVE_WINDOW trades per strategy, and shifts the
+    threshold offset:
+      - Sharpe < 0  → tighten by ADAPTIVE_TIGHTEN_STEP (entries are bad)
+      - Sharpe > 0.5 → relax by ADAPTIVE_RELAX_STEP (entries are good)
+      - Otherwise   → no change (wait for clearer signal)
+
+    Offsets are bounded by ADAPTIVE_MAX_OFFSET / ADAPTIVE_MIN_OFFSET.
+    """
+    global _adaptive_offsets
+
+    for strategy in ("SCALPER", "MOONSHOT"):
+        full = [t for t in trade_history
+                if t.get("label") == strategy
+                and not t.get("is_partial")][-ADAPTIVE_WINDOW:]
+        if len(full) < max(5, ADAPTIVE_WINDOW // 2):
+            continue  # not enough data to be statistically meaningful
+
+        pnls = [t["pnl_pct"] for t in full]
+        n    = len(pnls)
+        mean = sum(pnls) / n
+        if n > 1:
+            var   = sum((p - mean) ** 2 for p in pnls) / (n - 1)
+            std   = var ** 0.5
+            sharpe = (mean / std) if std > 0 else 0.0
+        else:
+            sharpe = 0.0
+
+        old_offset = _adaptive_offsets.get(strategy, 0.0)
+        if sharpe < 0:
+            new_offset = min(old_offset + ADAPTIVE_TIGHTEN_STEP, ADAPTIVE_MAX_OFFSET)
+            direction  = "tightened"
+        elif sharpe > 0.5:
+            new_offset = max(old_offset - ADAPTIVE_RELAX_STEP, ADAPTIVE_MIN_OFFSET)
+            direction  = "relaxed"
+        else:
+            new_offset = old_offset
+            direction  = "unchanged"
+
+        if new_offset != old_offset:
+            _adaptive_offsets[strategy] = new_offset
+            log.info(f"🧠 [ADAPTIVE] {strategy} threshold {direction}: "
+                     f"offset {old_offset:+.0f} → {new_offset:+.0f} "
+                     f"(Sharpe={sharpe:.2f} over {n} trades)")
+
+
+def get_effective_threshold(strategy: str) -> float:
+    """
+    Return the current entry threshold for a strategy,
+    incorporating the adaptive offset.
+    """
+    base = {"SCALPER": SCALPER_THRESHOLD, "MOONSHOT": MOONSHOT_MIN_SCORE}.get(strategy, 40)
+    offset = _adaptive_offsets.get(strategy, 0.0)
+    return base + offset
+
+
+# ── Performance-Based Budget Allocation ───────────────────────
+
+def rebalance_budgets():
+    """
+    Shift capital allocation between strategies based on rolling performance.
+
+    Computes Sharpe for each strategy over the last PERF_REBALANCE_TRADES.
+    The strategy with higher Sharpe gets a budget bump; the other gets trimmed.
+    Both are clamped to floor/ceiling to ensure neither strategy starves.
+
+    Only fires after every PERF_REBALANCE_TRADES total completed trades.
+    """
+    global _last_rebalance_count, _dynamic_scalper_budget, _dynamic_moonshot_budget
+
+    full = [t for t in trade_history if not t.get("is_partial")]
+    if len(full) < PERF_REBALANCE_TRADES or len(full) <= _last_rebalance_count:
+        return
+    if len(full) - _last_rebalance_count < PERF_REBALANCE_TRADES:
+        return
+
+    _last_rebalance_count = len(full)
+
+    def strategy_sharpe(label: str) -> float:
+        st = [t for t in full if t.get("label") == label][-PERF_REBALANCE_TRADES:]
+        if len(st) < 5:
+            return 0.0
+        pnls = [t["pnl_pct"] for t in st]
+        mean = sum(pnls) / len(pnls)
+        if len(pnls) > 1:
+            var = sum((p - mean) ** 2 for p in pnls) / (len(pnls) - 1)
+            std = var ** 0.5
+            return (mean / std) if std > 0 else 0.0
+        return 0.0
+
+    scalper_sharpe  = strategy_sharpe("SCALPER")
+    moonshot_sharpe = strategy_sharpe("MOONSHOT")
+
+    # Current budgets (use dynamic if set, else static)
+    curr_scalper  = _dynamic_scalper_budget  or SCALPER_BUDGET_PCT
+    curr_moonshot = _dynamic_moonshot_budget or MOONSHOT_BUDGET_PCT
+
+    if scalper_sharpe > moonshot_sharpe + 0.2:
+        # Scalper outperforming → shift toward scalper
+        new_scalper  = min(PERF_SCALPER_CEIL,  curr_scalper  + PERF_SHIFT_STEP)
+        new_moonshot = max(PERF_MOONSHOT_FLOOR, curr_moonshot - PERF_SHIFT_STEP)
+    elif moonshot_sharpe > scalper_sharpe + 0.2:
+        # Moonshot outperforming → shift toward moonshot
+        new_scalper  = max(PERF_SCALPER_FLOOR,  curr_scalper  - PERF_SHIFT_STEP)
+        new_moonshot = min(PERF_MOONSHOT_CEIL,  curr_moonshot + PERF_SHIFT_STEP)
+    else:
+        # Similar performance — no shift
+        new_scalper  = curr_scalper
+        new_moonshot = curr_moonshot
+
+    if new_scalper != curr_scalper or new_moonshot != curr_moonshot:
+        _dynamic_scalper_budget  = new_scalper
+        _dynamic_moonshot_budget = new_moonshot
+        log.info(f"💼 [REBALANCE] Scalper: {curr_scalper*100:.0f}% → {new_scalper*100:.0f}% "
+                 f"(Sharpe {scalper_sharpe:.2f}) | "
+                 f"Moonshot: {curr_moonshot*100:.0f}% → {new_moonshot*100:.0f}% "
+                 f"(Sharpe {moonshot_sharpe:.2f})")
+        telegram(
+            f"💼 <b>Budget Rebalanced</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🟢 Scalper: {new_scalper*100:.0f}% (Sharpe {scalper_sharpe:.2f})\n"
+            f"🌙 Moonshot: {new_moonshot*100:.0f}% (Sharpe {moonshot_sharpe:.2f})\n"
+            f"Based on last {PERF_REBALANCE_TRADES} trades"
+        )
+
+
+def get_effective_budget_pct(strategy: str) -> float:
+    """Return the current effective budget pct, using dynamic override if set."""
+    if strategy == "SCALPER":
+        return _dynamic_scalper_budget or SCALPER_BUDGET_PCT
+    elif strategy == "MOONSHOT":
+        return _dynamic_moonshot_budget or MOONSHOT_BUDGET_PCT
+    return SCALPER_BUDGET_PCT
+
+
+# ── Fee-Aware TP Floor ────────────────────────────────────────
+
+def calc_fee_aware_tp_floor() -> float:
+    """
+    Compute the minimum TP percentage that covers round-trip fees + slippage + min profit.
+
+    Dynamically estimates from recent trade fills if available (actual fee rates
+    may differ from default if user has VIP tier or MX deduction).
+    Falls back to conservative FEE_RATE_TAKER constant.
+    """
+    # Try to estimate actual fee rate from recent trades
+    recent_with_fees = [t for t in trade_history
+                        if t.get("fee_usdt", 0) > 0 and t.get("cost_usdt", 0) > 0][-10:]
+    if len(recent_with_fees) >= 3:
+        # Average fee as fraction of cost — covers both buy and sell sides
+        avg_fee_pct = sum(t["fee_usdt"] / t["cost_usdt"]
+                          for t in recent_with_fees) / len(recent_with_fees)
+        # This is already round-trip (buy + sell fees are both in fee_usdt)
+        effective_fee = avg_fee_pct
+    else:
+        # Conservative default: 2 × single-side taker fee
+        effective_fee = 2 * FEE_RATE_TAKER
+
+    floor = effective_fee + FEE_SLIPPAGE_BUFFER + FEE_MIN_PROFIT
+    return round(floor, 4)
+
 def parse_klines(symbol, interval="5m", limit=60, min_len=30) -> pd.DataFrame | None:
     # Short-TTL cache — avoids duplicate fetches when evaluate and score
     # run within seconds of each other on the same symbol
@@ -1372,9 +1726,18 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
 
     score          = rsi_score + ma_score + vol_score + confluence_bonus - ema50_penalty
 
-    threshold = SCALPER_THRESHOLD if strict else max(5, SCALPER_THRESHOLD // 2)
+    # ── Move Maturity Filter — penalise late entries ──────────
+    move_mat = calc_move_maturity(df5m, MATURITY_LOOKBACK)
+    mat_pen  = maturity_penalty(move_mat, max(score, 1.0), MATURITY_THRESHOLD)
+    score    = score - mat_pen
+
+    # Use adaptive threshold in strict mode (entry), base threshold for watchlist
+    eff_threshold = get_effective_threshold("SCALPER") if strict else max(5, SCALPER_THRESHOLD // 2)
+    threshold     = eff_threshold
     if score < threshold:
-        if ema50_penalty > 0:
+        if mat_pen > 0:
+            log.debug(f"[SCALPER] Skip {sym} — maturity {move_mat:.2f} penalty -{mat_pen:.1f}pts")
+        elif ema50_penalty > 0:
             log.debug(f"[SCALPER] Skip {sym} — EMA50 penalty {ema50_penalty:.1f}pts "
                       f"({ema50_gap*100:.1f}% below EMA50)")
         return None
@@ -1391,13 +1754,14 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
         # maximum possible penalty (SENTIMENT_MAX_PENALTY), sentiment can't push
         # it below threshold — skip the API call entirely.
         # Conversely if score is far below threshold even the max bonus can't save it.
-        if (score >= SCALPER_THRESHOLD - SENTIMENT_MAX_BONUS
-                and score <= SCALPER_THRESHOLD + SENTIMENT_MAX_PENALTY):
+        eff_thresh = get_effective_threshold("SCALPER")
+        if (score >= eff_thresh - SENTIMENT_MAX_BONUS
+                and score <= eff_thresh + SENTIMENT_MAX_PENALTY):
             sentiment_delta, sentiment_label = sentiment_score_adjustment(sym)
             score = round(score + sentiment_delta, 2)
             if sentiment_delta != 0:
                 log.info(f"[SCALPER] {sym} sentiment: {sentiment_label} → score {score}")
-        if score < SCALPER_THRESHOLD:
+        if score < eff_thresh:
             log.info(f"[SCALPER] Skip {sym} — below threshold after sentiment ({score:.1f})")
             return None
 
@@ -1438,6 +1802,8 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
         "vol_ratio":       round(vol_ratio, 2),
         "ema50_gap":       round(ema50_gap * 100, 2),
         "ema50_penalty":   ema50_penalty,
+        "move_maturity":   round(move_mat, 3),
+        "maturity_penalty":mat_pen,
         "price":           curr_close,
         "atr_pct":         round(atr_pct, 6),
         # ATR-based trail width — stored here, transferred to trade dict at open_position.
@@ -1817,7 +2183,18 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
                       f"(1h vol ${recent_1h_vol:,.0f} < ${min_1h_vol:,.0f})")
             return None
         score     = rsi_score + ma_score + vol_score
-        if score < MOONSHOT_MIN_SCORE:
+
+        # ── Move Maturity Filter — penalise late moonshot entries ──
+        moon_maturity = calc_move_maturity(df_k, MATURITY_LOOKBACK)
+        moon_mat_pen  = maturity_penalty(moon_maturity, max(score, 1.0),
+                                          MATURITY_MOONSHOT_THRESHOLD)
+        score = score - moon_mat_pen
+
+        eff_moon_thresh = get_effective_threshold("MOONSHOT")
+        if score < eff_moon_thresh:
+            if moon_mat_pen > 0:
+                log.debug(f"[MOONSHOT] Skip {sym} — maturity {moon_maturity:.2f} "
+                          f"penalty -{moon_mat_pen:.1f}pts")
             return None
         # ── Note 9 — Keltner bonus on the same klines already fetched ──
         keltner_bonus = 0.0
@@ -1825,13 +2202,13 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
             keltner_bonus = KELTNER_SCORE_BONUS
         # Only apply sentiment/social when score is near threshold — reduces cost
         # significantly since most candidates fail well before sentiment matters.
-        if score > MOONSHOT_MIN_SCORE - 5:
+        if score > eff_moon_thresh - 5:
             sentiment_delta, _ = sentiment_score_adjustment(sym)
             social_boost, social_summary = get_social_boost(sym)
         else:
             sentiment_delta, social_boost, social_summary = 0.0, 0.0, ""
         final_score = round(score + keltner_bonus + sentiment_delta + social_boost, 2)
-        if final_score < MOONSHOT_MIN_SCORE:
+        if final_score < eff_moon_thresh:
             return None
         # Note 4 — dead coin check using 24h vol from pre-built ticker lookup
         row_vol = ticker_vol_map.get(sym, 0.0)
@@ -2343,7 +2720,9 @@ def calc_dynamic_tp_sl(opp: dict) -> tuple[float, float, str, str]:
     atr_tp      = atr_pct * tp_mult
     candle_cap  = avg_candle_pct * SCALPER_TP_CANDLE_MULT
     tp_pct      = min(atr_tp, candle_cap)             # whichever is more conservative
-    tp_pct      = min(SCALPER_TP_MAX, max(SCALPER_TP_MIN, tp_pct))
+    # Fee-aware TP floor — dynamically computed from actual fee rates when available
+    dynamic_tp_floor = calc_fee_aware_tp_floor()
+    tp_pct      = min(SCALPER_TP_MAX, max(dynamic_tp_floor, tp_pct))
 
     if atr_tp > candle_cap:
         tp_label += f" (candle-capped {candle_cap*100:.1f}%)"
@@ -2420,16 +2799,17 @@ def calc_risk_budget(opp: dict, balance: float) -> tuple[float, float, float, st
     try:
         tp_pct, sl_pct, tp_label, sl_label = calc_dynamic_tp_sl(opp)
         if sl_pct > 0:
+            eff_budget_pct = get_effective_budget_pct("SCALPER")
             base_risk   = balance * SCALPER_RISK_PER_TRADE * kelly_mult
             risk_budget = base_risk / sl_pct
-            capped      = min(risk_budget, balance * SCALPER_BUDGET_PCT)
+            capped      = min(risk_budget, balance * eff_budget_pct)
             log.debug(f"[SCALPER] Kelly mult {kelly_mult:.2f}× "
                       f"(score {score:.0f}, gap +{gap:.0f}) → ${capped:.2f}")
             return round(capped, 2), tp_pct, sl_pct, tp_label, sl_label
     except Exception:
         pass
     # Fallback — use pct cap and let open_position compute TP/SL itself
-    return round(balance * SCALPER_BUDGET_PCT, 2), 0.0, 0.0, "", ""
+    return round(balance * get_effective_budget_pct("SCALPER"), 2), 0.0, 0.0, "", ""
 
 
 def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
@@ -2605,6 +2985,8 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
                               opp.get("trail_pct", SCALPER_TRAIL_PCT) if label == "SCALPER"
                               else actual_sl * 0.5  # conservative proxy: half the SL width
                           ),
+        # Move maturity at entry — logged at close for adaptive learning
+        "move_maturity":  opp.get("move_maturity"),
         # High-confidence scalper trades get fast breakeven: SL moves to entry at +1.5%
         # Moonshot trades get breakeven at +4% — prevents giving back gains before partial TP
         # Trinity trades get breakeven at +1% — tight, liquid, small moves matter
@@ -2722,6 +3104,8 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         + f" | RSI: {opp.get('rsi','?')} ({opp.get('rsi_delta',0):+.1f}) | Vol: {opp.get('vol_ratio','?')}x"
         + (f" | Trail: {opp.get('trail_pct', SCALPER_TRAIL_PCT)*100:.1f}%" if label == "SCALPER" else "")
         + (f" | Kelly: {opp.get('kelly_mult', 1.0):.2f}×" if label == "SCALPER" and opp.get("kelly_mult") else "")
+        + (f"\nMaturity: {opp.get('move_maturity',0):.0%}" + (f" (-{opp.get('maturity_penalty',0):.0f}pts)" if opp.get('maturity_penalty',0) > 0 else "") if opp.get('move_maturity') is not None else "")
+        + (f" | Threshold: {get_effective_threshold(label):.0f}" if _adaptive_offsets.get(label, 0) != 0 else "")
     )
     save_state()
     return trade
@@ -2941,22 +3325,14 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             log.info(f"⏰ [{label}] Marginal timeout: {symbol} | {pct:+.2f}% after {held_min:.0f}min")
             return True, "TIMEOUT"
 
-        # Mid-hold volume collapse — pump is over if volume has dried up
-        # Only check after MOONSHOT_VOL_CHECK_MINS to avoid noise on entry
-        if held_min >= MOONSHOT_VOL_CHECK_MINS and pct < 5.0:
-            try:
-                df_vol = parse_klines(symbol, interval="5m", limit=25, min_len=10)
-                if df_vol is not None:
-                    vol       = df_vol["volume"]
-                    avg_vol   = float(vol.iloc[-21:-1].mean())
-                    curr_vol  = float(vol.iloc[-1])
-                    vol_ratio = (curr_vol / avg_vol) if avg_vol > 0 else 1.0
-                    if vol_ratio < MOONSHOT_VOL_COLLAPSE_RATIO:
-                        log.info(f"📉 [{label}] Vol collapse: {symbol} | "
-                                 f"vol {vol_ratio:.2f}× avg | {pct:+.2f}%")
-                        return True, "VOL_COLLAPSE"
-            except Exception:
-                pass  # never block an exit check on a kline failure
+        # Mid-hold momentum decay — pump is over if volume declining AND price flat.
+        # Replaces the old single-candle VOL_COLLAPSE ratio check which was too
+        # aggressive on normal consolidation patterns. The decay detector requires
+        # N consecutive declining-volume candles with flat price — a much stronger signal.
+        if held_min >= MOMENTUM_DECAY_MIN_HELD and pct < 5.0:
+            if detect_momentum_decay(symbol):
+                log.info(f"📉 [{label}] Momentum decay: {symbol} | {pct:+.2f}%")
+                return True, "VOL_COLLAPSE"
 
     # ── REVERSAL-specific exits ───────────────────────────────
     if label == "REVERSAL" and not trade.get("partial_tp_hit"):
@@ -3262,6 +3638,15 @@ def close_position(trade, reason) -> bool:
         log.info(f"[{label}] Ticker exit ${ticker_price:.6f} (myTrades unavailable) "
                  f"P&L=${pnl_usdt:+.4f} ({pnl_pct:+.2f}%)")
 
+    # ── Giveback tracking — how much peak profit was returned ──────
+    peak_price    = trade.get("highest_price", actual_entry)
+    peak_profit   = (peak_price / actual_entry - 1) if actual_entry > 0 else 0.0
+    actual_profit = (actual_exit / actual_entry - 1) if actual_entry > 0 else 0.0
+    giveback_ratio = (
+        (peak_profit - actual_profit) / peak_profit
+        if peak_profit > 0.001 else 0.0  # only meaningful if trade went positive
+    )
+
     trade_history.append({
         **{k: v for k, v in trade.items() if not k.startswith("_")},
         "exit_price":    actual_exit,
@@ -3274,7 +3659,18 @@ def close_position(trade, reason) -> bool:
         "pnl_pct":       pnl_pct,
         "pnl_usdt":      pnl_usdt,
         "fills_used":    bool(exit_fills.get("avg_sell_price")),
+        # ── Adaptive learning fields ──
+        "highest_price":    peak_price,
+        "peak_profit_pct":  round(peak_profit * 100, 4),
+        "giveback_ratio":   round(giveback_ratio, 4),
+        "move_maturity":    trade.get("move_maturity"),
+        "adaptive_offset":  _adaptive_offsets.get(label, 0.0),
     })
+
+    if giveback_ratio > 0 and peak_profit > 0.005:
+        log.info(f"📊 [{label}] Giveback: peak +{peak_profit*100:.1f}% → "
+                 f"exit {actual_profit*100:+.1f}% | gave back {giveback_ratio*100:.0f}%"
+                 + (f" ⚠️ trail too wide" if giveback_ratio > GIVEBACK_TARGET_HIGH else ""))
 
     # Track consecutive scalper losses for the streak circuit breaker
     global _consecutive_losses, _win_rate_pause_until
@@ -3283,6 +3679,14 @@ def close_position(trade, reason) -> bool:
             _consecutive_losses += 1
         else:
             _consecutive_losses = 0   # any win resets the streak
+
+    # ── Adaptive learning — update thresholds + rebalance budgets ──
+    # These run on every close so the bot continuously adjusts to market conditions.
+    try:
+        update_adaptive_thresholds()
+        rebalance_budgets()
+    except Exception as e:
+        log.debug(f"Adaptive learning update failed: {e}")
 
     # Win-rate circuit breaker — check after every full (non-partial) close.
     # Only counts SCALPER trades since the CB only blocks scalper entries.
@@ -3806,7 +4210,7 @@ def _compute_metrics(trades: list) -> dict:
 
     # Per-strategy breakdown
     by_label = {}
-    for lbl in ("SCALPER", "MOONSHOT", "REVERSAL"):
+    for lbl in ("SCALPER", "MOONSHOT", "REVERSAL", "TRINITY"):
         lt = [t for t in full if t.get("label") == lbl]
         if not lt:
             continue
@@ -3827,6 +4231,16 @@ def _compute_metrics(trades: list) -> dict:
         r = t.get("exit_reason", "UNKNOWN")
         by_reason[r] = by_reason.get(r, 0) + 1
 
+    # ── Giveback stats — how much peak profit is being returned ──
+    givebacks = [t.get("giveback_ratio", 0) for t in full
+                 if t.get("giveback_ratio") is not None and t.get("peak_profit_pct", 0) > 0.5]
+    avg_giveback = sum(givebacks) / len(givebacks) if givebacks else None
+
+    # ── Move maturity stats — are we entering too late? ──
+    maturities = [t.get("move_maturity", 0) for t in full
+                  if t.get("move_maturity") is not None]
+    avg_maturity = sum(maturities) / len(maturities) if maturities else None
+
     return {
         "total":         n,
         "wins":          len(wins),
@@ -3842,6 +4256,8 @@ def _compute_metrics(trades: list) -> dict:
         "worst":         worst,
         "by_label":      by_label,
         "by_reason":     by_reason,
+        "avg_giveback":  avg_giveback,
+        "avg_maturity":  avg_maturity,
     }
 
 
@@ -3896,6 +4312,29 @@ def _cmd_metrics(balance: float):
     lines.append(f"Worst: {worst['symbol']} {worst['pnl_pct']:+.2f}% "
                  f"({worst.get('exit_reason','?')})")
 
+    # ── Adaptive learning stats ──────────────────────────────
+    adaptive_lines = []
+    if m.get("avg_giveback") is not None:
+        gb = m["avg_giveback"]
+        gb_status = ("✅ optimal" if GIVEBACK_TARGET_LOW <= gb <= GIVEBACK_TARGET_HIGH
+                     else "⚠️ trail too wide" if gb > GIVEBACK_TARGET_HIGH
+                     else "⚠️ trail too tight")
+        adaptive_lines.append(f"Giveback: {gb*100:.0f}% avg ({gb_status})")
+    if m.get("avg_maturity") is not None:
+        mat = m["avg_maturity"]
+        mat_status = ("✅ early entries" if mat < 0.6
+                      else "⚠️ mid-move entries" if mat < 0.8
+                      else "🔴 late entries")
+        adaptive_lines.append(f"Maturity: {mat*100:.0f}% avg ({mat_status})")
+    s_off = _adaptive_offsets.get("SCALPER", 0)
+    m_off = _adaptive_offsets.get("MOONSHOT", 0)
+    if s_off != 0 or m_off != 0:
+        adaptive_lines.append(f"Thresholds: S={get_effective_threshold('SCALPER'):.0f} "
+                              f"M={get_effective_threshold('MOONSHOT'):.0f}")
+    if adaptive_lines:
+        lines.append("━━━━━━━━━━━━━━━")
+        lines.append("🧬 " + " | ".join(adaptive_lines))
+
     telegram("\n".join(lines)[:4000])
 
 
@@ -3908,7 +4347,7 @@ def _cmd_config():
     telegram(
         f"⚙️ <b>Current Config</b>\n━━━━━━━━━━━━━━━\n"
         f"🟢 <b>Scalper</b>\n"
-        f"  Max: {SCALPER_MAX_TRADES} × {SCALPER_BUDGET_PCT*100:.0f}% cap | 1% risk/trade\n"
+        f"  Max: {SCALPER_MAX_TRADES} × {get_effective_budget_pct('SCALPER')*100:.0f}% cap | 1% risk/trade\n"
         f"  TP: dynamic {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% (signal-aware, candle-capped)\n"
         f"  SL: dynamic {SCALPER_SL_MIN*100:.1f}–{SCALPER_SL_MAX*100:.0f}% (noise-floored)\n"
         f"  Trail: ATR-stepped\n"
@@ -3943,6 +4382,15 @@ def _cmd_config():
         f"  Spread cap: {DEAD_COIN_SPREAD_MAX*100:.1f}% | {DEAD_COIN_CONSECUTIVE} fails → {DEAD_COIN_BLACKLIST_HOURS}h blacklist\n"
         f"  Active blacklist: {dead_active} symbols | Pending ({dead_pending} with strikes)\n"
         f"\n🧠 <b>Sentiment</b>: {'✅ on (web search)' if SENTIMENT_ENABLED and WEB_SEARCH_ENABLED else '✅ on (no web search — /ask + journal only)' if SENTIMENT_ENABLED else '⚠️ off'}\n"
+        f"\n🧬 <b>Adaptive Learning</b>\n"
+        f"  Scalper threshold: {SCALPER_THRESHOLD} base {_adaptive_offsets.get('SCALPER',0):+.0f} offset = {get_effective_threshold('SCALPER'):.0f}\n"
+        f"  Moonshot threshold: {MOONSHOT_MIN_SCORE} base {_adaptive_offsets.get('MOONSHOT',0):+.0f} offset = {get_effective_threshold('MOONSHOT'):.0f}\n"
+        f"  Scalper budget: {get_effective_budget_pct('SCALPER')*100:.0f}%"
+        + (f" (dynamic)" if _dynamic_scalper_budget else " (static)") + "\n"
+        f"  Moonshot budget: {get_effective_budget_pct('MOONSHOT')*100:.0f}%"
+        + (f" (dynamic)" if _dynamic_moonshot_budget else " (static)") + "\n"
+        f"  Maturity filter: penalty >{MATURITY_THRESHOLD*100:.0f}% (scalper) >{MATURITY_MOONSHOT_THRESHOLD*100:.0f}% (moon)\n"
+        f"  Fee-aware TP floor: {calc_fee_aware_tp_floor()*100:.2f}%\n"
         f"\n{'⏸️ PAUSED' if _paused else '▶️ RUNNING'}"
     )
 
@@ -4198,7 +4646,9 @@ def startup() -> float:
     """
     global scalper_trades, alt_trades, trade_history, _consecutive_losses, \
            _win_rate_pause_until, _scalper_excluded, _alt_excluded, _api_blacklist, \
-           _liquidity_blacklist, _liquidity_fail_count
+           _liquidity_blacklist, _liquidity_fail_count, \
+           _adaptive_offsets, _last_rebalance_count, \
+           _dynamic_scalper_budget, _dynamic_moonshot_budget
 
     mode = "📝 PAPER TRADING" if PAPER_TRADE else "💰 LIVE TRADING"
     log.info(f"🚀 MEXC Bot — {mode}")
@@ -4208,7 +4658,18 @@ def startup() -> float:
     (scalper_trades, alt_trades, trade_history,
      _consecutive_losses, _win_rate_pause_until, _streak_paused_at,
      _paused, _scalper_excluded, _alt_excluded, _api_blacklist,
-     _liquidity_blacklist, _liquidity_fail_count) = load_state()
+     _liquidity_blacklist, _liquidity_fail_count,
+     _adaptive_offsets, _last_rebalance_count,
+     _dynamic_scalper_budget, _dynamic_moonshot_budget) = load_state()
+
+    if _adaptive_offsets.get("SCALPER", 0) != 0 or _adaptive_offsets.get("MOONSHOT", 0) != 0:
+        log.info(f"🧠 [ADAPTIVE] Restored offsets: "
+                 f"SCALPER {_adaptive_offsets.get('SCALPER',0):+.0f} "
+                 f"MOONSHOT {_adaptive_offsets.get('MOONSHOT',0):+.0f}")
+    if _dynamic_scalper_budget or _dynamic_moonshot_budget:
+        log.info(f"💼 [REBALANCE] Restored budgets: "
+                 f"Scalper {(_dynamic_scalper_budget or SCALPER_BUDGET_PCT)*100:.0f}% "
+                 f"Moonshot {(_dynamic_moonshot_budget or MOONSHOT_BUDGET_PCT)*100:.0f}%")
 
     if _paused:
         log.info("⏸️  Bot restored in PAUSED state — send /resume to restart scanning")
@@ -4225,7 +4686,7 @@ def startup() -> float:
     telegram(
         f"🚀 <b>MEXC Bot Started</b> [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"Balance: <b>${startup_balance:.2f} USDT</b>\n"
-        f"\n🟢 <b>Scalper</b> (max {SCALPER_MAX_TRADES} × {SCALPER_BUDGET_PCT*100:.0f}%)\n"
+        f"\n🟢 <b>Scalper</b> (max {SCALPER_MAX_TRADES} × {get_effective_budget_pct('SCALPER')*100:.0f}%)\n"
         f"  TP/SL: dynamic (signal-aware ATR×mult, candle-capped, noise-floored)\n"
         f"  TP range: {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% | SL range: {SCALPER_SL_MIN*100:.1f}–{SCALPER_SL_MAX*100:.0f}%\n"
         f"  Entry threshold: score ≥ {SCALPER_THRESHOLD} | 1h vol ≥ ${SCALPER_MIN_1H_VOL:,}\n"
@@ -4243,6 +4704,9 @@ def startup() -> float:
         f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%  max {REVERSAL_MAX_HOURS}h\n"
         f"\n🧠 <b>AI</b>: {'✅ Haiku + web search' if SENTIMENT_ENABLED and WEB_SEARCH_ENABLED else '✅ Haiku only (/ask + journal)' if SENTIMENT_ENABLED else '⚠️ disabled (set ANTHROPIC_API_KEY)'}\n"
         f"  Cache: {SENTIMENT_CACHE_MINS}min | Bonus: +{SENTIMENT_MAX_BONUS}pts | Penalty: -{SENTIMENT_MAX_PENALTY}pts\n"
+        f"\n🧬 <b>Adaptive Learning</b>: ✅ enabled\n"
+        f"  Maturity filter | Momentum-decay exit | Rolling threshold tuning\n"
+        f"  Fee-aware TP floor: {calc_fee_aware_tp_floor()*100:.2f}% | Budget rebalancing every {PERF_REBALANCE_TRADES} trades\n"
         f"\n<i>/status · /metrics · /pnl · /logs · /config · /pause · /resume · /close · /restart · /resetstreak · /ask</i>"
     )
     return startup_balance
@@ -4428,7 +4892,7 @@ def run():
                     log.debug(f"BTC rebound check error: {_e}")
 
             # ── Scalper ───────────────────────────────────────
-            budget = round(balance * SCALPER_BUDGET_PCT, 2)
+            budget = round(balance * get_effective_budget_pct("SCALPER"), 2)
 
             # ── BTC regime checks + scalper entry ─────────────
             # Only runs when actually considering a scalper entry.
@@ -4501,7 +4965,7 @@ def run():
                                          else KELLY_MULT_MARGINAL)
                     log.info(f"💰 [SCALPER] Risk budget: ${trade_budget:.2f} "
                              f"(Kelly {opp['kelly_mult']:.2f}× | 1% risk @ SL {pre_sl*100:.2f}%, "
-                             f"cap ${round(balance*SCALPER_BUDGET_PCT,2):.2f})")
+                             f"cap ${round(balance*get_effective_budget_pct('SCALPER'),2):.2f})")
                     trade = open_position(opp, trade_budget, pre_tp, pre_sl, "SCALPER")
                     if trade:
                         scalper_trades.append(trade)
@@ -4567,7 +5031,8 @@ def run():
 
             # ── Alt (Trinity / Moonshot / Reversal) ──────────────
             if not _paused and len(alt_trades) < ALT_MAX_TRADES:
-                ideal  = round(total_value * MOONSHOT_BUDGET_PCT, 2)
+                eff_moon_pct = get_effective_budget_pct("MOONSHOT")
+                ideal  = round(total_value * eff_moon_pct, 2)
                 budget = min(ideal, balance)
                 min_alt = MOONSHOT_MIN_NOTIONAL
 
@@ -4606,12 +5071,12 @@ def run():
                             ticker_row = tickers[tickers["symbol"] == opp["symbol"]]
                             if not ticker_row.empty:
                                 vol_24h = float(ticker_row["quoteVolume"].iloc[0])
-                                vol_pct = min(MOONSHOT_BUDGET_PCT, vol_24h / MOONSHOT_VOL_DIVISOR)
+                                vol_pct = min(eff_moon_pct, vol_24h / MOONSHOT_VOL_DIVISOR)
                             else:
                                 vol_24h = None
-                                vol_pct = MOONSHOT_BUDGET_PCT
+                                vol_pct = eff_moon_pct
                             budget = max(min_alt, min(round(total_value * vol_pct, 2), balance))
-                            if vol_pct < MOONSHOT_BUDGET_PCT and vol_24h is not None:
+                            if vol_pct < eff_moon_pct and vol_24h is not None:
                                 log.info(f"💰 [MOONSHOT] Vol-weighted: "
                                          f"{vol_pct*100:.1f}% (24h vol ${vol_24h:,.0f}) → ${budget:.2f}")
                             trade = open_position(opp, budget, MOONSHOT_TP_INITIAL, MOONSHOT_SL,
