@@ -1456,6 +1456,9 @@ def update_adaptive_thresholds():
       - Sharpe > 0.5 → relax by ADAPTIVE_RELAX_STEP (entries are good)
       - Otherwise   → no change (wait for clearer signal)
 
+    Also logs per-signal win rates so /metrics can surface which signals
+    are consistently profitable vs. which are dragging performance.
+
     Offsets are bounded by ADAPTIVE_MAX_OFFSET / ADAPTIVE_MIN_OFFSET.
     """
     global _adaptive_offsets
@@ -1490,9 +1493,47 @@ def update_adaptive_thresholds():
 
         if new_offset != old_offset:
             _adaptive_offsets[strategy] = new_offset
+
+            # Per-signal breakdown for the log — shows which signals are working
+            signal_stats = _compute_signal_stats(full)
+            signal_summary = " | ".join(
+                f"{sig}:{s['wins']}W/{s['total']-s['wins']}L"
+                for sig, s in sorted(signal_stats.items())
+                if s["total"] >= 2
+            )
+
             log.info(f"🧠 [ADAPTIVE] {strategy} threshold {direction}: "
                      f"offset {old_offset:+.0f} → {new_offset:+.0f} "
-                     f"(Sharpe={sharpe:.2f} over {n} trades)")
+                     f"(Sharpe={sharpe:.2f} over {n} trades)"
+                     + (f" [{signal_summary}]" if signal_summary else ""))
+
+
+def _compute_signal_stats(trades: list) -> dict:
+    """
+    Compute per-signal win rate and P&L from a list of trades.
+    Returns {signal: {total, wins, losses, avg_pnl, win_rate}}.
+    Shared by update_adaptive_thresholds and _compute_metrics.
+    """
+    by_signal: dict = {}
+    for t in trades:
+        sig = t.get("entry_signal", "UNKNOWN")
+        if sig not in by_signal:
+            by_signal[sig] = {"total": 0, "wins": 0, "losses": 0,
+                              "pnl_sum": 0.0, "pnl_list": []}
+        by_signal[sig]["total"] += 1
+        by_signal[sig]["pnl_sum"] += t.get("pnl_pct", 0)
+        by_signal[sig]["pnl_list"].append(t.get("pnl_pct", 0))
+        if t.get("pnl_pct", 0) > 0:
+            by_signal[sig]["wins"] += 1
+        else:
+            by_signal[sig]["losses"] += 1
+
+    # Compute derived stats
+    for sig, s in by_signal.items():
+        s["avg_pnl"]  = round(s["pnl_sum"] / s["total"], 2) if s["total"] > 0 else 0.0
+        s["win_rate"] = round(s["wins"] / s["total"] * 100, 1) if s["total"] > 0 else 0.0
+        del s["pnl_list"]  # don't carry raw data forward
+    return by_signal
 
 
 def get_effective_threshold(strategy: str) -> float:
@@ -1609,6 +1650,64 @@ def calc_fee_aware_tp_floor() -> float:
 
     floor = effective_fee + FEE_SLIPPAGE_BUFFER + FEE_MIN_PROFIT
     return round(floor, 4)
+
+
+# ── Entry Signal Classification ───────────────────────────────
+
+def classify_entry_signal(crossed_now: bool = False, vol_ratio: float = 1.0,
+                          rsi: float = 50.0, is_new: bool = False,
+                          is_trending: bool = False,
+                          label: str = "SCALPER") -> str:
+    """
+    Classify the dominant entry signal driving a trade.
+
+    Used by:
+      - _score_scalper / _score_moonshot to tag the opp dict
+      - calc_dynamic_tp_sl to select TP/SL multipliers (replacing duplicated if/elif)
+      - update_adaptive_thresholds for per-signal performance tracking
+
+    Signal priority (first match wins, same order as TP/SL classification):
+      CROSSOVER  — fresh EMA9/21 crossover (strongest momentum confirmation)
+      VOL_SPIKE  — volume ≥3× average (scalper) or burst detected (moonshot)
+      OVERSOLD   — RSI < 40 (mean-reversion entry)
+      TRENDING   — socially trending coin (moonshot only)
+      NEW_LISTING— recently listed coin (moonshot only)
+      TREND      — default: price trending above EMAs but no fresh signal
+
+    REVERSAL and TRINITY have fixed signals set by their own scorers.
+    """
+    if label in ("REVERSAL",):
+        return "CAPITULATION_BOUNCE"
+    if label in ("TRINITY",):
+        return "DEEP_DIP_RECOVERY"
+    if crossed_now:
+        return "CROSSOVER"
+    if vol_ratio >= 3.0:
+        return "VOL_SPIKE"
+    if rsi < 40:
+        return "OVERSOLD"
+    if is_trending:
+        return "TRENDING"
+    if is_new:
+        return "NEW_LISTING"
+    return "TREND"
+
+
+# ── Signal → TP/SL multiplier mapping ────────────────────────
+
+_SIGNAL_TP_MULT = {
+    "CROSSOVER":  SCALPER_TP_MULT_CROSSOVER,
+    "VOL_SPIKE":  SCALPER_TP_MULT_VOL_SPIKE,
+    "OVERSOLD":   SCALPER_TP_MULT_OVERSOLD,
+    "TREND":      SCALPER_TP_MULT_DEFAULT,
+    "TRENDING":   SCALPER_TP_MULT_DEFAULT,
+    "NEW_LISTING":SCALPER_TP_MULT_DEFAULT,
+}
+
+_SIGNAL_SL_MULT = {
+    "VOL_SPIKE":  SCALPER_SL_MULT_VOL_SPIKE,
+    "OVERSOLD":   SCALPER_SL_MULT_OVERSOLD,
+}
 
 def parse_klines(symbol, interval="5m", limit=60, min_len=30) -> pd.DataFrame | None:
     # Short-TTL cache — avoids duplicate fetches when evaluate and score
@@ -1804,6 +1903,8 @@ def _score_scalper(sym: str, strict: bool = False) -> dict | None:
         "ema50_penalty":   ema50_penalty,
         "move_maturity":   round(move_mat, 3),
         "maturity_penalty":mat_pen,
+        "entry_signal":    classify_entry_signal(crossed_now=crossed_now,
+                                                  vol_ratio=vol_ratio, rsi=rsi),
         "price":           curr_close,
         "atr_pct":         round(atr_pct, 6),
         # ATR-based trail width — stored here, transferred to trade dict at open_position.
@@ -1980,6 +2081,7 @@ def find_scalper_opportunity(budget: float, exclude: set, open_symbols: set) -> 
 
     age_mins = (time.time() - _watchlist_at) / 60
     scanner_log(f"📊 [SCALPER] Top: {best['symbol']} | Score: {best['score']}/100 | "
+                f"Signal: {best.get('entry_signal','?')} | "
                 f"RSI: {best['rsi']} | ATR: {best['atr_pct']*100:.2f}% | "
                 f"watchlist age: {age_mins:.0f}min")
 
@@ -2224,6 +2326,11 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
             "rsi_delta":    round(rsi_delta, 2),
             "vol_ratio":    round(vol_ratio, 2),
             "vol_1h_usdt":  round(recent_1h_vol, 0),
+            "entry_signal": classify_entry_signal(crossed_now=crossed,
+                                                   vol_ratio=vol_ratio, rsi=rsi,
+                                                   is_new=is_new,
+                                                   is_trending=(sym in trending_syms),
+                                                   label="MOONSHOT"),
             "price":        float(close.iloc[-1]),
             "_df":          df_k,
             "_is_new":      is_new,
@@ -2363,6 +2470,7 @@ def evaluate_reversal_candidate(sym: str) -> dict | None:
         "symbol":      sym,
         "price":       entry_est,
         "rsi":         round(rsi, 2),
+        "entry_signal":"CAPITULATION_BOUNCE",
         # Composite score: lower RSI = more oversold (better), higher recovery/vol = stronger signal.
         # Inverted RSI so sorting ascending by score gives best candidates first.
         "score":       round((REVERSAL_MAX_RSI - rsi) + recovery * 20 + (curr_vol / avg_vol if avg_vol > 0 else 1.0), 2),
@@ -2475,11 +2583,12 @@ def evaluate_trinity_candidate(sym: str) -> dict | None:
              f"R:R {tp_pct/sl_pct:.1f}:1")
 
     return {
-        "symbol":   sym,
-        "price":    price_now,
-        "rsi":      round(rsi, 2),
-        "vol_ratio":round(vol_burst, 2),
-        "atr_pct":  round(atr_pct, 6),
+        "symbol":       sym,
+        "price":        price_now,
+        "rsi":          round(rsi, 2),
+        "vol_ratio":    round(vol_burst, 2),
+        "entry_signal": "DEEP_DIP_RECOVERY",
+        "atr_pct":      round(atr_pct, 6),
         "tp_pct":   round(tp_pct, 6),
         "sl_pct":   round(sl_pct, 6),
         "drop_pct": round(drop_pct * 100, 2),
@@ -2700,22 +2809,15 @@ def calc_dynamic_tp_sl(opp: dict) -> tuple[float, float, str, str]:
     rsi            = opp.get("rsi",             50.0)
     score          = opp.get("score",           0.0)
     crossed_now    = opp.get("crossed_now",     False)
-    ema21_dist_pct = opp.get("ema21_dist_pct",  atr_pct * 1.5)  # 1.5× ATR fallback for EMA21 distance
+    ema21_dist_pct = opp.get("ema21_dist_pct",  atr_pct * 1.5)
     avg_candle_pct = opp.get("avg_candle_pct",  atr_pct)
+    signal         = opp.get("entry_signal",
+                             classify_entry_signal(crossed_now=crossed_now,
+                                                    vol_ratio=vol_ratio, rsi=rsi))
 
-    # ── TP ─────────────────────────────────────────────────────
-    if crossed_now:
-        tp_mult  = SCALPER_TP_MULT_CROSSOVER
-        tp_label = f"crossover×{tp_mult}"
-    elif vol_ratio >= 3.0:
-        tp_mult  = SCALPER_TP_MULT_VOL_SPIKE
-        tp_label = f"vol×{tp_mult}"
-    elif rsi < 40:
-        tp_mult  = SCALPER_TP_MULT_OVERSOLD
-        tp_label = f"oversold×{tp_mult}"
-    else:
-        tp_mult  = SCALPER_TP_MULT_DEFAULT
-        tp_label = f"trend×{tp_mult}"
+    # ── TP — driven by entry signal via lookup table ───────────
+    tp_mult  = _SIGNAL_TP_MULT.get(signal, SCALPER_TP_MULT_DEFAULT)
+    tp_label = f"{signal.lower()}×{tp_mult}"
 
     atr_tp      = atr_pct * tp_mult
     candle_cap  = avg_candle_pct * SCALPER_TP_CANDLE_MULT
@@ -2727,13 +2829,10 @@ def calc_dynamic_tp_sl(opp: dict) -> tuple[float, float, str, str]:
     if atr_tp > candle_cap:
         tp_label += f" (candle-capped {candle_cap*100:.1f}%)"
 
-    # ── SL ─────────────────────────────────────────────────────
-    if vol_ratio >= 3.0:
-        sl_mult  = SCALPER_SL_MULT_VOL_SPIKE
-        sl_label = f"tight×{sl_mult} (vol spike)"
-    elif rsi < 40:
-        sl_mult  = SCALPER_SL_MULT_OVERSOLD
-        sl_label = f"tight×{sl_mult} (oversold)"
+    # ── SL — driven by entry signal, with score-based override ──
+    if signal in _SIGNAL_SL_MULT:
+        sl_mult  = _SIGNAL_SL_MULT[signal]
+        sl_label = f"tight×{sl_mult} ({signal.lower()})"
     elif score >= SCALPER_BREAKEVEN_SCORE:
         sl_mult  = SCALPER_SL_MULT_HIGH_CONF
         sl_label = f"wide×{sl_mult} (high confidence)"
@@ -2746,7 +2845,7 @@ def calc_dynamic_tp_sl(opp: dict) -> tuple[float, float, str, str]:
     # For crossover entries, anchor SL to EMA21 distance — that's where
     # the thesis actually breaks. Use whichever is larger (EMA21 or ATR-based)
     # to avoid placing SL inside normal price oscillation.
-    if crossed_now and ema21_dist_pct > 0:
+    if signal == "CROSSOVER" and ema21_dist_pct > 0:
         sl_pct   = max(atr_sl, ema21_dist_pct)
         sl_label = f"EMA21 anchor ({ema21_dist_pct*100:.2f}%)"
     else:
@@ -2973,6 +3072,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         "opened_at":      datetime.now(timezone.utc).isoformat(),
         "score":          opp.get("score", 0),
         "rsi":            opp.get("rsi", 0),
+        "entry_signal":   opp.get("entry_signal", "UNKNOWN"),
         "sentiment":      opp.get("sentiment"),
         # ATR-based trail width — set at entry from scorer, persisted across restarts.
         # check_exit uses this instead of the static SCALPER_TRAIL_PCT constant.
@@ -3098,7 +3198,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         f"{breakeven_line}"
         f"{timeout_line}"
         f"{tp_status}\n"
-        f"Score: {opp.get('score',0)}"
+        f"Score: {opp.get('score',0)} | Signal: {opp.get('entry_signal','?')}"
         + (f" 🔥 (confluence +{opp.get('confluence_bonus',0):.0f})" if opp.get('confluence_bonus') else "")
         + (f" 📐 (keltner +{opp.get('keltner_bonus',0):.0f})" if opp.get('keltner_bonus') else "")
         + f" | RSI: {opp.get('rsi','?')} ({opp.get('rsi_delta',0):+.1f}) | Vol: {opp.get('vol_ratio','?')}x"
@@ -3729,14 +3829,19 @@ def close_position(trade, reason) -> bool:
 
     fee_line   = f"Fees:    ${fee_usdt:.4f}\n" if fee_usdt > 0 else ""
     fills_note = "✅ actual fills" if exit_fills.get("avg_sell_price") else "⚠️ estimated"
+    signal_str = trade.get("entry_signal", "")
+    peak_line  = (f"Peak:    +{peak_profit*100:.1f}% (gave back {giveback_ratio*100:.0f}%)\n"
+                  if peak_profit > 0.005 else "")
 
     telegram(
         f"{emoji} <b>{reason_label} — {label}</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"Pair:    <b>{symbol}</b>\n"
+        f"Pair:    <b>{symbol}</b>"
+        + (f"  [{signal_str}]" if signal_str else "") + "\n"
         f"Entry:   ${actual_entry:.6f}\n"
         f"Exit:    <b>${actual_exit:.6f}</b>  [{fills_note}]\n"
         f"P&L:     <b>{pnl_pct:+.2f}%  (${pnl_usdt:+.2f})</b>\n"
+        f"{peak_line}"
         f"{fee_line}"
         f"━━━━━━━━━━━━━━━\n"
         f"Session: {len(full_trades)} trades | Win: {win_rate:.0f}% | P&L: ${total_pnl:+.2f}"
@@ -3937,10 +4042,12 @@ def generate_daily_journal(today_trades: list, balance: float) -> str:
             held = 0
         lines.append(
             f"{t['symbol']} [{t['label']}] "
+            f"signal={t.get('entry_signal','?')} "
             f"entry={t.get('entry_price',0):.6f} exit={t.get('exit_price',0):.6f} "
             f"pnl={t.get('pnl_pct',0):+.2f}% (${t.get('pnl_usdt',0):+.2f}) "
             f"reason={t.get('exit_reason','?')} "
             f"score={t.get('score',0):.0f} rsi={t.get('rsi',0):.0f} "
+            f"peak={t.get('peak_profit_pct',0):+.1f}% giveback={t.get('giveback_ratio',0)*100:.0f}% "
             f"held={held}min"
         )
 
@@ -3956,7 +4063,8 @@ def generate_daily_journal(today_trades: list, balance: float) -> str:
         + "\n\nWrite a short journal entry (max 5 bullet points) covering:\n"
         "• What worked and what didn't — specific patterns, not generalities\n"
         "• Best and worst trade and why\n"
-        "• Any time-of-day, RSI, or exit-reason patterns worth noting\n"
+        "• Entry signal patterns: which signals (CROSSOVER, VOL_SPIKE, OVERSOLD, TREND) are winning vs losing?\n"
+        "• Giveback analysis: are we giving back too much peak profit? Note any trades with >50% giveback\n"
         "• One concrete observation for tomorrow\n\n"
         "Keep it under 200 words. Be honest, not cheerful."
     )
@@ -4241,6 +4349,9 @@ def _compute_metrics(trades: list) -> dict:
                   if t.get("move_maturity") is not None]
     avg_maturity = sum(maturities) / len(maturities) if maturities else None
 
+    # ── Per-signal performance breakdown ─────────────────────────
+    by_signal = _compute_signal_stats(full)
+
     return {
         "total":         n,
         "wins":          len(wins),
@@ -4256,6 +4367,7 @@ def _compute_metrics(trades: list) -> dict:
         "worst":         worst,
         "by_label":      by_label,
         "by_reason":     by_reason,
+        "by_signal":     by_signal,
         "avg_giveback":  avg_giveback,
         "avg_maturity":  avg_maturity,
     }
@@ -4302,6 +4414,23 @@ def _cmd_metrics(balance: float):
         reason_parts = [f"{r}: {c}" for r, c in
                         sorted(m["by_reason"].items(), key=lambda x: -x[1])]
         lines.append("Exits: " + "  ".join(reason_parts))
+
+    # ── Per-signal performance ────────────────────────────────
+    if m.get("by_signal"):
+        sig_parts = []
+        for sig, s in sorted(m["by_signal"].items(),
+                              key=lambda x: -x[1]["total"]):
+            if s["total"] < 2:
+                continue
+            emoji = "✅" if s["win_rate"] >= 50 else "⚠️" if s["win_rate"] >= 30 else "🔴"
+            sig_parts.append(f"{emoji}{sig}: {s['total']}t "
+                             f"{s['win_rate']:.0f}%WR "
+                             f"avg {s['avg_pnl']:+.1f}%")
+        if sig_parts:
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append("Signals:")
+            for sp in sig_parts:
+                lines.append(f"  {sp}")
 
     # ── Best / worst ─────────────────────────────────────────
     best  = m["best"]
@@ -4436,6 +4565,7 @@ def _cmd_ask(question: str, balance: float):
                           datetime.fromisoformat(t["opened_at"])).total_seconds() / 60)
             context_lines.append(
                 f"{t.get('closed_at','?')[:16]} {t['symbol']} [{t['label']}] "
+                f"signal={t.get('entry_signal','?')} "
                 f"pnl={t.get('pnl_pct',0):+.2f}% reason={t.get('exit_reason','?')} "
                 f"score={t.get('score',0):.0f} rsi={t.get('rsi',0):.0f} held={held}min"
             )
