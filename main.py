@@ -15,6 +15,7 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Locked balance handling (free+locked) to prevent premature exit
   • Market regime detection (adjusts entry thresholds based on BTC volatility/trend)
   • Chase limit orders for profit exits (reduces slippage)
+  • Balance verification on close – retries until position is actually gone
 """
 
 import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re, math
@@ -978,6 +979,25 @@ def get_available_balance() -> float:
         return 0.0
     except Exception as e:
         log.error(f"Balance fetch failed: {e}")
+        return 0.0
+
+def get_asset_balance(symbol: str) -> float:
+    """Return total (free + locked) balance of the base asset."""
+    if PAPER_TRADE:
+        # For paper trading, just return the qty from the trade state
+        for t in scalper_trades + alt_trades:
+            if t["symbol"] == symbol:
+                return t["qty"]
+        return 0.0
+    try:
+        asset = symbol.replace("USDT", "")
+        data = private_get("/api/v3/account")
+        for b in data.get("balances", []):
+            if b["asset"] == asset:
+                return float(b.get("free", 0)) + float(b.get("locked", 0))
+        return 0.0
+    except Exception as e:
+        log.error(f"Failed to fetch balance for {symbol}: {e}")
         return 0.0
 
 def calc_rsi(series, period=14) -> float:
@@ -3058,48 +3078,48 @@ def close_position(trade, reason) -> bool:
                     break
             trade["tp_order_id"] = None
 
-        # Use chase limit order for profit exits, market for stop loss
-        if reason in ("STOP_LOSS", "HARD_SL"):
-            # Urgent – use market sell
-            try:
-                result = private_post("/api/v3/order", {
-                    "symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": str(trade["qty"])
-                })
-                sell_order_id = result.get("orderId")
-                log.info(f"✅ [{label}] Market sell ({reason}): {result}")
-            except requests.exceptions.HTTPError as e:
-                try:    body = e.response.json()
-                except Exception: body = e.response.text if e.response else "no response"
-                code = body.get("code") if isinstance(body, dict) else None
-                msg  = body.get("msg",  body) if isinstance(body, dict) else body
-                log.error(f"🚨 [{label}] Market sell failed (code={code}): {msg}")
-                if code in (30005, -2010) or "insufficient" in str(msg).lower() or "balance" in str(msg).lower():
-                    log.warning(f"⚠️ [{label}] {symbol} — position already closed on exchange "
-                                f"(TP limit likely filled just before SL). Checking fills...")
-                    telegram(f"⚠️ [{label}] <b>{symbol}</b> ({reason})\n"
-                             f"Market sell returned 'insufficient balance' — "
-                             f"TP limit order may have filled simultaneously.\n"
-                             f"Treating as TAKE_PROFIT and checking actual fills.")
-                elif code == 10007 or "not support" in str(msg).lower():
-                    _api_blacklist.add(symbol)
-                    log.warning(f"⚠️ [{label}] {symbol} not API-tradeable — blacklisted.")
-                    telegram(f"🚨 <b>Sell failed!</b> [{label}] {symbol} ({reason})\n"
-                             f"Error: {str(msg)[:200]}\n"
-                             f"Symbol blacklisted — close manually on MEXC.")
-                    return False
+        max_sell_attempts = 3
+        for attempt in range(max_sell_attempts):
+            if reason in ("STOP_LOSS", "HARD_SL"):
+                try:
+                    result = private_post("/api/v3/order", {
+                        "symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": str(trade["qty"])
+                    })
+                    sell_order_id = result.get("orderId")
+                    log.info(f"✅ [{label}] Market sell ({reason}) attempt {attempt+1}: {result}")
+                except Exception as e:
+                    log.error(f"🚨 [{label}] Market sell failed (attempt {attempt+1}): {e}")
+                    sell_order_id = None
+            else:
+                result = chase_limit_sell(symbol, trade["qty"], label, tag=reason)
+                sell_order_id = result.get("orderId") if result else None
+                if not result:
+                    log.error(f"🚨 [{label}] Chase limit sell failed (attempt {attempt+1})")
+                    sell_order_id = None
+
+            if sell_order_id:
+                time.sleep(1)
+                remaining = get_asset_balance(symbol)
+                if remaining < trade["qty"] * 0.01:
+                    log.info(f"✅ [{label}] Position {symbol} closed after attempt {attempt+1}")
+                    break
                 else:
-                    telegram(f"🚨 <b>Sell failed!</b> [{label}] {symbol} ({reason})\n"
-                             f"Code: {code} — {str(msg)[:200]}\n"
-                             f"Close manually on MEXC.")
-                    return False
-        else:
-            # Profit exit – use chase limit order
-            result = chase_limit_sell(symbol, trade["qty"], label, tag=reason)
-            sell_order_id = result.get("orderId") if result else None
-            if not result:
-                log.error(f"🚨 [{label}] Chase limit sell failed for {symbol} – manual intervention may be needed.")
-                return False
-    # Continue with exit_fills, etc. as before (unchanged from previous version)
+                    log.warning(f"⚠️ [{label}] Sell order placed but still have {remaining:.4f} {symbol} – retrying")
+                    if attempt < max_sell_attempts - 1:
+                        time.sleep(2)
+            else:
+                if attempt < max_sell_attempts - 1:
+                    time.sleep(2)
+
+        final_remaining = get_asset_balance(symbol)
+        if final_remaining > trade["qty"] * 0.01:
+            log.error(f"🚨 [{label}] Could not close position {symbol} after {max_sell_attempts} attempts! Remaining {final_remaining:.4f}")
+            telegram(f"🚨 <b>Failed to close position!</b> {label} {symbol}\n"
+                     f"Reason: {reason}\n"
+                     f"Remaining: {final_remaining:.4f}\n"
+                     f"Manual intervention required.")
+            return False
+
     exit_fills = {}
     if not PAPER_TRADE:
         bought_at_ms  = trade.get("bought_at_ms", int(time.time() * 1000) - 86400_000)
