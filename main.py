@@ -16,6 +16,7 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Market regime detection (adjusts entry thresholds based on BTC volatility/trend)
   • Chase limit orders for profit exits (reduces slippage)
   • Balance verification on close – retries until position is actually gone
+  • Oversold (30005) error handling – treats as already closed without spam
 """
 
 import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re, math
@@ -355,6 +356,9 @@ _btc_ema_gap:         float = 0.0
 _fast_cycle_counter = 0
 MAX_FAST_CYCLES = 10
 _market_regime_mult = 1.0   # default neutral
+
+# Throttle for 30005 errors
+_last_oversold_alert: dict = {}
 
 # ── WebSocket monitor (unchanged) ───────────────────────────
 WS_URL          = "wss://wbs-api.mexc.com/ws"
@@ -2450,6 +2454,17 @@ def chase_limit_sell(symbol: str, qty: float, label: str, tag: str = "", timeout
             # Not filled in time – cancel
             log.info(f"⏰ [{label}] Chase limit order {order_id} not filled in {timeout}s — cancelling and retrying")
             cancel_order(symbol, order_id, label)
+        except requests.exceptions.HTTPError as e:
+            # Handle "oversold" (already closed) gracefully
+            try:
+                body = e.response.json()
+                if isinstance(body, dict) and body.get("code") == 30005:
+                    log.debug(f"[{label}] Chase limit sell: {symbol} already closed (code 30005) — treating as success")
+                    # Return a dummy result to indicate success
+                    return {"orderId": f"DUMMY_{tag}_{int(time.time())}", "status": "FILLED"}
+            except Exception:
+                pass
+            log.warning(f"[{label}] Chase limit order failed on attempt {attempt+1}: {e}")
         except Exception as e:
             log.warning(f"[{label}] Chase limit order failed on attempt {attempt+1}: {e}")
 
@@ -2468,6 +2483,10 @@ def chase_limit_sell(symbol: str, qty: float, label: str, tag: str = "", timeout
     except requests.exceptions.HTTPError as e:
         try:    body = e.response.json()
         except Exception: body = e.response.text if e.response else "no response"
+        # Special handling for 30005 (already closed)
+        if isinstance(body, dict) and body.get("code") == 30005:
+            log.debug(f"[{label}] Market sell: {symbol} already closed (code 30005) — treating as success")
+            return {"orderId": f"DUMMY_{tag}_{int(time.time())}", "status": "FILLED"}
         log.error(f"🚨 [{label}] Market SELL failed: {body}")
         telegram(f"🚨 <b>SELL failed!</b> [{label}] {symbol} qty={qty}\n{str(body)[:200]}\nManual intervention required.")
         return None
@@ -3087,14 +3106,26 @@ def close_position(trade, reason) -> bool:
                     })
                     sell_order_id = result.get("orderId")
                     log.info(f"✅ [{label}] Market sell ({reason}) attempt {attempt+1}: {result}")
-                except Exception as e:
+                except requests.exceptions.HTTPError as e:
+                    try:
+                        body = e.response.json()
+                        if isinstance(body, dict) and body.get("code") == 30005:
+                            log.debug(f"[{label}] Market sell: {symbol} already closed (code 30005) — treating as success")
+                            # No need to retry, break loop
+                            sell_order_id = f"DUMMY_{reason}_{int(time.time())}"
+                            break
+                    except Exception:
+                        pass
                     log.error(f"🚨 [{label}] Market sell failed (attempt {attempt+1}): {e}")
                     sell_order_id = None
             else:
                 result = chase_limit_sell(symbol, trade["qty"], label, tag=reason)
-                sell_order_id = result.get("orderId") if result else None
-                if not result:
-                    log.error(f"🚨 [{label}] Chase limit sell failed (attempt {attempt+1})")
+                if result:
+                    sell_order_id = result.get("orderId")
+                    if "DUMMY" in str(sell_order_id):
+                        log.debug(f"[{label}] Chase limit sell returned dummy order (already closed)")
+                        break
+                else:
                     sell_order_id = None
 
             if sell_order_id:
@@ -3114,10 +3145,13 @@ def close_position(trade, reason) -> bool:
         final_remaining = get_asset_balance(symbol)
         if final_remaining > trade["qty"] * 0.01:
             log.error(f"🚨 [{label}] Could not close position {symbol} after {max_sell_attempts} attempts! Remaining {final_remaining:.4f}")
-            telegram(f"🚨 <b>Failed to close position!</b> {label} {symbol}\n"
-                     f"Reason: {reason}\n"
-                     f"Remaining: {final_remaining:.4f}\n"
-                     f"Manual intervention required.")
+            # Only send telegram once per symbol to avoid spam
+            if symbol not in _last_oversold_alert or time.time() - _last_oversold_alert[symbol] > 300:
+                _last_oversold_alert[symbol] = time.time()
+                telegram(f"🚨 <b>Failed to close position!</b> {label} {symbol}\n"
+                         f"Reason: {reason}\n"
+                         f"Remaining: {final_remaining:.4f}\n"
+                         f"Manual intervention required.")
             return False
 
     exit_fills = {}
@@ -3127,7 +3161,7 @@ def close_position(trade, reason) -> bool:
         known_sell_ids = set()
         if trade.get("tp_order_id"):
             known_sell_ids.add(trade["tp_order_id"])
-        if sell_order_id:
+        if sell_order_id and "DUMMY" not in str(sell_order_id):
             known_sell_ids.add(sell_order_id)
         retries    = 5 if (reason == "TAKE_PROFIT" and label in ("SCALPER", "TRINITY")) else 3
         exit_fills = get_actual_fills(
