@@ -6,7 +6,7 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Maker orders (post-only limit) for fee reduction
   • ATR-based moonshot stop-loss
   • Reduced partial TP ratio for moonshots
-  • All previous optimisations (Kelly, rotation, etc.)
+  • Dynamic disable of micro/partial TP for trades below MIN_TRADE_FOR_PARTIAL_TP
 """
 
 import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re, math
@@ -32,6 +32,9 @@ PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "50"))
 SCALPER_ALLOCATION_PCT   = float(os.getenv("SCALPER_ALLOCATION_PCT",   "0.25"))
 MOONSHOT_ALLOCATION_PCT  = float(os.getenv("MOONSHOT_ALLOCATION_PCT",  "0.50"))
 TRINITY_ALLOCATION_PCT   = float(os.getenv("TRINITY_ALLOCATION_PCT",   "0.25"))
+
+# Minimum trade size for enabling micro/partial TP (to avoid dust)
+MIN_TRADE_FOR_PARTIAL_TP = float(os.getenv("MIN_TRADE_FOR_PARTIAL_TP", "15.0"))
 
 # ── Scalper (max 3 concurrent) ────────────────────────────────
 SCALPER_MAX_TRADES   = int(os.getenv("SCALPER_MAX_TRADES",   "3"))
@@ -2395,6 +2398,24 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     else:
         log.info(f"[{label}] Using ticker price (myTrades unavailable): ${price:.6f}")
 
+    # 🔧 NEW: Disable micro/partial TP for small trades to avoid dust
+    micro_tp_price = None
+    partial_tp_price = None
+    if label == "MOONSHOT" and actual_cost < MIN_TRADE_FOR_PARTIAL_TP:
+        log.info(f"[{label}] Trade size ${actual_cost:.2f} < ${MIN_TRADE_FOR_PARTIAL_TP:.0f} — disabling micro/partial TP")
+        # micro and partial TP will remain None
+    else:
+        # compute micro and partial TP as usual
+        micro_tp_price = round_price_to_tick(actual_entry * (1 + MOONSHOT_MICRO_TP_PCT), tick_size) if label == "MOONSHOT" else None
+        if label == "MOONSHOT":
+            partial_tp_price = round_price_to_tick(actual_entry * (1 + MOONSHOT_PARTIAL_TP_PCT), tick_size)
+        elif label == "REVERSAL":
+            partial_tp_price = round_price_to_tick(actual_entry * (1 + REVERSAL_PARTIAL_TP_PCT), tick_size)
+        elif label == "SCALPER" and opp.get("score", 0) >= SCALPER_PARTIAL_TP_SCORE:
+            partial_tp_price = tp_price
+        else:
+            partial_tp_price = None
+
     if label == "SCALPER" and opp.get("atr_pct") is not None:
         if tp_pct > 0 and sl_pct > 0:
             used_tp_pct = tp_pct
@@ -2473,20 +2494,10 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
                            else TRINITY_BREAKEVEN_ACT if label == "TRINITY"
                            else None),
         "breakeven_done": False,
-        "micro_tp_price": (
-            round_price_to_tick(actual_entry * (1 + MOONSHOT_MICRO_TP_PCT), tick_size)
-            if label == "MOONSHOT" else None
-        ),
-        "micro_tp_ratio":   MOONSHOT_MICRO_TP_RATIO if label == "MOONSHOT" else None,
-        "micro_tp_hit":     False,
-        "partial_tp_price": (
-            tp_price
-            if (label == "SCALPER" and opp.get("score", 0) >= SCALPER_PARTIAL_TP_SCORE) else
-            round_price_to_tick(actual_entry * (1 + MOONSHOT_PARTIAL_TP_PCT), tick_size)
-            if label == "MOONSHOT" else
-            round_price_to_tick(actual_entry * (1 + REVERSAL_PARTIAL_TP_PCT), tick_size)
-            if label == "REVERSAL" else None
-        ),
+        "micro_tp_price": micro_tp_price,
+        "micro_tp_ratio": MOONSHOT_MICRO_TP_RATIO if label == "MOONSHOT" else None,
+        "micro_tp_hit":   False,
+        "partial_tp_price": partial_tp_price,
         "partial_tp_ratio": (
             SCALPER_PARTIAL_TP_RATIO  if (label == "SCALPER" and opp.get("score", 0) >= SCALPER_PARTIAL_TP_SCORE) else
             MOONSHOT_PARTIAL_TP_RATIO if label == "MOONSHOT" else
@@ -3579,6 +3590,7 @@ def _cmd_config():
         f"⚙️ <b>Current Config</b>\n━━━━━━━━━━━━━━━\n"
         f"💰 <b>Capital Allocation</b>\n"
         f"  Scalper: {SCALPER_ALLOCATION_PCT*100:.0f}% | Moonshot: {MOONSHOT_ALLOCATION_PCT*100:.0f}% | Trinity: {TRINITY_ALLOCATION_PCT*100:.0f}%\n"
+        f"  Partial TP disabled for trades < ${MIN_TRADE_FOR_PARTIAL_TP:.0f}\n"
         f"🟢 <b>Scalper</b>\n"
         f"  Max: {SCALPER_MAX_TRADES} × {get_effective_budget_pct('SCALPER')*100:.0f}% cap | 1% risk/trade (uncapped Kelly up to 2.8%)\n"
         f"  TP: dynamic {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% (signal-aware, candle-capped)\n"
@@ -3593,8 +3605,8 @@ def _cmd_config():
         f"\n🌙 <b>Moonshot</b>  [bot-monitored]\n"
         f"  Max: {ALT_MAX_TRADES} trades | Budget: max($2, {MOONSHOT_BUDGET_PCT*100:.0f}% of allocated capital)\n"
         f"  SL: ATR×{MOONSHOT_SL_ATR_MULT:.1f} (capped 4-12%) | Breakeven: +{MOONSHOT_BREAKEVEN_ACT*100:.0f}%\n"
-        f"  Micro TP: {MOONSHOT_MICRO_TP_RATIO*100:.0f}% sold at +{MOONSHOT_MICRO_TP_PCT*100:.0f}% → SL → entry\n"
-        f"  Partial TP: {MOONSHOT_PARTIAL_TP_RATIO*100:.0f}% sold at +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}%\n"
+        f"  Micro TP: {MOONSHOT_MICRO_TP_RATIO*100:.0f}% sold at +{MOONSHOT_MICRO_TP_PCT*100:.0f}% → SL → entry (disabled if trade < ${MIN_TRADE_FOR_PARTIAL_TP:.0f})\n"
+        f"  Partial TP: {MOONSHOT_PARTIAL_TP_RATIO*100:.0f}% sold at +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% → trail {MOONSHOT_TRAIL_PCT*100:.0f}% (disabled if trade < ${MIN_TRADE_FOR_PARTIAL_TP:.0f})\n"
         f"  Trail after partial: {MOONSHOT_TRAIL_PCT*100:.0f}% (widens to {MOONSHOT_TRAIL_ATR_WIDE*100:.0f}% once +{MOONSHOT_TRAIL_WIDE_THRESH:.0f}×ATR)\n"
         f"  HWM stop: protect after +{MOONSHOT_PROTECT_ACT*100:.0f}%, giveback {MOONSHOT_PROTECT_GIVEBACK*100:.1f}%\n"
         f"  Timeout: flat {MOONSHOT_TIMEOUT_FLAT_MINS}min | marginal {MOONSHOT_TIMEOUT_MARGINAL_MINS}min | hard {MOONSHOT_TIMEOUT_MAX_MINS}min\n"
@@ -3607,7 +3619,7 @@ def _cmd_config():
         f"  TP: {TRINITY_TP_ATR_MULT}×ATR | SL: {TRINITY_SL_ATR_MULT}×ATR (cap {TRINITY_SL_MAX*100:.1f}%) | Max: {TRINITY_MAX_HOURS}h\n"
         f"\n🔄 <b>Reversal</b>  [bot-monitored]\n"
         f"  TP: +{REVERSAL_TP*100:.1f}% | SL: cap-candle anchor | Max: {REVERSAL_MAX_HOURS}h\n"
-        f"  Partial TP: {REVERSAL_PARTIAL_TP_RATIO*100:.0f}% sold at +{REVERSAL_PARTIAL_TP_PCT*100:.1f}% → SL moves to entry\n"
+        f"  Partial TP: {REVERSAL_PARTIAL_TP_RATIO*100:.0f}% sold at +{REVERSAL_PARTIAL_TP_PCT*100:.1f}% → SL moves to entry (disabled if trade < ${MIN_TRADE_FOR_PARTIAL_TP:.0f})\n"
         f"  Flat-progress exit: <{REVERSAL_FLAT_PROGRESS*100:.0f}% toward TP after {REVERSAL_FLAT_MINS}min → cut\n"
         f"  Weak bounce: after {REVERSAL_WEAK_BOUNCE_MINS}min, if <{REVERSAL_WEAK_BOUNCE_PCT:.1f}% → SL → entry\n"
         f"\n📊 <b>Order Book Depth</b>\n"
@@ -3889,6 +3901,7 @@ def startup() -> float:
         f"🚀 <b>MEXC Bot Started</b> [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"Balance: <b>${startup_balance:.2f} USDT</b>\n"
         f"Capital allocation: Scalper {SCALPER_ALLOCATION_PCT*100:.0f}% | Moonshot {MOONSHOT_ALLOCATION_PCT*100:.0f}% | Trinity {TRINITY_ALLOCATION_PCT*100:.0f}%\n"
+        f"Partial TP disabled for trades < ${MIN_TRADE_FOR_PARTIAL_TP:.0f}\n"
         f"\n🟢 <b>Scalper</b> (max {SCALPER_MAX_TRADES} × {get_effective_budget_pct('SCALPER')*100:.0f}%)\n"
         f"  TP/SL: dynamic (signal-aware ATR×mult, candle-capped, noise-floored)\n"
         f"  TP range: {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% | SL range: {SCALPER_SL_MIN*100:.1f}–{SCALPER_SL_MAX*100:.0f}%\n"
@@ -3900,14 +3913,15 @@ def startup() -> float:
         f"  Watchlist: top {WATCHLIST_SIZE} pairs, refresh every {WATCHLIST_TTL//60}min "
         f"(+early rebuild on BTC ≥{BTC_REBOUND_PCT*100:.0f}% rebound)\n"
         f"\n🌙 <b>Moonshot</b> (max {ALT_MAX_TRADES} trades, {MOONSHOT_BUDGET_PCT*100:.0f}% of allocated capital) [bot-monitored]\n"
-        f"  SL: ATR×{MOONSHOT_SL_ATR_MULT:.1f} (4-12%) | Micro TP: {MOONSHOT_MICRO_TP_RATIO*100:.0f}% @ +{MOONSHOT_MICRO_TP_PCT*100:.0f}% → SL entry\n"
-        f"  Partial TP: +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% then {MOONSHOT_TRAIL_PCT*100:.0f}% trail | max {MOONSHOT_MAX_HOURS}h\n"
+        f"  SL: ATR×{MOONSHOT_SL_ATR_MULT:.1f} (4-12%) | Micro TP: {MOONSHOT_MICRO_TP_RATIO*100:.0f}% @ +{MOONSHOT_MICRO_TP_PCT*100:.0f}% → SL entry (disabled if trade < ${MIN_TRADE_FOR_PARTIAL_TP:.0f})\n"
+        f"  Partial TP: +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% then {MOONSHOT_TRAIL_PCT*100:.0f}% trail (disabled if trade < ${MIN_TRADE_FOR_PARTIAL_TP:.0f})\n"
         f"  HWM stop: protect after +{MOONSHOT_PROTECT_ACT*100:.0f}%, giveback {MOONSHOT_PROTECT_GIVEBACK*100:.1f}%\n"
         f"  Pre-breakout: accumulation/squeeze/base patterns → +{PRE_BREAKOUT_TP*100:.0f}%/-{PRE_BREAKOUT_SL*100:.0f}% | {PRE_BREAKOUT_MAX_HOURS}h\n"
         f"\n🔱 <b>Trinity</b> (max 1 trade, {TRINITY_BUDGET_PCT*100:.0f}% of allocated capital) [exchange TP + bot SL]\n"
         f"  {'/'.join(s.replace('USDT','') for s in TRINITY_SYMBOLS)} | drop ≥{TRINITY_DROP_PCT*100:.0f}% | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | max {TRINITY_MAX_HOURS}h\n"
         f"\n🔄 <b>Reversal</b> (via moonshot slot) [bot-monitored]\n"
         f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%  max {REVERSAL_MAX_HOURS}h\n"
+        f"  Partial TP: {REVERSAL_PARTIAL_TP_RATIO*100:.0f}% sold at +{REVERSAL_PARTIAL_TP_PCT*100:.1f}% → SL entry (disabled if trade < ${MIN_TRADE_FOR_PARTIAL_TP:.0f})\n"
         f"  Weak bounce: after {REVERSAL_WEAK_BOUNCE_MINS}min, if <{REVERSAL_WEAK_BOUNCE_PCT:.1f}% → SL → entry\n"
         f"\n🧠 <b>AI</b>: {'✅ Haiku + web search' if SENTIMENT_ENABLED and WEB_SEARCH_ENABLED else '✅ Haiku only (/ask + journal)' if SENTIMENT_ENABLED else '⚠️ disabled (set ANTHROPIC_API_KEY)'}\n"
         f"  Cache: {SENTIMENT_CACHE_MINS}min | Bonus: +{SENTIMENT_MAX_BONUS}pts | Penalty: -{SENTIMENT_MAX_PENALTY}pts\n"
