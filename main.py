@@ -10,6 +10,9 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Kelly uncap up to 2.8% risk on high-confidence setups
   • Stricter rotation (+13 gap, 15min cooldown)
   • BTC volatility guard (ATR ratio >1.85 → pause scalper entries)
+  • Micro‑cap quick trigger (low volume moonshots protect early)
+  • Dynamic ATR‑based giveback for moonshot HWM stops
+  • Locked balance handling (free+locked) to prevent premature exit
 """
 
 import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re, math
@@ -42,6 +45,14 @@ MIN_TRADE_FOR_PARTIAL_TP = float(os.getenv("MIN_TRADE_FOR_PARTIAL_TP", "15.0"))
 # ── Maker orders (post‑only) for both entry and TP ─────────────
 USE_MAKER_ORDERS = os.getenv("USE_MAKER_ORDERS", "True").lower() == "true"
 MAKER_ORDER_TIMEOUT_SEC = float(os.getenv("MAKER_ORDER_TIMEOUT_SEC", "2.0"))
+
+# ── Micro‑cap quick trigger (low volume moonshots) ────────────
+MICRO_CAP_VOL_RATIO_THRESHOLD = float(os.getenv("MICRO_CAP_VOL_RATIO_THRESHOLD", "0.30"))
+MICRO_CAP_PROTECT_ACT = float(os.getenv("MICRO_CAP_PROTECT_ACT", "0.025"))          # 2.5%
+MICRO_CAP_GIVEBACK    = float(os.getenv("MICRO_CAP_GIVEBACK", "0.005"))             # 0.5%
+
+# ── Dynamic ATR giveback multiplier (for normal moonshots) ────
+MOONSHOT_HWM_ATR_MULT = float(os.getenv("MOONSHOT_HWM_ATR_MULT", "1.5"))
 
 # ── Scalper (max 3 concurrent) ────────────────────────────────
 SCALPER_MAX_TRADES   = int(os.getenv("SCALPER_MAX_TRADES",   "3"))
@@ -947,7 +958,7 @@ def get_available_balance() -> float:
         data = private_get("/api/v3/account")
         for b in data.get("balances", []):
             if b["asset"] == "USDT":
-                return float(b["free"])
+                return float(b["free"])   # only free USDT is available for new trades
         return 0.0
     except Exception as e:
         log.error(f"Balance fetch failed: {e}")
@@ -2161,8 +2172,11 @@ def place_limit_sell(symbol, qty, price, label="", tag="", maker: bool = None):
         return f"PAPER_{tag}_{int(time.time())}"
     try:
         order_params = {
-            "symbol": symbol, "side": "SELL", "type": "LIMIT",
-            "quantity": str(qty), "price": str(price)
+            "symbol": symbol,
+            "side": "SELL",
+            "type": "LIMIT",
+            "quantity": str(qty),
+            "price": str(price)
         }
         if maker:
             order_params["postOnly"] = "true"
@@ -2497,6 +2511,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
                               opp.get("trail_pct", SCALPER_TRAIL_PCT) if label == "SCALPER"
                               else actual_sl * 0.5
                           ),
+        "vol_ratio":      opp.get("vol_ratio", 1.0),   # for micro‑cap detection
         "move_maturity":  opp.get("move_maturity"),
         "breakeven_act":  (SCALPER_BREAKEVEN_ACT if (
                                label == "SCALPER" and
@@ -2652,14 +2667,31 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
         if not PAPER_TRADE and tp_order_id:
             cancel_order(symbol, tp_order_id, label)
         return True, "STOP_LOSS"
+
+    # ── MOONSHOT HIGH-WATER MARK WITH MICRO‑CAP AND ATR GIVEBACK ──
     if label == "MOONSHOT" and not trade.get("partial_tp_hit") and not trade.get("micro_tp_hit"):
-        if peak_pct >= MOONSHOT_PROTECT_ACT * 100:
+        # Micro‑cap detection
+        vol_ratio = trade.get("vol_ratio", 1.0)
+        if vol_ratio < MICRO_CAP_VOL_RATIO_THRESHOLD:
+            protect_act = MICRO_CAP_PROTECT_ACT       # 2.5%
+            giveback = MICRO_CAP_GIVEBACK             # 0.5%
+            reason_tag = "MICRO_HWM"
+        else:
+            protect_act = MOONSHOT_PROTECT_ACT        # 5.0%
+            # Dynamic ATR-based giveback
+            atr_pct = trade.get("atr_pct", 0.02)
+            dynamic_giveback = max(0.005, min(0.03, atr_pct * MOONSHOT_HWM_ATR_MULT))
+            giveback = dynamic_giveback
+            reason_tag = "DYN_HWM"
+
+        if peak_pct >= protect_act * 100:
             drop_from_peak = (trade["highest_price"] - price) / trade["highest_price"]
-            if drop_from_peak >= MOONSHOT_PROTECT_GIVEBACK:
-                log.info(f"🛡️ [{label}] HWM stop: {symbol} | peak +{peak_pct:.1f}%, drop {drop_from_peak*100:.1f}% → sell")
+            if drop_from_peak >= giveback:
+                log.info(f"🛡️ [{label}] {reason_tag} stop: {symbol} | peak +{peak_pct:.1f}%, drop {drop_from_peak*100:.1f}% → sell")
                 if not PAPER_TRADE and tp_order_id:
                     cancel_order(symbol, tp_order_id, label)
-                return True, "PROTECT_STOP"
+                return True, reason_tag
+
     breakeven_act = trade.get("breakeven_act")
     if breakeven_act and not trade.get("breakeven_done") and peak_pct >= breakeven_act * 100:
         if trade["sl_price"] < trade["entry_price"]:
@@ -2667,18 +2699,23 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             trade["breakeven_done"] = True
             log.info(f"🔒 [{label}] Breakeven locked: {symbol} | peak +{peak_pct:.1f}% | "
                      f"SL moved to entry ${trade['entry_price']:.6f}")
+
+    # Micro TP (if enabled)
     if (label == "MOONSHOT"
             and not trade.get("micro_tp_hit")
             and trade.get("micro_tp_price")
             and peak_pct >= MOONSHOT_MICRO_TP_PCT * 100):
         log.info(f"🎯μ [{label}] Micro TP triggered (peak): {symbol} | peak +{peak_pct:.1f}%")
         return True, "MICRO_TP"
+
+    # Partial TP (if enabled)
     if (label in ("MOONSHOT", "REVERSAL")
             and not trade.get("partial_tp_hit")
             and trade.get("partial_tp_price")
             and peak_pct >= (trade["partial_tp_price"] / trade["entry_price"] - 1) * 100):
         log.info(f"🎯½ [{label}] Partial TP triggered (peak): {symbol} | peak +{peak_pct:.1f}%")
         return True, "PARTIAL_TP"
+
     if label == "SCALPER":
         if (trade.get("partial_tp_price")
                 and not trade.get("partial_tp_hit")
@@ -2937,7 +2974,7 @@ def close_position(trade, reason) -> bool:
             log.info(f"✅ [{label}] Market sell ({reason}): {result}")
         except requests.exceptions.HTTPError as e:
             try:    body = e.response.json()
-            except Exception: body = {"msg": e.response.text if e.response else "no response"}
+            except Exception: body = e.response.text if e.response else "no response"
             code = body.get("code") if isinstance(body, dict) else None
             msg  = body.get("msg",  body) if isinstance(body, dict) else body
             log.error(f"🚨 [{label}] Market sell failed (code={code}): {msg}")
@@ -2999,6 +3036,10 @@ def close_position(trade, reason) -> bool:
         (peak_profit - actual_profit) / peak_profit
         if peak_profit > 0.001 else 0.0
     )
+    # Cap giveback at 100% for display
+    giveback_display = giveback_ratio
+    if giveback_ratio > 1.0:
+        giveback_display = 1.0
     trade_history.append({
         **{k: v for k, v in trade.items() if not k.startswith("_")},
         "exit_price":    actual_exit,
@@ -3065,12 +3106,14 @@ def close_position(trade, reason) -> bool:
         "PARTIAL_TP":    ("🎯½","Partial Take Profit"),
         "MICRO_TP":      ("🎯μ","Micro Take Profit"),
         "PROTECT_STOP":  ("🛡️","Protection Stop"),
+        "MICRO_HWM":     ("🛡️","Micro‑Cap HWM"),
+        "DYN_HWM":       ("🛡️","Dynamic HWM"),
     }
     emoji, reason_label = icons.get(reason, ("✅", reason))
     fee_line   = f"Fees:    ${fee_usdt:.4f}\n" if fee_usdt > 0 else ""
     fills_note = "✅ actual fills" if exit_fills.get("avg_sell_price") else "⚠️ estimated"
     signal_str = trade.get("entry_signal", "")
-    peak_line  = (f"Peak:    +{peak_profit*100:.1f}% (gave back {giveback_ratio*100:.0f}%)\n"
+    peak_line  = (f"Peak:    +{peak_profit*100:.1f}% (gave back {giveback_display*100:.0f}%)\n"
                   if peak_profit > 0.005 else "")
     telegram(
         f"{emoji} <b>{reason_label} — {label}</b> [{mode}]\n"
@@ -3602,6 +3645,8 @@ def _cmd_config():
         f"💰 <b>Capital Allocation</b>\n"
         f"  Scalper: {SCALPER_ALLOCATION_PCT*100:.0f}% | Moonshot: {MOONSHOT_ALLOCATION_PCT*100:.0f}% | Trinity: {TRINITY_ALLOCATION_PCT*100:.0f}%\n"
         f"  Partial TP disabled for trades < ${MIN_TRADE_FOR_PARTIAL_TP:.0f}\n"
+        f"  Micro‑cap trigger: vol < {MICRO_CAP_VOL_RATIO_THRESHOLD*100:.0f}% → protect at +{MICRO_CAP_PROTECT_ACT*100:.1f}%, giveback {MICRO_CAP_GIVEBACK*100:.1f}%\n"
+        f"  Dynamic HWM giveback: ATR×{MOONSHOT_HWM_ATR_MULT:.1f} (capped 0.5–3.0%)\n"
         f"🟢 <b>Scalper</b>\n"
         f"  Max: {SCALPER_MAX_TRADES} × {get_effective_budget_pct('SCALPER')*100:.0f}% cap | 1% risk/trade (uncapped Kelly up to 2.8%)\n"
         f"  TP: dynamic {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% (signal-aware, candle-capped)\n"
@@ -3619,7 +3664,7 @@ def _cmd_config():
         f"  Micro TP: {MOONSHOT_MICRO_TP_RATIO*100:.0f}% sold at +{MOONSHOT_MICRO_TP_PCT*100:.0f}% → SL → entry (disabled if trade < ${MIN_TRADE_FOR_PARTIAL_TP:.0f})\n"
         f"  Partial TP: {MOONSHOT_PARTIAL_TP_RATIO*100:.0f}% sold at +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% → trail {MOONSHOT_TRAIL_PCT*100:.0f}% (disabled if trade < ${MIN_TRADE_FOR_PARTIAL_TP:.0f})\n"
         f"  Trail after partial: {MOONSHOT_TRAIL_PCT*100:.0f}% (widens to {MOONSHOT_TRAIL_ATR_WIDE*100:.0f}% once +{MOONSHOT_TRAIL_WIDE_THRESH:.0f}×ATR)\n"
-        f"  HWM stop: protect after +{MOONSHOT_PROTECT_ACT*100:.0f}%, giveback {MOONSHOT_PROTECT_GIVEBACK*100:.1f}%\n"
+        f"  HWM stop: micro‑cap triggers at +{MICRO_CAP_PROTECT_ACT*100:.1f}%, giveback {MICRO_CAP_GIVEBACK*100:.1f}%; normal coins use ATR×{MOONSHOT_HWM_ATR_MULT:.1f} giveback\n"
         f"  Timeout: flat {MOONSHOT_TIMEOUT_FLAT_MINS}min | marginal {MOONSHOT_TIMEOUT_MARGINAL_MINS}min | hard {MOONSHOT_TIMEOUT_MAX_MINS}min\n"
         f"\n🔮 <b>Pre-Breakout</b>  [via moonshot slot]\n"
         f"  Patterns: accumulation | squeeze | base-spring\n"
@@ -3777,12 +3822,9 @@ def reconcile_open_positions():
             log.info(f"✅ [PAPER] Restored {len(scalper_trades)} scalper + {len(alt_trades)} alt trades.")
         return
     try:
-        try:
-            balances = {b["asset"]: float(b.get("free", 0)) + float(b.get("locked", 0))
-                        for b in private_get("/api/v3/account").get("balances", [])}
-        except Exception as e:
-            log.warning(f"Balance fetch failed during reconcile: {e}")
-            balances = {}
+        # IMPORTANT: Use free+locked to avoid thinking positions are closed when they have open limit orders
+        balances = {b["asset"]: float(b.get("free", 0)) + float(b.get("locked", 0))
+                    for b in private_get("/api/v3/account").get("balances", [])}
         if scalper_trades or alt_trades:
             stale = []
             for trade in list(scalper_trades + alt_trades):
@@ -3913,6 +3955,8 @@ def startup() -> float:
         f"Balance: <b>${startup_balance:.2f} USDT</b>\n"
         f"Capital allocation: Scalper {SCALPER_ALLOCATION_PCT*100:.0f}% | Moonshot {MOONSHOT_ALLOCATION_PCT*100:.0f}% | Trinity {TRINITY_ALLOCATION_PCT*100:.0f}%\n"
         f"Partial TP disabled for trades < ${MIN_TRADE_FOR_PARTIAL_TP:.0f}\n"
+        f"Micro‑cap quick trigger: vol < {MICRO_CAP_VOL_RATIO_THRESHOLD*100:.0f}% → protect at +{MICRO_CAP_PROTECT_ACT*100:.1f}%, giveback {MICRO_CAP_GIVEBACK*100:.1f}%\n"
+        f"Dynamic HWM giveback: ATR×{MOONSHOT_HWM_ATR_MULT:.1f} (capped 0.5–3.0%)\n"
         f"\n🟢 <b>Scalper</b> (max {SCALPER_MAX_TRADES} × {get_effective_budget_pct('SCALPER')*100:.0f}%)\n"
         f"  TP/SL: dynamic (signal-aware ATR×mult, candle-capped, noise-floored)\n"
         f"  TP range: {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% | SL range: {SCALPER_SL_MIN*100:.1f}–{SCALPER_SL_MAX*100:.0f}%\n"
@@ -3926,7 +3970,7 @@ def startup() -> float:
         f"\n🌙 <b>Moonshot</b> (max {ALT_MAX_TRADES} trades, {MOONSHOT_BUDGET_PCT*100:.0f}% of allocated capital) [bot-monitored]\n"
         f"  SL: ATR×{MOONSHOT_SL_ATR_MULT:.1f} (4-12%) | Micro TP: {MOONSHOT_MICRO_TP_RATIO*100:.0f}% @ +{MOONSHOT_MICRO_TP_PCT*100:.0f}% → SL entry (disabled if trade < ${MIN_TRADE_FOR_PARTIAL_TP:.0f})\n"
         f"  Partial TP: +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% then {MOONSHOT_TRAIL_PCT*100:.0f}% trail (disabled if trade < ${MIN_TRADE_FOR_PARTIAL_TP:.0f})\n"
-        f"  HWM stop: protect after +{MOONSHOT_PROTECT_ACT*100:.0f}%, giveback {MOONSHOT_PROTECT_GIVEBACK*100:.1f}%\n"
+        f"  HWM stop: micro‑cap triggers at +{MICRO_CAP_PROTECT_ACT*100:.1f}%, giveback {MICRO_CAP_GIVEBACK*100:.1f}%; normal coins use ATR×{MOONSHOT_HWM_ATR_MULT:.1f} giveback\n"
         f"  Pre-breakout: accumulation/squeeze/base patterns → +{PRE_BREAKOUT_TP*100:.0f}%/-{PRE_BREAKOUT_SL*100:.0f}% | {PRE_BREAKOUT_MAX_HOURS}h\n"
         f"\n🔱 <b>Trinity</b> (max 1 trade, {TRINITY_BUDGET_PCT*100:.0f}% of allocated capital) [exchange TP + bot SL]\n"
         f"  {'/'.join(s.replace('USDT','') for s in TRINITY_SYMBOLS)} | drop ≥{TRINITY_DROP_PCT*100:.0f}% | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | max {TRINITY_MAX_HOURS}h\n"
@@ -4096,14 +4140,12 @@ def run():
                     log.debug(f"BTC rebound check error: {_e}")
             # Scalper entry
             if scalper_needs_entry:
-                # used capital for scalper
                 used_scalper = sum(t["budget_used"] for t in scalper_trades)
                 available_scalper = scalper_capital - used_scalper
                 if available_scalper <= 0:
                     log.info(f"💰 Scalper capital depleted (${available_scalper:.2f}) — no new entries")
                 else:
-                    # compute budget based on scalper capital
-                    opp = find_scalper_opportunity(available_scalper,  # pass available, not the capital, but calc_risk_budget expects total capital
+                    opp = find_scalper_opportunity(available_scalper,
                                                    exclude=_scalper_excluded,
                                                    open_symbols=open_symbols)
                     if opp and _btc_ema_gap < 0:
@@ -4120,7 +4162,6 @@ def run():
                             opp["score"] = adj_score
                     if opp:
                         trade_budget, pre_tp, pre_sl, _, _ = calc_risk_budget(opp, scalper_capital)
-                        # cap by available capital
                         trade_budget = min(trade_budget, available_scalper)
                         if trade_budget <= 0:
                             log.info(f"💰 [SCALPER] Budget zero after cap — skipping")
@@ -4146,7 +4187,6 @@ def run():
                     now = time.time()
                     if now - _last_rotation_scan >= ROTATION_SCAN_INTERVAL:
                         _last_rotation_scan = now
-                        # compute available scalper capital for rotation candidate
                         used_scalper = sum(t["budget_used"] for t in scalper_trades)
                         available_scalper = scalper_capital - used_scalper
                         if available_scalper > 0:
@@ -4185,7 +4225,6 @@ def run():
                                             KELLY_MULT_MARGINAL
                                         )
                                         rot_budget, rot_pre_tp, rot_pre_sl, _, _ = calc_risk_budget(best_opp, scalper_capital)
-                                        # cap by available
                                         used_scalper = sum(t["budget_used"] for t in scalper_trades)
                                         available_scalper = scalper_capital - used_scalper
                                         rot_budget = min(rot_budget, available_scalper)
@@ -4204,7 +4243,6 @@ def run():
                                                    exclude=_alt_excluded,
                                                    open_symbols=open_symbols)
                     if opp:
-                        # compute budget based on trinity capital
                         trinity_budget = max(MOONSHOT_MIN_NOTIONAL, min(
                             round(total_value * TRINITY_BUDGET_PCT, 2), available_trinity))
                         trade = open_position(opp, trinity_budget,
