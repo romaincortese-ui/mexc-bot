@@ -13,6 +13,8 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Micro‑cap quick trigger (low volume moonshots protect early)
   • Dynamic ATR‑based giveback for moonshot HWM stops
   • Locked balance handling (free+locked) to prevent premature exit
+  • Market regime detection (adjusts entry thresholds based on BTC volatility/trend)
+  • Chase limit orders for profit exits (reduces slippage)
 """
 
 import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re, math
@@ -46,6 +48,10 @@ MIN_TRADE_FOR_PARTIAL_TP = float(os.getenv("MIN_TRADE_FOR_PARTIAL_TP", "15.0"))
 USE_MAKER_ORDERS = os.getenv("USE_MAKER_ORDERS", "True").lower() == "true"
 MAKER_ORDER_TIMEOUT_SEC = float(os.getenv("MAKER_ORDER_TIMEOUT_SEC", "2.0"))
 
+# Chase limit order settings (for exits)
+CHASE_LIMIT_TIMEOUT = float(os.getenv("CHASE_LIMIT_TIMEOUT", "2.0"))
+CHASE_LIMIT_RETRIES = int(os.getenv("CHASE_LIMIT_RETRIES", "3"))
+
 # ── Micro‑cap quick trigger (low volume moonshots) ────────────
 MICRO_CAP_VOL_RATIO_THRESHOLD = float(os.getenv("MICRO_CAP_VOL_RATIO_THRESHOLD", "0.30"))
 MICRO_CAP_PROTECT_ACT = float(os.getenv("MICRO_CAP_PROTECT_ACT", "0.025"))          # 2.5%
@@ -53,6 +59,15 @@ MICRO_CAP_GIVEBACK    = float(os.getenv("MICRO_CAP_GIVEBACK", "0.005"))         
 
 # ── Dynamic ATR giveback multiplier (for normal moonshots) ────
 MOONSHOT_HWM_ATR_MULT = float(os.getenv("MOONSHOT_HWM_ATR_MULT", "1.5"))
+
+# ── Market regime thresholds (adjust entry thresholds) ────────
+REGIME_HIGH_VOL_ATR_RATIO = float(os.getenv("REGIME_HIGH_VOL_ATR_RATIO", "1.85"))
+REGIME_LOW_VOL_ATR_RATIO  = float(os.getenv("REGIME_LOW_VOL_ATR_RATIO",  "0.80"))
+REGIME_STRONG_UPTREND_GAP = float(os.getenv("REGIME_STRONG_UPTREND_GAP", "0.01"))   # 1% above EMA
+REGIME_STRONG_DOWNTREND_GAP = float(os.getenv("REGIME_STRONG_DOWNTREND_GAP", "-0.01")) # 1% below EMA
+REGIME_TIGHTEN_MULT = float(os.getenv("REGIME_TIGHTEN_MULT", "0.8"))
+REGIME_LOOSEN_MULT  = float(os.getenv("REGIME_LOOSEN_MULT",  "1.2"))
+REGIME_TREND_MULT   = float(os.getenv("REGIME_TREND_MULT",   "1.1"))
 
 # ── Scalper (max 3 concurrent) ────────────────────────────────
 SCALPER_MAX_TRADES   = int(os.getenv("SCALPER_MAX_TRADES",   "3"))
@@ -338,6 +353,7 @@ _social_boost_cache:  dict  = {}
 _btc_ema_gap:         float = 0.0
 _fast_cycle_counter = 0
 MAX_FAST_CYCLES = 10
+_market_regime_mult = 1.0   # default neutral
 
 # ── WebSocket monitor (unchanged) ───────────────────────────
 WS_URL          = "wss://wbs-api.mexc.com/ws"
@@ -1125,6 +1141,10 @@ def get_effective_threshold(strategy: str) -> float:
     offset = _adaptive_offsets.get(strategy, 0.0)
     return base + offset
 
+def get_regime_multiplier() -> float:
+    """Return a multiplier to adjust entry thresholds based on BTC market regime."""
+    return _market_regime_mult
+
 def rebalance_budgets():
     global _last_rebalance_count, _dynamic_scalper_budget, _dynamic_moonshot_budget
     full = [t for t in trade_history if not t.get("is_partial")]
@@ -1345,7 +1365,10 @@ def _score_scalper(sym: str, strict: bool = False, btc_pulse_ratio: float = 1.0)
     mat_pen  = maturity_penalty(move_mat, max(score, 1.0), MATURITY_THRESHOLD)
     score    = score - mat_pen
 
-    eff_threshold = get_effective_threshold("SCALPER") if strict else max(5, SCALPER_THRESHOLD // 2)
+    # Apply market regime multiplier only for strict scoring (entry)
+    regime_mult = get_regime_multiplier() if strict else 1.0
+    eff_threshold = get_effective_threshold("SCALPER") * regime_mult if strict else max(5, SCALPER_THRESHOLD // 2)
+
     if score < eff_threshold:
         if mat_pen > 0:
             log.debug(f"[SCALPER] Skip {sym} — maturity {move_mat:.2f} penalty -{mat_pen:.1f}pts")
@@ -1370,7 +1393,7 @@ def _score_scalper(sym: str, strict: bool = False, btc_pulse_ratio: float = 1.0)
             score -= 5
             log.debug(f"[SCALPER] {sym} frenzied market penalty -5 (pulse {btc_pulse_ratio:.2f})")
 
-        eff_thresh = get_effective_threshold("SCALPER")
+        eff_thresh = get_effective_threshold("SCALPER") * regime_mult
         if (score >= eff_thresh - SENTIMENT_MAX_BONUS
                 and score <= eff_thresh + SENTIMENT_MAX_PENALTY):
             sentiment_delta, sentiment_label = sentiment_score_adjustment(sym)
@@ -1694,7 +1717,10 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
                                           MATURITY_MOONSHOT_THRESHOLD)
         score = score - moon_mat_pen
         eff_moon_thresh = get_effective_threshold("MOONSHOT")
-        if score < eff_moon_thresh:
+        # Apply regime multiplier only for entry scoring
+        regime_mult = get_regime_multiplier()
+        eff_moon_thresh_adj = eff_moon_thresh * regime_mult
+        if score < eff_moon_thresh_adj:
             if moon_mat_pen > 0:
                 log.debug(f"[MOONSHOT] Skip {sym} — maturity {moon_maturity:.2f} "
                           f"penalty -{moon_mat_pen:.1f}pts")
@@ -1702,7 +1728,7 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
         keltner_bonus = 0.0
         if KELTNER_SCORE_BONUS > 0 and keltner_breakout(df_k):
             keltner_bonus = KELTNER_SCORE_BONUS
-        if score > eff_moon_thresh - 5:
+        if score > eff_moon_thresh_adj - 5:
             sentiment_delta, _ = sentiment_score_adjustment(sym)
             social_boost, social_summary = get_social_boost(sym)
         else:
@@ -1710,11 +1736,11 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
         final_score = round(score + keltner_bonus + sentiment_delta + social_boost, 2)
 
         # only apply social boost if already close to threshold
-        if final_score < eff_moon_thresh + 9:
+        if final_score < eff_moon_thresh_adj + 9:
             social_boost = 0.0
             social_summary = ""
 
-        if final_score < eff_moon_thresh:
+        if final_score < eff_moon_thresh_adj:
             return None
         row_vol = ticker_vol_map.get(sym, 0.0)
         if check_dead_coin(sym, row_vol, 0.0, "MOONSHOT"):
@@ -2352,6 +2378,80 @@ def calc_risk_budget(opp: dict, balance: float) -> tuple[float, float, float, st
         return round(capped, 2), tp_pct, sl_pct, tp_label, sl_label
     return round(balance * get_effective_budget_pct("SCALPER"), 2), 0.0, 0.0, "", ""
 
+# ⚡ NEW: Chase limit order for profit exits (reduces slippage)
+def chase_limit_sell(symbol: str, qty: float, label: str, tag: str = "", timeout: float = CHASE_LIMIT_TIMEOUT, max_retries: int = CHASE_LIMIT_RETRIES) -> dict | None:
+    """
+    Attempt to sell at the best ask using limit orders. Retries if not filled.
+    Returns order result dict (with orderId) or None on failure.
+    """
+    if PAPER_TRADE:
+        log.info(f"📝 [PAPER] [{label}] CHASE LIMIT SELL ({tag}) {qty} {symbol}")
+        return {"orderId": f"PAPER_{tag}_{int(time.time())}"}
+
+    for attempt in range(max_retries):
+        # Get current best ask
+        try:
+            depth = public_get("/api/v3/depth", {"symbol": symbol, "limit": 5})
+            asks = depth.get("asks", [])
+            if not asks:
+                log.warning(f"[{label}] No asks in depth for {symbol} — falling back to market")
+                break
+            best_ask = float(asks[0][0])
+            _, _, _, tick_size = get_symbol_rules(symbol)
+            price = round_price_to_tick(best_ask, tick_size)
+        except Exception as e:
+            log.warning(f"[{label}] Failed to get ask price for {symbol}: {e} — falling back to market")
+            break
+
+        # Place limit order (not post-only)
+        try:
+            order_params = {
+                "symbol": symbol,
+                "side": "SELL",
+                "type": "LIMIT",
+                "quantity": str(qty),
+                "price": str(price)
+            }
+            result = private_post("/api/v3/order", order_params)
+            order_id = result.get("orderId")
+            log.info(f"✅ [{label}] Chase limit order placed: {order_id} @ {price} (attempt {attempt+1})")
+
+            # Wait for fill
+            start = time.time()
+            while time.time() - start < timeout:
+                status_resp = private_get("/api/v3/order", {"symbol": symbol, "orderId": order_id})
+                if status_resp.get("status") == "FILLED":
+                    log.info(f"✅ [{label}] Chase limit order filled: {order_id}")
+                    return result
+                elif status_resp.get("status") in ("CANCELED", "EXPIRED"):
+                    break
+                time.sleep(0.2)
+
+            # Not filled in time – cancel
+            log.info(f"⏰ [{label}] Chase limit order {order_id} not filled in {timeout}s — cancelling and retrying")
+            cancel_order(symbol, order_id, label)
+        except Exception as e:
+            log.warning(f"[{label}] Chase limit order failed on attempt {attempt+1}: {e}")
+
+        # Wait a moment before retry
+        if attempt < max_retries - 1:
+            time.sleep(0.3)
+
+    # Fallback to market sell
+    log.info(f"[{label}] Falling back to market sell for {symbol}")
+    try:
+        result = private_post("/api/v3/order", {
+            "symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": str(qty)
+        })
+        log.info(f"✅ [{label}] Market SELL placed: {result}")
+        return result
+    except requests.exceptions.HTTPError as e:
+        try:    body = e.response.json()
+        except Exception: body = e.response.text if e.response else "no response"
+        log.error(f"🚨 [{label}] Market SELL failed: {body}")
+        telegram(f"🚨 <b>SELL failed!</b> [{label}] {symbol} qty={qty}\n{str(body)[:200]}\nManual intervention required.")
+        return None
+
 def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     symbol                              = opp["symbol"]
     if any(t["symbol"] == symbol for t in scalper_trades + alt_trades):
@@ -2855,19 +2955,11 @@ def execute_partial_tp(trade, micro: bool = False) -> bool:
         if label == "SCALPER" and trade.get("tp_order_id"):
             cancel_order(symbol, trade["tp_order_id"], label)
             trade["tp_order_id"] = None
-        try:
-            result = private_post("/api/v3/order", {
-                "symbol": symbol, "side": "SELL",
-                "type": "MARKET", "quantity": str(partial_qty),
-            })
-            partial_sell_id = result.get("orderId")
-            log.info(f"✅ [{label}] Partial sell: {partial_qty} {symbol} → {result}")
-        except requests.exceptions.HTTPError as e:
-            try:    body = e.response.json()
-            except Exception: body = {"msg": str(e)}
-            log.error(f"🚨 [{label}] Partial sell failed: {body}")
-            telegram(f"🚨 <b>Partial TP sell failed!</b> [{label}] {symbol}\n"
-                     f"{str(body)[:200]}\nClose manually if needed.")
+        # Use chase limit order for partial TP
+        result = chase_limit_sell(symbol, partial_qty, label, tag=reason_tag)
+        partial_sell_id = result.get("orderId") if result else None
+        if not result:
+            log.error(f"🚨 [{label}] Partial TP sell failed (chase limit fallback failed).")
             return False
     partial_fills = {}
     if not PAPER_TRADE:
@@ -2965,38 +3057,49 @@ def close_position(trade, reason) -> bool:
                 if tp_order_id not in get_open_order_ids(symbol):
                     break
             trade["tp_order_id"] = None
-        try:
-            result = private_post("/api/v3/order", {
-                "symbol": symbol, "side": "SELL",
-                "type": "MARKET", "quantity": str(trade["qty"])
-            })
-            sell_order_id = result.get("orderId")
-            log.info(f"✅ [{label}] Market sell ({reason}): {result}")
-        except requests.exceptions.HTTPError as e:
-            try:    body = e.response.json()
-            except Exception: body = e.response.text if e.response else "no response"
-            code = body.get("code") if isinstance(body, dict) else None
-            msg  = body.get("msg",  body) if isinstance(body, dict) else body
-            log.error(f"🚨 [{label}] Market sell failed (code={code}): {msg}")
-            if code in (30005, -2010) or "insufficient" in str(msg).lower() or "balance" in str(msg).lower():
-                log.warning(f"⚠️ [{label}] {symbol} — position already closed on exchange "
-                            f"(TP limit likely filled just before SL). Checking fills...")
-                telegram(f"⚠️ [{label}] <b>{symbol}</b> ({reason})\n"
-                         f"Market sell returned 'insufficient balance' — "
-                         f"TP limit order may have filled simultaneously.\n"
-                         f"Treating as TAKE_PROFIT and checking actual fills.")
-            elif code == 10007 or "not support" in str(msg).lower():
-                _api_blacklist.add(symbol)
-                log.warning(f"⚠️ [{label}] {symbol} not API-tradeable — blacklisted.")
-                telegram(f"🚨 <b>Sell failed!</b> [{label}] {symbol} ({reason})\n"
-                         f"Error: {str(msg)[:200]}\n"
-                         f"Symbol blacklisted — close manually on MEXC.")
+
+        # Use chase limit order for profit exits, market for stop loss
+        if reason in ("STOP_LOSS", "HARD_SL"):
+            # Urgent – use market sell
+            try:
+                result = private_post("/api/v3/order", {
+                    "symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": str(trade["qty"])
+                })
+                sell_order_id = result.get("orderId")
+                log.info(f"✅ [{label}] Market sell ({reason}): {result}")
+            except requests.exceptions.HTTPError as e:
+                try:    body = e.response.json()
+                except Exception: body = e.response.text if e.response else "no response"
+                code = body.get("code") if isinstance(body, dict) else None
+                msg  = body.get("msg",  body) if isinstance(body, dict) else body
+                log.error(f"🚨 [{label}] Market sell failed (code={code}): {msg}")
+                if code in (30005, -2010) or "insufficient" in str(msg).lower() or "balance" in str(msg).lower():
+                    log.warning(f"⚠️ [{label}] {symbol} — position already closed on exchange "
+                                f"(TP limit likely filled just before SL). Checking fills...")
+                    telegram(f"⚠️ [{label}] <b>{symbol}</b> ({reason})\n"
+                             f"Market sell returned 'insufficient balance' — "
+                             f"TP limit order may have filled simultaneously.\n"
+                             f"Treating as TAKE_PROFIT and checking actual fills.")
+                elif code == 10007 or "not support" in str(msg).lower():
+                    _api_blacklist.add(symbol)
+                    log.warning(f"⚠️ [{label}] {symbol} not API-tradeable — blacklisted.")
+                    telegram(f"🚨 <b>Sell failed!</b> [{label}] {symbol} ({reason})\n"
+                             f"Error: {str(msg)[:200]}\n"
+                             f"Symbol blacklisted — close manually on MEXC.")
+                    return False
+                else:
+                    telegram(f"🚨 <b>Sell failed!</b> [{label}] {symbol} ({reason})\n"
+                             f"Code: {code} — {str(msg)[:200]}\n"
+                             f"Close manually on MEXC.")
+                    return False
+        else:
+            # Profit exit – use chase limit order
+            result = chase_limit_sell(symbol, trade["qty"], label, tag=reason)
+            sell_order_id = result.get("orderId") if result else None
+            if not result:
+                log.error(f"🚨 [{label}] Chase limit sell failed for {symbol} – manual intervention may be needed.")
                 return False
-            else:
-                telegram(f"🚨 <b>Sell failed!</b> [{label}] {symbol} ({reason})\n"
-                         f"Code: {code} — {str(msg)[:200]}\n"
-                         f"Close manually on MEXC.")
-                return False
+    # Continue with exit_fills, etc. as before (unchanged from previous version)
     exit_fills = {}
     if not PAPER_TRADE:
         bought_at_ms  = trade.get("bought_at_ms", int(time.time() * 1000) - 86400_000)
@@ -3640,11 +3743,14 @@ def _cmd_config():
     now_ts      = time.time()
     dead_active = sum(1 for v in _liquidity_blacklist.values() if v > now_ts)
     dead_pending= sum(1 for v in _liquidity_fail_count.values() if v > 0)
+    regime_str = f"{_market_regime_mult:.2f}x" if _market_regime_mult != 1.0 else "1.00x (neutral)"
     telegram(
         f"⚙️ <b>Current Config</b>\n━━━━━━━━━━━━━━━\n"
         f"💰 <b>Capital Allocation</b>\n"
         f"  Scalper: {SCALPER_ALLOCATION_PCT*100:.0f}% | Moonshot: {MOONSHOT_ALLOCATION_PCT*100:.0f}% | Trinity: {TRINITY_ALLOCATION_PCT*100:.0f}%\n"
         f"  Partial TP disabled for trades < ${MIN_TRADE_FOR_PARTIAL_TP:.0f}\n"
+        f"  Market regime multiplier: {regime_str}\n"
+        f"  Chase limit orders: timeout {CHASE_LIMIT_TIMEOUT}s, {CHASE_LIMIT_RETRIES} retries\n"
         f"  Micro‑cap trigger: vol < {MICRO_CAP_VOL_RATIO_THRESHOLD*100:.0f}% → protect at +{MICRO_CAP_PROTECT_ACT*100:.1f}%, giveback {MICRO_CAP_GIVEBACK*100:.1f}%\n"
         f"  Dynamic HWM giveback: ATR×{MOONSHOT_HWM_ATR_MULT:.1f} (capped 0.5–3.0%)\n"
         f"🟢 <b>Scalper</b>\n"
@@ -3919,6 +4025,49 @@ def get_strategy_capital(balance: float, strategy: str) -> float:
     else:
         return balance
 
+def compute_market_regime_multiplier(df_btc: pd.DataFrame) -> float:
+    """
+    Compute a multiplier for entry thresholds based on BTC volatility and trend.
+    Returns multiplier (e.g., 0.8 = tighten, 1.2 = loosen).
+    """
+    try:
+        # Volatility: ATR ratio (last ATR / average ATR over 40 candles)
+        tr = pd.concat([
+            df_btc["high"] - df_btc["low"],
+            (df_btc["high"] - df_btc["close"].shift(1)).abs(),
+            (df_btc["low"]  - df_btc["close"].shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1.0 / 14, adjust=False).mean()
+        if len(atr) > 40:
+            atr_ratio = atr.iloc[-1] / atr.iloc[-41:-1].mean()
+        else:
+            atr_ratio = 1.0
+        # Trend: EMA gap
+        btc_ema = calc_ema(df_btc["close"], BTC_REGIME_EMA_PERIOD)
+        ema_gap = (float(df_btc["close"].iloc[-1]) / float(btc_ema.iloc[-1]) - 1)
+
+        multiplier = 1.0
+        # Volatility adjustments
+        if atr_ratio > REGIME_HIGH_VOL_ATR_RATIO:
+            multiplier *= REGIME_TIGHTEN_MULT
+            log.debug(f"Market regime: high volatility (ATR ratio {atr_ratio:.2f}) → tighten ×{REGIME_TIGHTEN_MULT}")
+        elif atr_ratio < REGIME_LOW_VOL_ATR_RATIO:
+            multiplier *= REGIME_LOOSEN_MULT
+            log.debug(f"Market regime: low volatility (ATR ratio {atr_ratio:.2f}) → loosen ×{REGIME_LOOSEN_MULT}")
+
+        # Trend adjustments
+        if ema_gap > REGIME_STRONG_UPTREND_GAP:
+            multiplier *= REGIME_TREND_MULT
+            log.debug(f"Market regime: strong uptrend (EMA gap {ema_gap*100:.1f}%) → loosen ×{REGIME_TREND_MULT}")
+        elif ema_gap < REGIME_STRONG_DOWNTREND_GAP:
+            multiplier *= REGIME_TIGHTEN_MULT
+            log.debug(f"Market regime: strong downtrend (EMA gap {ema_gap*100:.1f}%) → tighten ×{REGIME_TIGHTEN_MULT}")
+
+        return max(0.6, min(1.4, multiplier))  # clamp to 0.6–1.4
+    except Exception as e:
+        log.debug(f"Market regime computation failed: {e}")
+        return 1.0
+
 def startup() -> float:
     global scalper_trades, alt_trades, trade_history, _consecutive_losses, \
            _win_rate_pause_until, _scalper_excluded, _alt_excluded, _api_blacklist, \
@@ -3955,6 +4104,7 @@ def startup() -> float:
         f"Balance: <b>${startup_balance:.2f} USDT</b>\n"
         f"Capital allocation: Scalper {SCALPER_ALLOCATION_PCT*100:.0f}% | Moonshot {MOONSHOT_ALLOCATION_PCT*100:.0f}% | Trinity {TRINITY_ALLOCATION_PCT*100:.0f}%\n"
         f"Partial TP disabled for trades < ${MIN_TRADE_FOR_PARTIAL_TP:.0f}\n"
+        f"Chase limit orders: timeout {CHASE_LIMIT_TIMEOUT}s, {CHASE_LIMIT_RETRIES} retries\n"
         f"Micro‑cap quick trigger: vol < {MICRO_CAP_VOL_RATIO_THRESHOLD*100:.0f}% → protect at +{MICRO_CAP_PROTECT_ACT*100:.1f}%, giveback {MICRO_CAP_GIVEBACK*100:.1f}%\n"
         f"Dynamic HWM giveback: ATR×{MOONSHOT_HWM_ATR_MULT:.1f} (capped 0.5–3.0%)\n"
         f"\n🟢 <b>Scalper</b> (max {SCALPER_MAX_TRADES} × {get_effective_budget_pct('SCALPER')*100:.0f}%)\n"
@@ -3992,7 +4142,7 @@ def run():
            _last_rebound_rebuild, \
            _scalper_excluded, _alt_excluded, _btc_ema_gap, \
            _streak_paused_at, _consecutive_losses, _win_rate_pause_until, \
-           _paused, _fast_cycle_counter
+           _paused, _fast_cycle_counter, _market_regime_mult
     startup_balance  = startup()
     balance          = get_available_balance()
     while True:
@@ -4091,7 +4241,7 @@ def run():
                             log.warning(f"🚨 BTC panic: {chg*100:.2f}% — ALL entries paused this cycle")
                 except Exception:
                     pass
-            # volatility regime guard
+            # volatility regime guard (pause scalper entries)
             if scalper_needs_entry and df_btc is not None:
                 try:
                     tr = pd.concat([
@@ -4106,6 +4256,11 @@ def run():
                         log.warning(f"🌪️ BTC extreme volatility regime (ATR ratio {atr_ratio:.2f}) — scalper entries PAUSED")
                 except Exception as e:
                     log.debug(f"Volatility guard error: {e}")
+            # Compute market regime multiplier
+            if df_btc is not None:
+                _market_regime_mult = compute_market_regime_multiplier(df_btc)
+            else:
+                _market_regime_mult = 1.0
             if btc_panic:
                 scalper_needs_entry = False
                 alt_needs_entry     = False
