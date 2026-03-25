@@ -3,10 +3,13 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Added features:
   • Capital allocation per strategy (Scalper 25%, Moonshot/Reversal 50%, Trinity 25%)
-  • Maker orders (post-only limit) for fee reduction
+  • Maker orders (post-only limit) for both entry and TP to reduce fees
   • ATR-based moonshot stop-loss
   • Reduced partial TP ratio for moonshots
   • Dynamic disable of micro/partial TP for trades below MIN_TRADE_FOR_PARTIAL_TP
+  • Kelly uncap up to 2.8% risk on high-confidence setups
+  • Stricter rotation (+13 gap, 15min cooldown)
+  • BTC volatility guard (ATR ratio >1.85 → pause scalper entries)
 """
 
 import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re, math
@@ -35,6 +38,10 @@ TRINITY_ALLOCATION_PCT   = float(os.getenv("TRINITY_ALLOCATION_PCT",   "0.25"))
 
 # Minimum trade size for enabling micro/partial TP (to avoid dust)
 MIN_TRADE_FOR_PARTIAL_TP = float(os.getenv("MIN_TRADE_FOR_PARTIAL_TP", "15.0"))
+
+# ── Maker orders (post‑only) for both entry and TP ─────────────
+USE_MAKER_ORDERS = os.getenv("USE_MAKER_ORDERS", "True").lower() == "true"
+MAKER_ORDER_TIMEOUT_SEC = float(os.getenv("MAKER_ORDER_TIMEOUT_SEC", "2.0"))
 
 # ── Scalper (max 3 concurrent) ────────────────────────────────
 SCALPER_MAX_TRADES   = int(os.getenv("SCALPER_MAX_TRADES",   "3"))
@@ -186,10 +193,6 @@ TRINITY_DROP_LOOKBACK_CANDLES = [16, 32]
 MIN_PRICE         = 0.001
 SCAN_INTERVAL     = 60
 STATE_FILE        = "state.json"
-
-# ── Maker orders (NEW) ────────────────────────────────────────
-USE_MAKER_ORDERS = os.getenv("USE_MAKER_ORDERS", "True").lower() == "true"
-MAKER_ORDER_TIMEOUT_SEC = float(os.getenv("MAKER_ORDER_TIMEOUT_SEC", "2.0"))
 
 # ── Adaptive learning (unchanged) ────────────────────────────
 MATURITY_LOOKBACK       = int(os.getenv("MATURITY_LOOKBACK",       "20"))
@@ -2150,16 +2153,23 @@ def place_buy_order(symbol: str, qty: float, label: str, use_maker: bool = True)
             telegram(f"🚨 <b>BUY rejected</b> [{label}]\n{symbol} qty={qty}\n{str(body)[:300]}")
         return None
 
-def place_limit_sell(symbol, qty, price, label="", tag=""):
+# ⚡ UPGRADE: Maker orders for TP (post‑only if enabled)
+def place_limit_sell(symbol, qty, price, label="", tag="", maker: bool = None):
+    if maker is None:
+        maker = USE_MAKER_ORDERS
     if PAPER_TRADE:
         return f"PAPER_{tag}_{int(time.time())}"
     try:
-        result   = private_post("/api/v3/order", {
+        order_params = {
             "symbol": symbol, "side": "SELL", "type": "LIMIT",
             "quantity": str(qty), "price": str(price)
-        })
+        }
+        if maker:
+            order_params["postOnly"] = "true"
+        result = private_post("/api/v3/order", order_params)
         order_id = result.get("orderId")
-        log.info(f"✅ [{label}] LIMIT SELL ({tag}): {order_id} @ {price}")
+        maker_str = " (maker)" if maker else ""
+        log.info(f"✅ [{label}] LIMIT SELL{maker_str} ({tag}): {order_id} @ {price}")
         return order_id
     except requests.exceptions.HTTPError as e:
         try:    body = e.response.json()
@@ -2449,8 +2459,9 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
 
     sl_price = round(actual_entry * (1 - actual_sl), 8)
 
+    # Place TP order with maker option (if enabled)
     if label in ("SCALPER", "TRINITY"):
-        tp_order_id = place_limit_sell(symbol, qty, tp_price, label, tag="TP")
+        tp_order_id = place_limit_sell(symbol, qty, tp_price, label, tag="TP", maker=USE_MAKER_ORDERS)
         if not PAPER_TRADE and not tp_order_id:
             log.warning(f"[{label}] TP limit failed — monitoring manually.")
             telegram(f"⚠️ [{label}] TP limit failed for {symbol} — monitoring manually.")
@@ -4095,8 +4106,8 @@ def run():
                     opp = find_scalper_opportunity(available_scalper,  # pass available, not the capital, but calc_risk_budget expects total capital
                                                    exclude=_scalper_excluded,
                                                    open_symbols=open_symbols)
-                    if opp and btc_ema_gap < 0:
-                        penalty = round(abs(btc_ema_gap) * BTC_REGIME_EMA_PENALTY, 1)
+                    if opp and _btc_ema_gap < 0:
+                        penalty = round(abs(_btc_ema_gap) * BTC_REGIME_EMA_PENALTY, 1)
                         adj_score = round(opp["score"] - penalty, 2)
                         if adj_score < SCALPER_THRESHOLD:
                             log.info(f"🟡 [SCALPER] {opp['symbol']} score {opp['score']} "
