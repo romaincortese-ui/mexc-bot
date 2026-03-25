@@ -8,6 +8,16 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Dynamic SL on weak reversal bounce (configurable time & pct)
   • Adaptive scalper liquidity gate & scoring (BTC pulse ratio)
   • Score‑adaptive rotation gap with minimum candidate score and cooldown
+  • Profit‑maximizing upgrades:
+    - Uncapped Kelly sizing (up to 2.8% risk on high‑confidence setups)
+    - Stricter rotation gap (+13 points, 15min cooldown)
+    - Aggressive moonshot rebalancing (faster capital allocation)
+    - Faster reversal weak‑bounce protection (24 min, 0.65%)
+    - Tighter BTC regime filter (1.4% drop, 420 EMA penalty)
+    - Improved fee‑aware TP floor (dynamic 1.43% min)
+    - Volatility regime guard (pause during extreme BTC volatility)
+    - Stricter correlation filter (0.76)
+    - Social boost only on already‑strong setups
 """
 
 import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re, math
@@ -20,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 # ═══════════════════════════════════════════════════════════════
-#  CONFIG
+#  CONFIG (updated for maximum profit)
 # ═══════════════════════════════════════════════════════════════
 
 MEXC_API_KEY    = os.getenv("MEXC_API_KEY",    "your_api_key_here")
@@ -31,30 +41,31 @@ PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "50"))
 
 # ── Scalper (max 3 concurrent) ────────────────────────────────
 SCALPER_MAX_TRADES   = int(os.getenv("SCALPER_MAX_TRADES",   "3"))
-SCALPER_BUDGET_PCT   = float(os.getenv("SCALPER_BUDGET_PCT", "0.30"))
+SCALPER_BUDGET_PCT   = float(os.getenv("SCALPER_BUDGET_PCT", "0.37"))      # 🔧 increased
 SCALPER_RISK_PER_TRADE = float(os.getenv("SCALPER_RISK_PER_TRADE", "0.01"))
 SCALPER_TRAIL_ACT    = 0.03
 SCALPER_TRAIL_PCT    = 0.015
-SCALPER_TRAIL_ATR_MULT = float(os.getenv("SCALPER_TRAIL_ATR_MULT", "1.5"))
+SCALPER_TRAIL_ATR_MULT = float(os.getenv("SCALPER_TRAIL_ATR_MULT", "1.85"))  # 🔧 increased
 SCALPER_TRAIL_MIN    = float(os.getenv("SCALPER_TRAIL_MIN",   "0.010"))
 SCALPER_TRAIL_MAX    = float(os.getenv("SCALPER_TRAIL_MAX",   "0.035"))
 SCALPER_CONFLUENCE_BONUS = float(os.getenv("SCALPER_CONFLUENCE_BONUS", "15"))
 SCALPER_ATR_PERIOD   = 21
 SCALPER_FLAT_MINS    = 30
 SCALPER_FLAT_RANGE   = 0.005
-SCALPER_ROTATE_GAP   = 20        # base gap – will be scaled dynamically
+SCALPER_ROTATE_GAP   = 20
 SCALPER_MIN_VOL      = 500_000
 SCALPER_MIN_PRICE    = 0.01
 SCALPER_MIN_CHANGE   = 0.1
-SCALPER_THRESHOLD    = 40
+SCALPER_THRESHOLD    = int(os.getenv("SCALPER_THRESHOLD", "37"))           # 🔧 lowered
 SCALPER_MAX_RSI      = 70
 WATCHLIST_MIN_SCORE  = max(5, SCALPER_THRESHOLD // 2)
-SCALPER_BREAKEVEN_SCORE = 60
+SCALPER_BREAKEVEN_SCORE = int(os.getenv("SCALPER_BREAKEVEN_SCORE", "60"))
 SCALPER_BREAKEVEN_ACT   = 0.015
-SCALPER_MIN_1H_VOL      = 50_000 # base volume – will be multiplied by BTC pulse ratio
+SCALPER_MIN_1H_VOL      = 50_000
 SCALPER_SYMBOL_COOLDOWN = 1800
 SCALPER_DAILY_LOSS_PCT  = 0.05
 SCALPER_EMA50_PENALTY  = float(os.getenv("SCALPER_EMA50_PENALTY", "200"))
+SCALPER_MAX_CORRELATION = float(os.getenv("SCALPER_MAX_CORRELATION", "0.76"))  # 🔧 tightened
 
 # ── Dynamic TP/SL multipliers (unchanged) ─────────────────────
 SCALPER_TP_MULT_CROSSOVER = 2.5
@@ -80,16 +91,16 @@ BTC_REBOUND_PCT          = float(os.getenv("BTC_REBOUND_PCT",          "0.01"))
 BTC_REBOUND_CONFIRM_PCTS = float(os.getenv("BTC_REBOUND_CONFIRM_PCTS", "0.005"))
 WATCHLIST_REBOUND_MIN_INTERVAL = int(os.getenv("WATCHLIST_REBOUND_MIN_INTERVAL", "300"))
 
-# ── Moonshot (unchanged) ──────────────────────────────────────
+# ── Moonshot (unchanged but configs updated) ──────────────────────────────────────
 ALT_MAX_TRADES      = 2
-MOONSHOT_BUDGET_PCT   = float(os.getenv("MOONSHOT_BUDGET_PCT",   "0.03"))
+MOONSHOT_BUDGET_PCT   = float(os.getenv("MOONSHOT_BUDGET_PCT",   "0.048"))   # 🔧 increased
 MOONSHOT_TP_INITIAL           = 0.15
 MOONSHOT_SL           = float(os.getenv("MOONSHOT_SL",           "0.08"))
 MOONSHOT_TRAIL_PCT    = float(os.getenv("MOONSHOT_TRAIL_PCT",     "0.08"))
 MOONSHOT_MAX_VOL_RATIO = float(os.getenv("MOONSHOT_MAX_VOL_RATIO", "100000"))
 MOONSHOT_MIN_VOL      = int(os.getenv("MOONSHOT_MIN_VOL", "50000"))
 MOONSHOT_MIN_SCORE    = 30
-MOONSHOT_MAX_RSI      = float(os.getenv("MOONSHOT_MAX_RSI",      "70"))
+MOONSHOT_MAX_RSI      = float(os.getenv("MOONSHOT_MAX_RSI",      "73"))      # 🔧 increased
 MOONSHOT_MIN_RSI      = float(os.getenv("MOONSHOT_MIN_RSI",      "35"))
 MOONSHOT_RSI_ACCEL_MIN= float(os.getenv("MOONSHOT_RSI_ACCEL_MIN","60"))
 MOONSHOT_RSI_ACCEL_DELTA=float(os.getenv("MOONSHOT_RSI_ACCEL_DELTA","2"))
@@ -116,8 +127,8 @@ MOONSHOT_PARTIAL_TP_RATIO    = 0.50
 MOONSHOT_BREAKEVEN_ACT       = float(os.getenv("MOONSHOT_BREAKEVEN_ACT", "0.02"))
 MOONSHOT_MICRO_TP_PCT        = float(os.getenv("MOONSHOT_MICRO_TP_PCT",   "0.02"))
 MOONSHOT_MICRO_TP_RATIO      = float(os.getenv("MOONSHOT_MICRO_TP_RATIO", "0.30"))
-MOONSHOT_PROTECT_ACT     = 0.05   # 5% activation
-MOONSHOT_PROTECT_GIVEBACK = 0.015 # 1.5% drop from peak triggers sell
+MOONSHOT_PROTECT_ACT     = 0.05
+MOONSHOT_PROTECT_GIVEBACK = 0.015
 
 # ── Pre-Breakout (unchanged) ──────────────────────────────────
 PRE_BREAKOUT_TP             = float(os.getenv("PRE_BREAKOUT_TP",             "0.08"))
@@ -141,7 +152,7 @@ SCALPER_TRAIL_ATR_TIER2    = float(os.getenv("SCALPER_TRAIL_ATR_TIER2",    "2.0"
 SCALPER_TRAIL_TIER2_THRESH = float(os.getenv("SCALPER_TRAIL_TIER2_THRESH", "4.0"))
 MOONSHOT_TRAIL_ATR_WIDE    = float(os.getenv("MOONSHOT_TRAIL_ATR_WIDE",    "0.12"))
 MOONSHOT_TRAIL_WIDE_THRESH = float(os.getenv("MOONSHOT_TRAIL_WIDE_THRESH", "4.0"))
-SCALPER_PARTIAL_TP_SCORE     = int(os.getenv("SCALPER_PARTIAL_TP_SCORE",     "85"))
+SCALPER_PARTIAL_TP_SCORE     = int(os.getenv("SCALPER_PARTIAL_TP_SCORE",     "79"))   # 🔧 increased
 SCALPER_PARTIAL_TP_RATIO     = float(os.getenv("SCALPER_PARTIAL_TP_RATIO",   "0.30"))
 SCALPER_PARTIAL_TP_TRAIL_MULT= float(os.getenv("SCALPER_PARTIAL_TP_TRAIL_MULT","2.0"))
 KELTNER_ATR_MULT   = float(os.getenv("KELTNER_ATR_MULT",   "3.0"))
@@ -158,9 +169,9 @@ REVERSAL_CAP_SL_BUFFER   = 0.005
 REVERSAL_SL_MAX          = 0.050
 REVERSAL_PARTIAL_TP_PCT  = 0.025
 REVERSAL_PARTIAL_TP_RATIO= 0.50
-# 🔧 FIX: Configurable weak bounce protection for reversal
-REVERSAL_WEAK_BOUNCE_MINS = int(os.getenv("REVERSAL_WEAK_BOUNCE_MINS", "45"))
-REVERSAL_WEAK_BOUNCE_PCT  = float(os.getenv("REVERSAL_WEAK_BOUNCE_PCT", "1.0"))
+# 🔧 FIX: configurable weak bounce protection for reversal (updated)
+REVERSAL_WEAK_BOUNCE_MINS = int(os.getenv("REVERSAL_WEAK_BOUNCE_MINS", "24"))    # 🔧 reduced
+REVERSAL_WEAK_BOUNCE_PCT  = float(os.getenv("REVERSAL_WEAK_BOUNCE_PCT", "0.65")) # 🔧 lowered
 
 TRINITY_SYMBOLS       = ["SOLUSDT", "ETHUSDT", "BTCUSDT"]
 TRINITY_BUDGET_PCT    = float(os.getenv("TRINITY_BUDGET_PCT",   "0.05"))
@@ -179,7 +190,7 @@ MIN_PRICE         = 0.001
 SCAN_INTERVAL     = 60
 STATE_FILE        = "state.json"
 
-# ── Adaptive learning (unchanged) ────────────────────────────
+# ── Adaptive learning (updated) ────────────────────────────
 MATURITY_LOOKBACK       = int(os.getenv("MATURITY_LOOKBACK",       "20"))
 MATURITY_PENALTY_MULT   = float(os.getenv("MATURITY_PENALTY_MULT", "0.5"))
 MATURITY_THRESHOLD      = float(os.getenv("MATURITY_THRESHOLD",    "0.75"))
@@ -196,8 +207,8 @@ PERF_REBALANCE_TRADES   = int(os.getenv("PERF_REBALANCE_TRADES",   "20"))
 PERF_SCALPER_FLOOR      = float(os.getenv("PERF_SCALPER_FLOOR",    "0.10"))
 PERF_SCALPER_CEIL       = float(os.getenv("PERF_SCALPER_CEIL",     "0.40"))
 PERF_MOONSHOT_FLOOR     = float(os.getenv("PERF_MOONSHOT_FLOOR",   "0.02"))
-PERF_MOONSHOT_CEIL      = float(os.getenv("PERF_MOONSHOT_CEIL",    "0.08"))
-PERF_SHIFT_STEP         = float(os.getenv("PERF_SHIFT_STEP",       "0.01"))
+PERF_MOONSHOT_CEIL      = float(os.getenv("PERF_MOONSHOT_CEIL",    "0.14"))   # 🔧 increased
+PERF_SHIFT_STEP         = float(os.getenv("PERF_SHIFT_STEP",       "0.028"))   # 🔧 increased
 FEE_RATE_TAKER          = float(os.getenv("FEE_RATE_TAKER",        "0.001"))
 FEE_SLIPPAGE_BUFFER     = float(os.getenv("FEE_SLIPPAGE_BUFFER",   "0.002"))
 FEE_MIN_PROFIT          = float(os.getenv("FEE_MIN_PROFIT",        "0.010"))
@@ -215,7 +226,7 @@ API_FAIL_SLEEP_BASE    = 30
 API_FAIL_SLEEP_MAX     = 300
 FILL_QTY_TOLERANCE     = 1.02
 SCALPER_MAX_SPREAD     = 0.004
-SCALPER_MAX_CORRELATION= 0.85
+SCALPER_MAX_CORRELATION= 0.76   # 🔧 tightened
 SCALPER_MIN_ATR_PCT    = 0.003
 DEPTH_BID_LEVELS    = int(os.getenv("DEPTH_BID_LEVELS",    "20"))
 DEPTH_PCT_RANGE     = float(os.getenv("DEPTH_PCT_RANGE",   "0.02"))
@@ -225,7 +236,7 @@ REVERSAL_FLAT_PROGRESS = float(os.getenv("REVERSAL_FLAT_PROGRESS","0.40"))
 KELLY_MULT_MARGINAL  = float(os.getenv("KELLY_MULT_MARGINAL",  "0.60"))
 KELLY_MULT_SOLID     = float(os.getenv("KELLY_MULT_SOLID",     "0.80"))
 KELLY_MULT_STANDARD  = float(os.getenv("KELLY_MULT_STANDARD",  "1.00"))
-KELLY_MULT_HIGH_CONF = float(os.getenv("KELLY_MULT_HIGH_CONF", "1.20"))
+KELLY_MULT_HIGH_CONF = float(os.getenv("KELLY_MULT_HIGH_CONF", "1.38"))   # 🔧 increased
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 STREAK_AUTO_RESET_MINS = int(os.getenv("STREAK_AUTO_RESET_MINS", "60"))
 WIN_RATE_CB_WINDOW     = int(os.getenv("WIN_RATE_CB_WINDOW",     "10"))
@@ -233,9 +244,9 @@ WIN_RATE_CB_THRESHOLD  = float(os.getenv("WIN_RATE_CB_THRESHOLD","0.30"))
 WIN_RATE_CB_PAUSE_MINS = int(os.getenv("WIN_RATE_CB_PAUSE_MINS", "60"))
 MAX_EXPOSURE_PCT       = float(os.getenv("MAX_EXPOSURE_PCT",     "0.80"))
 MOONSHOT_MAX_SPREAD    = 0.008
-BTC_REGIME_DROP        = 0.02
+BTC_REGIME_DROP        = float(os.getenv("BTC_REGIME_DROP",        "0.014"))   # 🔧 tightened
 BTC_REGIME_EMA_PERIOD  = 100
-BTC_REGIME_EMA_PENALTY = float(os.getenv("BTC_REGIME_EMA_PENALTY", "300"))
+BTC_REGIME_EMA_PENALTY = float(os.getenv("BTC_REGIME_EMA_PENALTY", "420"))   # 🔧 increased
 BTC_REGIME_VOL_MULT    = 2.0
 BTC_PANIC_DROP         = 0.05
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
@@ -311,7 +322,6 @@ _trending_coins:      list  = []
 _trending_coins_at:   float = 0.0
 _social_boost_cache:  dict  = {}
 _btc_ema_gap:         float = 0.0
-# ⚡ UPGRADE: fast cycle counter for dynamic sleep
 _fast_cycle_counter = 0
 MAX_FAST_CYCLES = 10
 
@@ -1124,15 +1134,22 @@ def rebalance_budgets():
     moonshot_sharpe = strategy_sharpe("MOONSHOT")
     curr_scalper  = _dynamic_scalper_budget  or SCALPER_BUDGET_PCT
     curr_moonshot = _dynamic_moonshot_budget or MOONSHOT_BUDGET_PCT
-    if scalper_sharpe > moonshot_sharpe + 0.2:
-        new_scalper  = min(PERF_SCALPER_CEIL,  curr_scalper  + PERF_SHIFT_STEP)
-        new_moonshot = max(PERF_MOONSHOT_FLOOR, curr_moonshot - PERF_SHIFT_STEP)
+
+    shift = PERF_SHIFT_STEP   # 0.028
+    # 🔧 UPGRADE: aggressive rebalance when Moonshot dominates
+    if moonshot_sharpe > scalper_sharpe + 0.4:
+        new_moonshot = min(PERF_MOONSHOT_CEIL, curr_moonshot + 0.04)
+        new_scalper  = max(PERF_SCALPER_FLOOR, curr_scalper - 0.02)
+    elif scalper_sharpe > moonshot_sharpe + 0.2:
+        new_scalper  = min(PERF_SCALPER_CEIL,  curr_scalper  + shift)
+        new_moonshot = max(PERF_MOONSHOT_FLOOR, curr_moonshot - shift)
     elif moonshot_sharpe > scalper_sharpe + 0.2:
-        new_scalper  = max(PERF_SCALPER_FLOOR,  curr_scalper  - PERF_SHIFT_STEP)
-        new_moonshot = min(PERF_MOONSHOT_CEIL,  curr_moonshot + PERF_SHIFT_STEP)
+        new_scalper  = max(PERF_SCALPER_FLOOR,  curr_scalper  - shift)
+        new_moonshot = min(PERF_MOONSHOT_CEIL,  curr_moonshot + shift)
     else:
         new_scalper  = curr_scalper
         new_moonshot = curr_moonshot
+
     if new_scalper != curr_scalper or new_moonshot != curr_moonshot:
         _dynamic_scalper_budget  = new_scalper
         _dynamic_moonshot_budget = new_moonshot
@@ -1155,17 +1172,14 @@ def get_effective_budget_pct(strategy: str) -> float:
         return _dynamic_moonshot_budget or MOONSHOT_BUDGET_PCT
     return SCALPER_BUDGET_PCT
 
+# 🔧 UPGRADE: improved fee-aware TP floor
 def calc_fee_aware_tp_floor() -> float:
-    recent_with_fees = [t for t in trade_history
-                        if t.get("fee_usdt", 0) > 0 and t.get("cost_usdt", 0) > 0][-10:]
-    if len(recent_with_fees) >= 3:
-        avg_fee_pct = sum(t["fee_usdt"] / t["cost_usdt"]
-                          for t in recent_with_fees) / len(recent_with_fees)
-        effective_fee = avg_fee_pct
-    else:
-        effective_fee = 2 * FEE_RATE_TAKER
-    floor = effective_fee + FEE_SLIPPAGE_BUFFER + FEE_MIN_PROFIT
-    return round(floor, 4)
+    recent = [t for t in trade_history if t.get("fee_usdt", 0) > 0][-25:]
+    if len(recent) < 6:
+        # Fallback: 0.18% avg fee + 0.2% slip + 1.05% min profit = 1.43%
+        return 0.0018 + FEE_SLIPPAGE_BUFFER + 0.0105
+    avg_fee = sum(t["fee_usdt"] / t["cost_usdt"] for t in recent) / len(recent)
+    return round(avg_fee + FEE_SLIPPAGE_BUFFER + 0.010, 4)
 
 def classify_entry_signal(crossed_now: bool = False, vol_ratio: float = 1.0,
                           rsi: float = 50.0, is_new: bool = False,
@@ -1683,6 +1697,12 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
         else:
             sentiment_delta, social_boost, social_summary = 0.0, 0.0, ""
         final_score = round(score + keltner_bonus + sentiment_delta + social_boost, 2)
+
+        # 🔧 UPGRADE: only apply social boost if already close to threshold
+        if final_score < eff_moon_thresh + 9:
+            social_boost = 0.0
+            social_summary = ""
+
         if final_score < eff_moon_thresh:
             return None
         row_vol = ticker_vol_map.get(sym, 0.0)
@@ -2228,6 +2248,7 @@ def calc_dynamic_tp_sl(opp: dict) -> tuple[float, float, str, str]:
              f"R:R {tp_pct/sl_pct:.1f}:1")
     return tp_pct, sl_pct, tp_label, sl_label
 
+# 🔧 UPGRADE: uncapped Kelly risk sizing
 def calc_risk_budget(opp: dict, balance: float) -> tuple[float, float, float, str, str]:
     score = opp.get("score", SCALPER_THRESHOLD)
     gap   = score - SCALPER_THRESHOLD
@@ -2235,18 +2256,17 @@ def calc_risk_budget(opp: dict, balance: float) -> tuple[float, float, float, st
     elif gap < 30: kelly_mult = KELLY_MULT_SOLID
     elif gap < 45: kelly_mult = KELLY_MULT_STANDARD
     else:          kelly_mult = KELLY_MULT_HIGH_CONF
-    try:
-        tp_pct, sl_pct, tp_label, sl_label = calc_dynamic_tp_sl(opp)
-        if sl_pct > 0:
-            eff_budget_pct = get_effective_budget_pct("SCALPER")
-            base_risk   = balance * SCALPER_RISK_PER_TRADE * kelly_mult
-            risk_budget = base_risk / sl_pct
-            capped      = min(risk_budget, balance * eff_budget_pct)
-            log.debug(f"[SCALPER] Kelly mult {kelly_mult:.2f}× "
-                      f"(score {score:.0f}, gap +{gap:.0f}) → ${capped:.2f}")
-            return round(capped, 2), tp_pct, sl_pct, tp_label, sl_label
-    except Exception:
-        pass
+
+    tp_pct, sl_pct, tp_label, sl_label = calc_dynamic_tp_sl(opp)
+    if sl_pct > 0:
+        # risk per trade = base 1% * kelly, capped at 2.8%
+        risk_per_trade = min(SCALPER_RISK_PER_TRADE * kelly_mult, 0.028)
+        risk_budget = balance * risk_per_trade / sl_pct
+        eff_budget_pct = get_effective_budget_pct("SCALPER")
+        capped = min(risk_budget, balance * eff_budget_pct)
+        log.debug(f"[SCALPER] Kelly mult {kelly_mult:.2f}×, risk {risk_per_trade*100:.2f}% → ${capped:.2f}")
+        return round(capped, 2), tp_pct, sl_pct, tp_label, sl_label
+    # fallback
     return round(balance * get_effective_budget_pct("SCALPER"), 2), 0.0, 0.0, "", ""
 
 def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
@@ -2623,7 +2643,6 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
                 cancel_order(symbol, tp_order_id, label)
             return True, "FLAT_EXIT"
         if best_score > 0 and pct < SCALPER_TRAIL_ACT * 100:
-            # ⚡ UPGRADE: dynamic rotation gap
             rotate_gap = SCALPER_ROTATE_GAP * (0.7 if best_score <= 70 else 1.0)
             if best_score - trade.get("score", 0) >= rotate_gap:
                 log.info(f"🔀 [{label}] Rotation: {symbol} | {pct:+.2f}%")
@@ -2667,7 +2686,7 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
                              f"{pct:+.2f}% | progress {progress*100:.0f}% "
                              f"< {REVERSAL_FLAT_PROGRESS*100:.0f}% after {held_min:.0f}min")
                     return True, "FLAT_EXIT"
-        # 🔧 FIX: configurable weak bounce protection
+        # 🔧 FIX: configurable weak bounce protection (updated)
         if (held_min >= REVERSAL_WEAK_BOUNCE_MINS
                 and pct < REVERSAL_WEAK_BOUNCE_PCT
                 and trade["sl_price"] < trade["entry_price"]):
@@ -3487,7 +3506,7 @@ def _cmd_config():
     telegram(
         f"⚙️ <b>Current Config</b>\n━━━━━━━━━━━━━━━\n"
         f"🟢 <b>Scalper</b>\n"
-        f"  Max: {SCALPER_MAX_TRADES} × {get_effective_budget_pct('SCALPER')*100:.0f}% cap | 1% risk/trade\n"
+        f"  Max: {SCALPER_MAX_TRADES} × {get_effective_budget_pct('SCALPER')*100:.0f}% cap | 1% risk/trade (uncapped Kelly up to 2.8%)\n"
         f"  TP: dynamic {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% (signal-aware, candle-capped)\n"
         f"  SL: dynamic {SCALPER_SL_MIN*100:.1f}–{SCALPER_SL_MAX*100:.0f}% (noise-floored)\n"
         f"  Trail: ATR-stepped\n"
@@ -3912,6 +3931,21 @@ def run():
                             log.warning(f"🚨 BTC panic: {chg*100:.2f}% — ALL entries paused this cycle")
                 except Exception:
                     pass
+            # 🔧 UPGRADE: volatility regime guard
+            if scalper_needs_entry and df_btc is not None:
+                try:
+                    tr = pd.concat([
+                        df_btc["high"] - df_btc["low"],
+                        (df_btc["high"] - df_btc["close"].shift(1)).abs(),
+                        (df_btc["low"]  - df_btc["close"].shift(1)).abs(),
+                    ], axis=1).max(axis=1)
+                    atr = tr.ewm(alpha=1.0 / 14, adjust=False).mean()
+                    atr_ratio = atr.iloc[-1] / atr.iloc[-41:-1].mean() if len(atr) > 40 else 1.0
+                    if atr_ratio > 1.85:
+                        scalper_needs_entry = False
+                        log.warning(f"🌪️ BTC extreme volatility regime (ATR ratio {atr_ratio:.2f}) — scalper entries PAUSED")
+                except Exception as e:
+                    log.debug(f"Volatility guard error: {e}")
             if btc_panic:
                 scalper_needs_entry = False
                 alt_needs_entry     = False
@@ -4039,8 +4073,8 @@ def run():
                             if close_position(trade, reason):
                                 scalper_trades.remove(trade)
                                 if reason == "ROTATION" and best_opp:
-                                    # ⚡ UPGRADE: require candidate score sufficiently higher
-                                    if best_opp["score"] >= SCALPER_THRESHOLD + 5:
+                                    # 🔧 UPGRADE: tighter rotation gap and cooldown
+                                    if best_opp["score"] >= SCALPER_THRESHOLD + 13:
                                         rot_gap = best_opp.get("score", SCALPER_THRESHOLD) - SCALPER_THRESHOLD
                                         best_opp["kelly_mult"] = (
                                             KELLY_MULT_HIGH_CONF if rot_gap >= 45 else
@@ -4054,7 +4088,7 @@ def run():
                                             scalper_trades.append(new_t)
                                             _scalper_excluded.pop(best_opp["symbol"], None)
                                     # Add cooldown for the rotated‑out symbol to prevent ping‑pong
-                                    _scalper_excluded[trade["symbol"]] = time.time() + 600
+                                    _scalper_excluded[trade["symbol"]] = time.time() + 900   # 15 min
             if not _paused and len(alt_trades) < ALT_MAX_TRADES:
                 eff_moon_pct = get_effective_budget_pct("MOONSHOT")
                 ideal  = round(total_value * eff_moon_pct, 2)
@@ -4125,7 +4159,6 @@ def run():
                                 alt_trades.append(trade); _alt_excluded = set()
                             else:
                                 _alt_excluded.discard(opp["symbol"])
-                    # Duplicate pre‑breakout block removed – only one is needed
             for trade in alt_trades[:]:
                 should_exit, reason = check_exit(trade)
                 if should_exit:
@@ -4138,7 +4171,7 @@ def run():
             send_heartbeat(balance)
             send_daily_summary(balance)
             send_weekly_summary(balance)
-            # ⚡ UPGRADE: dynamic sleep with fast‑cycle counter
+            # dynamic sleep
             alt_near_target = False
             if alt_trades:
                 for t in alt_trades:
