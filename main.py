@@ -5,7 +5,8 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Fixed Trinity budget calculation (uses allocated capital, not total value)
   • Oversold (30005) error handling – treats as already closed without spam
   • Improved close_position retry logic with progressive delays and limit fallback
-  • DUST_THRESHOLD – stops endless loops on positions < $5
+  • DUST_THRESHOLD – stops endless loops on positions < $5 (default)
+  • Dust prevention in partial TP – if remaining slice < dust, sell 100%
   • Capital allocation per strategy (Scalper 25%, Moonshot/Reversal 50%, Trinity 25%)
   • Maker orders (post-only limit) for both entry and TP to reduce fees
   • ATR-based moonshot stop-loss
@@ -2982,10 +2983,29 @@ def execute_partial_tp(trade, micro: bool = False) -> bool:
     d_full  = Decimal(str(full_qty))
     d_ratio = Decimal(str(ratio))
     d_step  = Decimal(str(step_size))
-    partial_qty   = float((d_full * d_ratio / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step)
+
+    # --- DUST PREVENTION: If remaining slice would be below threshold, sell 100% ---
+    current_price = None
+    try:
+        current_price = float(public_get("/api/v3/ticker/price", {"symbol": symbol})["price"])
+    except Exception:
+        pass
+
+    # Calculate the quantity that would be sold
+    partial_qty = float((d_full * d_ratio / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step)
     remaining_qty = float(((d_full - Decimal(str(partial_qty))) / d_step)
                           .to_integral_value(rounding=ROUND_DOWN) * d_step)
-    if partial_qty < min_qty or remaining_qty < min_qty:
+
+    if current_price is not None and remaining_qty > 0:
+        remaining_notional = remaining_qty * current_price
+        if remaining_notional < DUST_THRESHOLD:
+            log.info(f"🧹 [{label}] Remaining position would be dust (${remaining_notional:.2f}) – selling entire position instead.")
+            partial_qty = full_qty
+            remaining_qty = 0
+            reason_tag = "FULL_CLOSE"
+    # --- End dust prevention ---
+
+    if partial_qty < min_qty or (remaining_qty > 0 and remaining_qty < min_qty):
         log.warning(f"[{label}] {reason_tag} skipped — qty too small "
                     f"(partial={partial_qty}, remaining={remaining_qty}, min={min_qty})")
         if micro:
@@ -2993,6 +3013,7 @@ def execute_partial_tp(trade, micro: bool = False) -> bool:
         else:
             trade["partial_tp_hit"] = True
         return True
+
     partial_sell_id  = None
     partial_sold_at_ms = int(time.time() * 1000)
     if not PAPER_TRADE:
