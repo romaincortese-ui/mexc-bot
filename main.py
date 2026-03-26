@@ -17,6 +17,8 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Chase limit orders for profit exits (reduces slippage)
   • Balance verification on close – retries until position is actually gone
   • Oversold (30005) error handling – treats as already closed without spam
+  • Fixed Trinity budget calculation (uses allocated capital, not total value)
+  • Improved close_position retry logic with progressive delays and limit fallback
 """
 
 import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re, math
@@ -4452,8 +4454,9 @@ def run():
                                                    exclude=_alt_excluded,
                                                    open_symbols=open_symbols)
                     if opp:
+                        # FIX: Use allocated capital, not total value
                         trinity_budget = max(MOONSHOT_MIN_NOTIONAL, min(
-                            round(total_value * TRINITY_BUDGET_PCT, 2), available_trinity))
+                            round(trinity_capital * TRINITY_BUDGET_PCT, 2), available_trinity))
                         trade = open_position(opp, trinity_budget,
                                               opp["tp_pct"], opp["sl_pct"],
                                               "TRINITY", max_hours=TRINITY_MAX_HOURS)
