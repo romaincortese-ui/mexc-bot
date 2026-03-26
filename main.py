@@ -5,6 +5,7 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Fixed Trinity budget calculation (uses allocated capital, not total value)
   • Oversold (30005) error handling – treats as already closed without spam
   • Improved close_position retry logic with progressive delays and limit fallback
+  • DUST_THRESHOLD – stops endless loops on positions < $5
   • Capital allocation per strategy (Scalper 25%, Moonshot/Reversal 50%, Trinity 25%)
   • Maker orders (post-only limit) for both entry and TP to reduce fees
   • ATR-based moonshot stop-loss
@@ -55,6 +56,9 @@ MAKER_ORDER_TIMEOUT_SEC = float(os.getenv("MAKER_ORDER_TIMEOUT_SEC", "2.0"))
 # Chase limit order settings (for exits)
 CHASE_LIMIT_TIMEOUT = float(os.getenv("CHASE_LIMIT_TIMEOUT", "2.0"))
 CHASE_LIMIT_RETRIES = int(os.getenv("CHASE_LIMIT_RETRIES", "3"))
+
+# ── Dust threshold – positions below this USD value are considered closed ──
+DUST_THRESHOLD = float(os.getenv("DUST_THRESHOLD", "5.0"))
 
 # ── Micro‑cap quick trigger (low volume moonshots) ────────────
 MICRO_CAP_VOL_RATIO_THRESHOLD = float(os.getenv("MICRO_CAP_VOL_RATIO_THRESHOLD", "0.30"))
@@ -3088,6 +3092,34 @@ def close_position(trade, reason) -> bool:
         (label == "TRINITY" and reason in ("STOP_LOSS","TIMEOUT"))
     )
     sell_order_id = None
+
+    # --- DUST HANDLING: Check if remaining position is too small to sell ---
+    current_price = None
+    try:
+        current_price = float(public_get("/api/v3/ticker/price", {"symbol": symbol})["price"])
+    except Exception:
+        pass
+    if current_price is not None:
+        remaining_notional = trade["qty"] * current_price
+        if remaining_notional < DUST_THRESHOLD:
+            log.info(f"🧹 [{label}] Dust position: {symbol} qty={trade['qty']:.6f} value=${remaining_notional:.2f} (< ${DUST_THRESHOLD}) — marking as closed")
+            trade_history.append({
+                **{k: v for k, v in trade.items() if not k.startswith("_")},
+                "exit_price":   current_price,
+                "exit_ticker":  current_price,
+                "exit_reason":  "DUST",
+                "closed_at":    datetime.now(timezone.utc).isoformat(),
+                "fee_usdt":     0.0,
+                "cost_usdt":    trade.get("budget_used", 0),
+                "revenue_usdt": 0.0,
+                "pnl_pct":      -100.0,
+                "pnl_usdt":     -trade.get("budget_used", 0),
+                "fills_used":   False,
+                "note":         f"Position too small (< ${DUST_THRESHOLD}) – marked as closed",
+            })
+            return True
+    # --- End dust handling ---
+
     if needs_sell and not PAPER_TRADE:
         tp_order_id = trade.get("tp_order_id")
         if label in ("SCALPER", "TRINITY") and tp_order_id:
@@ -3110,6 +3142,10 @@ def close_position(trade, reason) -> bool:
                 except requests.exceptions.HTTPError as e:
                     try: body = e.response.json()
                     except Exception: body = {}
+                    # Treat min notional error as dust (code 10006, 2005)
+                    if isinstance(body, dict) and body.get("code") in (10006, 2005):
+                        log.info(f"🧹 [{label}] Order size too small for {symbol} – treating as dust")
+                        break  # exit loop, treat as closed
                     if isinstance(body, dict) and body.get("code") == 30005:
                         log.info(f"✅ [{label}] Order already closed (code 30005) for {symbol} — assuming closed")
                         sell_order_id = "already_closed"
@@ -3130,6 +3166,12 @@ def close_position(trade, reason) -> bool:
             if sell_order_id:
                 time.sleep(1)
                 remaining = get_asset_balance(symbol)
+                # Check notional value instead of just quantity
+                if current_price is not None:
+                    remaining_notional = remaining * current_price
+                    if remaining_notional < DUST_THRESHOLD:
+                        log.info(f"🧹 [{label}] Remaining dust after sell: ${remaining_notional:.2f} – treating as closed")
+                        break
                 if remaining < trade["qty"] * 0.01:
                     log.info(f"✅ [{label}] Position {symbol} closed after attempt {attempt+1}")
                     break
@@ -3142,13 +3184,28 @@ def close_position(trade, reason) -> bool:
                     time.sleep(2 * (attempt + 1))
 
         final_remaining = get_asset_balance(symbol)
-        if final_remaining > trade["qty"] * 0.01:
-            log.error(f"🚨 [{label}] Could not close position {symbol} after {max_sell_attempts} attempts! Remaining {final_remaining:.4f}")
-            telegram(f"🚨 <b>Failed to close position!</b> {label} {symbol}\n"
-                     f"Reason: {reason}\n"
-                     f"Remaining: {final_remaining:.4f}\n"
-                     f"Manual intervention required.")
-            return False
+        if current_price is not None:
+            final_notional = final_remaining * current_price
+            if final_notional >= DUST_THRESHOLD:
+                log.error(f"🚨 [{label}] Could not close position {symbol} after {max_sell_attempts} attempts! Remaining {final_remaining:.4f} (${final_notional:.2f})")
+                telegram(f"🚨 <b>Failed to close position!</b> {label} {symbol}\n"
+                         f"Reason: {reason}\n"
+                         f"Remaining: {final_remaining:.4f} (~${final_notional:.2f})\n"
+                         f"Manual intervention required.")
+                return False
+            else:
+                log.info(f"🧹 [{label}] Position {symbol} left as dust (${final_notional:.2f}) – ignoring")
+                # Add a note to trade history? Already handled earlier.
+                return True
+        else:
+            # Fallback to old check
+            if final_remaining > trade["qty"] * 0.01:
+                log.error(f"🚨 [{label}] Could not close position {symbol} after {max_sell_attempts} attempts! Remaining {final_remaining:.4f}")
+                telegram(f"🚨 <b>Failed to close position!</b> {label} {symbol}\n"
+                         f"Reason: {reason}\n"
+                         f"Remaining: {final_remaining:.4f}\n"
+                         f"Manual intervention required.")
+                return False
 
     exit_fills = {}
     if not PAPER_TRADE:
