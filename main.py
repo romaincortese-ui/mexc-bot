@@ -7,6 +7,8 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Improved close_position retry logic with progressive delays and limit fallback
   • DUST_THRESHOLD – stops endless loops on positions < $5 (default)
   • Dust prevention in partial TP – if remaining slice < dust, sell 100%
+  • MAJOR_FILL_THRESHOLD – detect 85%+ fills and close trade immediately
+  • Major partial fill notification – sends TP hit alert on high fill rates
   • Capital allocation per strategy (Scalper 25%, Moonshot/Reversal 50%, Trinity 25%)
   • Maker orders (post-only limit) for both entry and TP to reduce fees
   • ATR-based moonshot stop-loss
@@ -60,6 +62,9 @@ CHASE_LIMIT_RETRIES = int(os.getenv("CHASE_LIMIT_RETRIES", "3"))
 
 # ── Dust threshold – positions below this USD value are considered closed ──
 DUST_THRESHOLD = float(os.getenv("DUST_THRESHOLD", "5.0"))
+
+# ── Major fill threshold – if a limit order is ≥ this % filled, close trade ──
+MAJOR_FILL_THRESHOLD = float(os.getenv("MAJOR_FILL_THRESHOLD", "0.85"))
 
 # ── Micro‑cap quick trigger (low volume moonshots) ────────────
 MICRO_CAP_VOL_RATIO_THRESHOLD = float(os.getenv("MICRO_CAP_VOL_RATIO_THRESHOLD", "0.30"))
@@ -2271,6 +2276,15 @@ def get_open_order_ids(symbol) -> set:
         log.debug(f"get_open_order_ids {symbol}: {e}")
         return set()
 
+def get_order_details(symbol: str, order_id: int) -> dict:
+    """Fetch order details from exchange. Returns dict with keys: status, executedQty, cummulativeQuoteQty, etc."""
+    try:
+        order = private_get("/api/v3/order", {"symbol": symbol, "orderId": order_id})
+        return order
+    except Exception as e:
+        log.debug(f"Failed to get order details for {symbol} {order_id}: {e}")
+        return {}
+
 def get_actual_fills(symbol: str, since_ms: int, retries: int = 3,
                      buy_order_id=None, sell_order_ids: set | None = None) -> dict:
     if PAPER_TRADE:
@@ -2862,6 +2876,46 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
         return True, "PARTIAL_TP"
 
     if label == "SCALPER":
+        # --- New: Major partial fill detection ---
+        if not PAPER_TRADE and tp_order_id and tp_order_id in get_open_order_ids(symbol):
+            order = get_order_details(symbol, tp_order_id)
+            if order and order.get("status") == "PARTIALLY_FILLED":
+                filled_qty = float(order.get("executedQty", 0))
+                if filled_qty > 0:
+                    filled_ratio = filled_qty / trade["qty"]
+                    remaining_qty = trade["qty"] - filled_qty
+                    remaining_notional = remaining_qty * price
+                    if filled_ratio >= MAJOR_FILL_THRESHOLD and remaining_notional < DUST_THRESHOLD:
+                        log.info(f"🎯 [SCALPER] Major partial fill ({filled_ratio*100:.1f}%) for {symbol}, remaining dust (${remaining_notional:.2f}) – closing trade")
+                        # Cancel remaining order
+                        cancel_order(symbol, tp_order_id, label)
+                        trade["tp_order_id"] = None
+                        # Record the partial fill as a trade
+                        filled_cost = float(order.get("cummulativeQuoteQty", 0))
+                        filled_price = filled_cost / filled_qty if filled_qty > 0 else price
+                        # Use a simplified partial TP record
+                        partial_trade = trade.copy()
+                        partial_trade["qty"] = filled_qty
+                        partial_trade["budget_used"] = trade["budget_used"] * filled_ratio
+                        partial_trade["exit_price"] = filled_price
+                        partial_trade["exit_ticker"] = filled_price
+                        partial_trade["exit_reason"] = "MAJOR_PARTIAL_TP"
+                        partial_trade["closed_at"] = datetime.now(timezone.utc).isoformat()
+                        partial_trade["fee_usdt"] = 0  # Will be refined if needed
+                        partial_trade["cost_usdt"] = partial_trade["budget_used"]
+                        partial_trade["revenue_usdt"] = filled_qty * filled_price
+                        partial_trade["pnl_usdt"] = partial_trade["revenue_usdt"] - partial_trade["cost_usdt"]
+                        partial_trade["pnl_pct"] = (partial_trade["pnl_usdt"] / partial_trade["cost_usdt"] * 100) if partial_trade["cost_usdt"] > 0 else 0
+                        partial_trade["fills_used"] = True
+                        partial_trade["is_partial"] = True
+                        trade_history.append(partial_trade)
+                        # Update the trade to reflect remaining dust (which we will treat as closed)
+                        trade["qty"] = remaining_qty
+                        trade["budget_used"] = trade["budget_used"] * (1 - filled_ratio)
+                        # Mark the trade as closed (dust will be swept later)
+                        return True, "MAJOR_PARTIAL_TP"
+        # --- End major partial fill detection ---
+
         if (trade.get("partial_tp_price")
                 and not trade.get("partial_tp_hit")
                 and peak_pct >= (trade["partial_tp_price"] / trade["entry_price"] - 1) * 100):
@@ -3109,7 +3163,7 @@ def close_position(trade, reason) -> bool:
     symbol = trade["symbol"]
     needs_sell = (
         (label in ("MOONSHOT", "REVERSAL")) or
-        (label == "SCALPER" and reason in ("STOP_LOSS","TRAILING_STOP","TIMEOUT","FLAT_EXIT","ROTATION","VOL_COLLAPSE","PROTECT_STOP")) or
+        (label == "SCALPER" and reason in ("STOP_LOSS","TRAILING_STOP","TIMEOUT","FLAT_EXIT","ROTATION","VOL_COLLAPSE","PROTECT_STOP","MAJOR_PARTIAL_TP")) or
         (label == "TRINITY" and reason in ("STOP_LOSS","TIMEOUT"))
     )
     sell_order_id = None
@@ -3339,6 +3393,7 @@ def close_position(trade, reason) -> bool:
         "PROTECT_STOP":  ("🛡️","Protection Stop"),
         "MICRO_HWM":     ("🛡️","Micro‑Cap HWM"),
         "DYN_HWM":       ("🛡️","Dynamic HWM"),
+        "MAJOR_PARTIAL_TP": ("🎯","Major Partial Fill"),
     }
     emoji, reason_label = icons.get(reason, ("✅", reason))
     fee_line   = f"Fees:    ${fee_usdt:.4f}\n" if fee_usdt > 0 else ""
