@@ -1,7 +1,10 @@
 """
 MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Added features:
+  Added features (restored in this version):
+  • Fixed Trinity budget calculation (uses allocated capital, not total value)
+  • Oversold (30005) error handling – treats as already closed without spam
+  • Improved close_position retry logic with progressive delays and limit fallback
   • Capital allocation per strategy (Scalper 25%, Moonshot/Reversal 50%, Trinity 25%)
   • Maker orders (post-only limit) for both entry and TP to reduce fees
   • ATR-based moonshot stop-loss
@@ -16,9 +19,6 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Market regime detection (adjusts entry thresholds based on BTC volatility/trend)
   • Chase limit orders for profit exits (reduces slippage)
   • Balance verification on close – retries until position is actually gone
-  • Oversold (30005) error handling – treats as already closed without spam
-  • Fixed Trinity budget calculation (uses allocated capital, not total value)
-  • Improved close_position retry logic with progressive delays and limit fallback
 """
 
 import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re, math
@@ -358,9 +358,6 @@ _btc_ema_gap:         float = 0.0
 _fast_cycle_counter = 0
 MAX_FAST_CYCLES = 10
 _market_regime_mult = 1.0   # default neutral
-
-# Throttle for 30005 errors
-_last_oversold_alert: dict = {}
 
 # ── WebSocket monitor (unchanged) ───────────────────────────
 WS_URL          = "wss://wbs-api.mexc.com/ws"
@@ -2240,6 +2237,10 @@ def place_limit_sell(symbol, qty, price, label="", tag="", maker: bool = None):
     except requests.exceptions.HTTPError as e:
         try:    body = e.response.json()
         except Exception: body = e.response.text if e.response else "no response"
+        # Treat "order already filled/cancelled" (30005) as success (position already closed)
+        if isinstance(body, dict) and body.get("code") == 30005:
+            log.info(f"✅ [{label}] Order already closed (code 30005) for {symbol} — assuming closed")
+            return None
         log.error(f"🚨 [{label}] LIMIT SELL rejected: {body}")
         telegram(f"⚠️ <b>TP limit order failed</b> [{label}]\n"
                  f"{symbol} qty={qty} @ {price}\n{str(body)[:200]}\n"
@@ -2329,6 +2330,7 @@ def get_actual_fills(symbol: str, since_ms: int, retries: int = 3,
                 "avg_sell_price": wavg_price(sells),
                 "cost_usdt":      total_quote(buys),
                 "revenue_usdt":   total_quote(sells),
+                "qty":            qty_bought,
                 "fee_usdt":       round(fee_usdt, 6),
                 "buy_count":      len(buys),
                 "sell_count":     len(sells),
@@ -2457,22 +2459,19 @@ def chase_limit_sell(symbol: str, qty: float, label: str, tag: str = "", timeout
             log.info(f"⏰ [{label}] Chase limit order {order_id} not filled in {timeout}s — cancelling and retrying")
             cancel_order(symbol, order_id, label)
         except requests.exceptions.HTTPError as e:
-            # Handle "oversold" (already closed) gracefully
-            try:
-                body = e.response.json()
-                if isinstance(body, dict) and body.get("code") == 30005:
-                    log.debug(f"[{label}] Chase limit sell: {symbol} already closed (code 30005) — treating as success")
-                    # Return a dummy result to indicate success
-                    return {"orderId": f"DUMMY_{tag}_{int(time.time())}", "status": "FILLED"}
-            except Exception:
-                pass
+            try:    body = e.response.json()
+            except Exception: body = e.response.text if e.response else "no response"
+            # Treat "order already filled/cancelled" (30005) as success (position already closed)
+            if isinstance(body, dict) and body.get("code") == 30005:
+                log.info(f"✅ [{label}] Order already closed (code 30005) for {symbol} — assuming closed")
+                return None
             log.warning(f"[{label}] Chase limit order failed on attempt {attempt+1}: {e}")
         except Exception as e:
             log.warning(f"[{label}] Chase limit order failed on attempt {attempt+1}: {e}")
 
-        # Wait a moment before retry
+        # Wait a moment before retry with progressive delay
         if attempt < max_retries - 1:
-            time.sleep(0.3)
+            time.sleep(0.5 * (attempt + 1))  # progressive: 0.5s, 1s, 1.5s
 
     # Fallback to market sell
     log.info(f"[{label}] Falling back to market sell for {symbol}")
@@ -2485,10 +2484,9 @@ def chase_limit_sell(symbol: str, qty: float, label: str, tag: str = "", timeout
     except requests.exceptions.HTTPError as e:
         try:    body = e.response.json()
         except Exception: body = e.response.text if e.response else "no response"
-        # Special handling for 30005 (already closed)
         if isinstance(body, dict) and body.get("code") == 30005:
-            log.debug(f"[{label}] Market sell: {symbol} already closed (code 30005) — treating as success")
-            return {"orderId": f"DUMMY_{tag}_{int(time.time())}", "status": "FILLED"}
+            log.info(f"✅ [{label}] Order already closed (code 30005) for {symbol} — assuming closed")
+            return None
         log.error(f"🚨 [{label}] Market SELL failed: {body}")
         telegram(f"🚨 <b>SELL failed!</b> [{label}] {symbol} qty={qty}\n{str(body)[:200]}\nManual intervention required.")
         return None
@@ -2556,6 +2554,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     actual_fills = get_actual_fills(symbol, since_ms=bought_at_ms,
                                     buy_order_id=buy_order_id)
     actual_entry = actual_fills.get("avg_buy_price") or price
+    actual_qty   = actual_fills.get("qty", qty) 
     actual_cost  = actual_fills.get("cost_usdt")     or notional
     if actual_fills.get("avg_buy_price"):
         log.info(f"[{label}] Actual fill: ${actual_entry:.6f} "
@@ -2563,24 +2562,8 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     else:
         log.info(f"[{label}] Using ticker price (myTrades unavailable): ${price:.6f}")
 
-    # 🔧 NEW: Disable micro/partial TP for small trades to avoid dust
-    micro_tp_price = None
-    partial_tp_price = None
-    if label == "MOONSHOT" and actual_cost < MIN_TRADE_FOR_PARTIAL_TP:
-        log.info(f"[{label}] Trade size ${actual_cost:.2f} < ${MIN_TRADE_FOR_PARTIAL_TP:.0f} — disabling micro/partial TP")
-        # micro and partial TP will remain None
-    else:
-        # compute micro and partial TP as usual
-        micro_tp_price = round_price_to_tick(actual_entry * (1 + MOONSHOT_MICRO_TP_PCT), tick_size) if label == "MOONSHOT" else None
-        if label == "MOONSHOT":
-            partial_tp_price = round_price_to_tick(actual_entry * (1 + MOONSHOT_PARTIAL_TP_PCT), tick_size)
-        elif label == "REVERSAL":
-            partial_tp_price = round_price_to_tick(actual_entry * (1 + REVERSAL_PARTIAL_TP_PCT), tick_size)
-        elif label == "SCALPER" and opp.get("score", 0) >= SCALPER_PARTIAL_TP_SCORE:
-            partial_tp_price = tp_price
-        else:
-            partial_tp_price = None
-
+    # Now compute TP/SL prices first (needed for partial TP)
+    # For SCALPER and REVERSAL, we may have dynamic SL, for others static
     if label == "SCALPER" and opp.get("atr_pct") is not None:
         if tp_pct > 0 and sl_pct > 0:
             used_tp_pct = tp_pct
@@ -2611,12 +2594,28 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         actual_sl = dynamic_sl
         sl_label = f"ATR×{MOONSHOT_SL_ATR_MULT} ({dynamic_sl*100:.1f}%)"
         sl_price = round(actual_entry * (1 - actual_sl), 8)
+    else:
+        sl_price = round(actual_entry * (1 - actual_sl), 8)
 
-    sl_price = round(actual_entry * (1 - actual_sl), 8)
+    # 🔧 NEW: Disable micro/partial TP for small trades to avoid dust
+    micro_tp_price = None
+    partial_tp_price = None
+    if label == "MOONSHOT" and actual_cost < MIN_TRADE_FOR_PARTIAL_TP:
+        log.info(f"[{label}] Trade size ${actual_cost:.2f} < ${MIN_TRADE_FOR_PARTIAL_TP:.0f} — disabling micro/partial TP")
+        # micro and partial TP will remain None
+    else:
+        # compute micro and partial TP as usual
+        if label == "MOONSHOT":
+            micro_tp_price = round_price_to_tick(actual_entry * (1 + MOONSHOT_MICRO_TP_PCT), tick_size)
+            partial_tp_price = round_price_to_tick(actual_entry * (1 + MOONSHOT_PARTIAL_TP_PCT), tick_size)
+        elif label == "REVERSAL":
+            partial_tp_price = round_price_to_tick(actual_entry * (1 + REVERSAL_PARTIAL_TP_PCT), tick_size)
+        elif label == "SCALPER" and opp.get("score", 0) >= SCALPER_PARTIAL_TP_SCORE:
+            partial_tp_price = tp_price   # now tp_price is defined
 
     # Place TP order with maker option (if enabled)
     if label in ("SCALPER", "TRINITY"):
-        tp_order_id = place_limit_sell(symbol, qty, tp_price, label, tag="TP", maker=USE_MAKER_ORDERS)
+        tp_order_id = place_limit_sell(symbol, actual_qty, tp_price, label, tag="TP", maker=USE_MAKER_ORDERS)
         if not PAPER_TRADE and not tp_order_id:
             log.warning(f"[{label}] TP limit failed — monitoring manually.")
             telegram(f"⚠️ [{label}] TP limit failed for {symbol} — monitoring manually.")
@@ -2631,7 +2630,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         "symbol":         symbol,
         "entry_price":    actual_entry,
         "entry_ticker":   price,
-        "qty":            qty,
+        "qty":            actual_qty,
         "budget_used":    actual_cost,
         "bought_at_ms":   bought_at_ms,
         "buy_order_id":   buy_order_id,
@@ -3109,26 +3108,24 @@ def close_position(trade, reason) -> bool:
                     sell_order_id = result.get("orderId")
                     log.info(f"✅ [{label}] Market sell ({reason}) attempt {attempt+1}: {result}")
                 except requests.exceptions.HTTPError as e:
-                    try:
-                        body = e.response.json()
-                        if isinstance(body, dict) and body.get("code") == 30005:
-                            log.debug(f"[{label}] Market sell: {symbol} already closed (code 30005) — treating as success")
-                            # No need to retry, break loop
-                            sell_order_id = f"DUMMY_{reason}_{int(time.time())}"
-                            break
-                    except Exception:
-                        pass
+                    try: body = e.response.json()
+                    except Exception: body = {}
+                    if isinstance(body, dict) and body.get("code") == 30005:
+                        log.info(f"✅ [{label}] Order already closed (code 30005) for {symbol} — assuming closed")
+                        sell_order_id = "already_closed"
+                        break  # treat as success
+                    log.error(f"🚨 [{label}] Market sell failed (attempt {attempt+1}): {e}")
+                    sell_order_id = None
+                except Exception as e:
                     log.error(f"🚨 [{label}] Market sell failed (attempt {attempt+1}): {e}")
                     sell_order_id = None
             else:
                 result = chase_limit_sell(symbol, trade["qty"], label, tag=reason)
-                if result:
-                    sell_order_id = result.get("orderId")
-                    if "DUMMY" in str(sell_order_id):
-                        log.debug(f"[{label}] Chase limit sell returned dummy order (already closed)")
-                        break
-                else:
+                if result is None:
+                    log.error(f"🚨 [{label}] Chase limit sell failed (attempt {attempt+1})")
                     sell_order_id = None
+                else:
+                    sell_order_id = result.get("orderId")
 
             if sell_order_id:
                 time.sleep(1)
@@ -3139,21 +3136,18 @@ def close_position(trade, reason) -> bool:
                 else:
                     log.warning(f"⚠️ [{label}] Sell order placed but still have {remaining:.4f} {symbol} – retrying")
                     if attempt < max_sell_attempts - 1:
-                        time.sleep(2)
+                        time.sleep(2 * (attempt + 1))  # progressive delay: 2s, 4s, 6s
             else:
                 if attempt < max_sell_attempts - 1:
-                    time.sleep(2)
+                    time.sleep(2 * (attempt + 1))
 
         final_remaining = get_asset_balance(symbol)
         if final_remaining > trade["qty"] * 0.01:
             log.error(f"🚨 [{label}] Could not close position {symbol} after {max_sell_attempts} attempts! Remaining {final_remaining:.4f}")
-            # Only send telegram once per symbol to avoid spam
-            if symbol not in _last_oversold_alert or time.time() - _last_oversold_alert[symbol] > 300:
-                _last_oversold_alert[symbol] = time.time()
-                telegram(f"🚨 <b>Failed to close position!</b> {label} {symbol}\n"
-                         f"Reason: {reason}\n"
-                         f"Remaining: {final_remaining:.4f}\n"
-                         f"Manual intervention required.")
+            telegram(f"🚨 <b>Failed to close position!</b> {label} {symbol}\n"
+                     f"Reason: {reason}\n"
+                     f"Remaining: {final_remaining:.4f}\n"
+                     f"Manual intervention required.")
             return False
 
     exit_fills = {}
@@ -3163,7 +3157,7 @@ def close_position(trade, reason) -> bool:
         known_sell_ids = set()
         if trade.get("tp_order_id"):
             known_sell_ids.add(trade["tp_order_id"])
-        if sell_order_id and "DUMMY" not in str(sell_order_id):
+        if sell_order_id and sell_order_id != "already_closed":
             known_sell_ids.add(sell_order_id)
         retries    = 5 if (reason == "TAKE_PROFIT" and label in ("SCALPER", "TRINITY")) else 3
         exit_fills = get_actual_fills(
@@ -4290,6 +4284,9 @@ def run():
                 try:
                     df_btc = parse_klines("BTCUSDT", interval="5m", limit=120, min_len=105)
                     if df_btc is not None:
+                        # Update BTC EMA gap for penalty
+                        btc_ema = calc_ema(df_btc["close"], BTC_REGIME_EMA_PERIOD)
+                        _btc_ema_gap = (float(df_btc["close"].iloc[-1]) / float(btc_ema.iloc[-1]) - 1)
                         chg = (float(df_btc["close"].iloc[-1]) /
                                float(df_btc["open"].iloc[-1]) - 1)
                         if chg < -BTC_PANIC_DROP:
@@ -4454,7 +4451,6 @@ def run():
                                                    exclude=_alt_excluded,
                                                    open_symbols=open_symbols)
                     if opp:
-                        # FIX: Use allocated capital, not total value
                         trinity_budget = max(MOONSHOT_MIN_NOTIONAL, min(
                             round(trinity_capital * TRINITY_BUDGET_PCT, 2), available_trinity))
                         trade = open_position(opp, trinity_budget,
