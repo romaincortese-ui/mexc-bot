@@ -9,6 +9,9 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Dust prevention in partial TP – if remaining slice < dust, sell 100%
   • MAJOR_FILL_THRESHOLD – detect 85%+ fills and close trade immediately
   • Major partial fill notification – sends TP hit alert on high fill rates
+  • Emergency market liquidation with up to 5 retries
+  • Alert de‑duplication – prevents spam for the same symbol within 10 minutes
+  • “Mission Over” threshold – switches to market sell if trade is already partially filled
   • Capital allocation per strategy (Scalper 25%, Moonshot/Reversal 50%, Trinity 25%)
   • Maker orders (post-only limit) for both entry and TP to reduce fees
   • ATR-based moonshot stop-loss
@@ -368,6 +371,10 @@ _btc_ema_gap:         float = 0.0
 _fast_cycle_counter = 0
 MAX_FAST_CYCLES = 10
 _market_regime_mult = 1.0   # default neutral
+
+# ── Alert de‑duplication ─────────────────────────────────────
+_last_error_time: dict = {}      # symbol -> last time an error alert was sent
+ERROR_ALERT_COOLDOWN = 600       # 10 minutes
 
 # ── WebSocket monitor (unchanged) ───────────────────────────
 WS_URL          = "wss://wbs-api.mexc.com/ws"
@@ -3195,6 +3202,9 @@ def close_position(trade, reason) -> bool:
             return True
     # --- End dust handling ---
 
+    # --- "Mission Over" threshold: if trade already partially filled (partial_tp_hit or micro_tp_hit) then force market sell ---
+    force_market = trade.get("partial_tp_hit") or trade.get("micro_tp_hit") or reason == "MAJOR_PARTIAL_TP"
+
     if needs_sell and not PAPER_TRADE:
         tp_order_id = trade.get("tp_order_id")
         if label in ("SCALPER", "TRINITY") and tp_order_id:
@@ -3205,82 +3215,121 @@ def close_position(trade, reason) -> bool:
                     break
             trade["tp_order_id"] = None
 
-        max_sell_attempts = 3
-        for attempt in range(max_sell_attempts):
-            if reason in ("STOP_LOSS", "HARD_SL"):
+        # First attempt: try chase_limit_sell if not forced to market
+        if not force_market:
+            result = chase_limit_sell(symbol, trade["qty"], label, tag=reason)
+            if result is not None:
+                sell_order_id = result.get("orderId")
+                if sell_order_id:
+                    # Check if order filled after a short wait
+                    time.sleep(1)
+                    remaining = get_asset_balance(symbol)
+                    if current_price is not None:
+                        remaining_notional = remaining * current_price
+                        if remaining_notional < DUST_THRESHOLD:
+                            log.info(f"🧹 [{label}] Dust after chase limit sell – treating as closed")
+                            return True
+                    if remaining < trade["qty"] * 0.01:
+                        log.info(f"✅ [{label}] Position {symbol} closed via chase limit sell")
+                        # Proceed to fill calculation
+                        # Continue to exit_fills logic (will happen after this block)
+                    else:
+                        log.info(f"⚠️ [{label}] Chase limit sell partially filled, remaining {remaining:.4f} – switching to market hammer")
+                        force_market = True
+            else:
+                # chase_limit_sell returned None (failure)
+                log.info(f"⚠️ [{label}] Chase limit sell failed – switching to market hammer")
+                force_market = True
+
+        # Market hammer: retry up to 5 times with short delays
+        if force_market:
+            market_attempts = 5
+            for attempt in range(market_attempts):
                 try:
                     result = private_post("/api/v3/order", {
                         "symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": str(trade["qty"])
                     })
                     sell_order_id = result.get("orderId")
-                    log.info(f"✅ [{label}] Market sell ({reason}) attempt {attempt+1}: {result}")
+                    log.info(f"✅ [{label}] Market sell (hammer) attempt {attempt+1}/{market_attempts}: {result}")
+                    # Wait a moment for order to process
+                    time.sleep(1)
+                    remaining = get_asset_balance(symbol)
+                    if current_price is not None:
+                        remaining_notional = remaining * current_price
+                        if remaining_notional < DUST_THRESHOLD:
+                            log.info(f"🧹 [{label}] Market hammer succeeded – dust remaining, treating as closed")
+                            return True
+                    if remaining < trade["qty"] * 0.01:
+                        log.info(f"✅ [{label}] Position {symbol} closed via market hammer")
+                        break
+                    else:
+                        log.info(f"⚠️ [{label}] Market hammer attempt {attempt+1} still has {remaining:.4f} – retrying")
                 except requests.exceptions.HTTPError as e:
                     try: body = e.response.json()
                     except Exception: body = {}
-                    # Treat min notional error as dust (code 10006, 2005)
-                    if isinstance(body, dict) and body.get("code") in (10006, 2005):
-                        log.info(f"🧹 [{label}] Order size too small for {symbol} – treating as dust")
-                        break  # exit loop, treat as closed
                     if isinstance(body, dict) and body.get("code") == 30005:
                         log.info(f"✅ [{label}] Order already closed (code 30005) for {symbol} — assuming closed")
                         sell_order_id = "already_closed"
-                        break  # treat as success
-                    log.error(f"🚨 [{label}] Market sell failed (attempt {attempt+1}): {e}")
+                        break
+                    elif isinstance(body, dict) and body.get("code") in (10006, 2005):
+                        log.info(f"🧹 [{label}] Order size too small for {symbol} – treating as dust")
+                        break
+                    else:
+                        # Check if we should send an alert (de‑duplication)
+                        now = time.time()
+                        last_alert = _last_error_time.get(symbol, 0)
+                        if now - last_alert > ERROR_ALERT_COOLDOWN:
+                            _last_error_time[symbol] = now
+                            log.error(f"🚨 [{label}] Market sell hammer attempt {attempt+1} failed: {e}")
+                            telegram(f"🚨 <b>Market sell failed!</b> {label} {symbol}\n"
+                                     f"Attempt {attempt+1}/{market_attempts}\n"
+                                     f"Error: {str(body)[:200]}\n"
+                                     f"Will retry.")
+                        else:
+                            log.debug(f"🚨 [{label}] Market sell hammer attempt {attempt+1} failed (alert suppressed): {e}")
                     sell_order_id = None
                 except Exception as e:
-                    log.error(f"🚨 [{label}] Market sell failed (attempt {attempt+1}): {e}")
+                    log.error(f"🚨 [{label}] Market sell hammer attempt {attempt+1} failed: {e}")
                     sell_order_id = None
-            else:
-                result = chase_limit_sell(symbol, trade["qty"], label, tag=reason)
-                if result is None:
-                    log.error(f"🚨 [{label}] Chase limit sell failed (attempt {attempt+1})")
-                    sell_order_id = None
-                else:
-                    sell_order_id = result.get("orderId")
 
-            if sell_order_id:
-                time.sleep(1)
-                remaining = get_asset_balance(symbol)
-                # Check notional value instead of just quantity
-                if current_price is not None:
-                    remaining_notional = remaining * current_price
-                    if remaining_notional < DUST_THRESHOLD:
-                        log.info(f"🧹 [{label}] Remaining dust after sell: ${remaining_notional:.2f} – treating as closed")
-                        break
-                if remaining < trade["qty"] * 0.01:
-                    log.info(f"✅ [{label}] Position {symbol} closed after attempt {attempt+1}")
-                    break
-                else:
-                    log.warning(f"⚠️ [{label}] Sell order placed but still have {remaining:.4f} {symbol} – retrying")
-                    if attempt < max_sell_attempts - 1:
-                        time.sleep(2 * (attempt + 1))  # progressive delay: 2s, 4s, 6s
-            else:
-                if attempt < max_sell_attempts - 1:
-                    time.sleep(2 * (attempt + 1))
+                if attempt < market_attempts - 1:
+                    time.sleep(1)  # short delay between retries
 
-        final_remaining = get_asset_balance(symbol)
-        if current_price is not None:
-            final_notional = final_remaining * current_price
-            if final_notional >= DUST_THRESHOLD:
-                log.error(f"🚨 [{label}] Could not close position {symbol} after {max_sell_attempts} attempts! Remaining {final_remaining:.4f} (${final_notional:.2f})")
-                telegram(f"🚨 <b>Failed to close position!</b> {label} {symbol}\n"
-                         f"Reason: {reason}\n"
-                         f"Remaining: {final_remaining:.4f} (~${final_notional:.2f})\n"
-                         f"Manual intervention required.")
-                return False
+            # After all hammer attempts, check remaining balance
+            final_remaining = get_asset_balance(symbol)
+            if current_price is not None:
+                final_notional = final_remaining * current_price
+                if final_notional >= DUST_THRESHOLD:
+                    log.error(f"🚨 [{label}] Could not close position {symbol} after {market_attempts} market hammer attempts! Remaining {final_remaining:.4f} (${final_notional:.2f})")
+                    # Only alert once per symbol per cooldown
+                    now = time.time()
+                    last_alert = _last_error_time.get(symbol, 0)
+                    if now - last_alert > ERROR_ALERT_COOLDOWN:
+                        _last_error_time[symbol] = now
+                        telegram(f"🚨 <b>Failed to close position!</b> {label} {symbol}\n"
+                                 f"Reason: {reason}\n"
+                                 f"Remaining: {final_remaining:.4f} (~${final_notional:.2f})\n"
+                                 f"Manual intervention required.")
+                    return False
+                else:
+                    log.info(f"🧹 [{label}] Position {symbol} left as dust (${final_notional:.2f}) – ignoring")
+                    return True
             else:
-                log.info(f"🧹 [{label}] Position {symbol} left as dust (${final_notional:.2f}) – ignoring")
-                # Add a note to trade history? Already handled earlier.
-                return True
-        else:
-            # Fallback to old check
-            if final_remaining > trade["qty"] * 0.01:
-                log.error(f"🚨 [{label}] Could not close position {symbol} after {max_sell_attempts} attempts! Remaining {final_remaining:.4f}")
-                telegram(f"🚨 <b>Failed to close position!</b> {label} {symbol}\n"
-                         f"Reason: {reason}\n"
-                         f"Remaining: {final_remaining:.4f}\n"
-                         f"Manual intervention required.")
-                return False
+                # Fallback to old check
+                if final_remaining > trade["qty"] * 0.01:
+                    log.error(f"🚨 [{label}] Could not close position {symbol} after {market_attempts} market hammer attempts! Remaining {final_remaining:.4f}")
+                    # Alert with dedup
+                    now = time.time()
+                    last_alert = _last_error_time.get(symbol, 0)
+                    if now - last_alert > ERROR_ALERT_COOLDOWN:
+                        _last_error_time[symbol] = now
+                        telegram(f"🚨 <b>Failed to close position!</b> {label} {symbol}\n"
+                                 f"Reason: {reason}\n"
+                                 f"Remaining: {final_remaining:.4f}\n"
+                                 f"Manual intervention required.")
+                    return False
+                else:
+                    return True
 
     exit_fills = {}
     if not PAPER_TRADE:
