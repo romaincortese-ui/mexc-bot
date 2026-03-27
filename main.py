@@ -31,6 +31,11 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Market regime detection (adjusts entry thresholds based on BTC volatility/trend)
   • Chase limit orders for profit exits (reduces slippage)
   • Balance verification on close – retries until position is actually gone
+  • FLOOR & CHASE EXIT STRATEGY (MOONSHOT / REVERSAL / PRE‑BREAKOUT):
+      - After a micro or partial TP, a hard profit floor (true breakeven or 0.5% below exit)
+        and a dynamic trailing stop (based on ATR and high‑water mark) are activated.
+      - Exit is triggered when price hits the higher of the two, and execution uses
+        chase limit orders (avoiding market sell unless absolutely necessary).
 """
 
 import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re, math
@@ -387,6 +392,11 @@ WS_PING_SECS    = 20
 WS_STALE_SECS   = 60
 _live_prices: dict = {}
 _ws_lock           = threading.Lock()
+
+# ── Floor & Chase (true breakeven) ────────────────────────────
+def calculate_true_breakeven(entry_price: float) -> float:
+    round_trip_cost = (FEE_RATE_TAKER * 2) + FEE_SLIPPAGE_BUFFER
+    return entry_price * (1 + round_trip_cost)
 
 def ws_price(symbol: str) -> float | None:
     with _ws_lock:
@@ -2672,6 +2682,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         used_tp_pct = tp_pct
         tp_status   = "TP + SL bot-monitored ✅ (direct market sell)"
 
+    # ── Floor & Chase fields added ─────────────────────────────────
     trade = {
         "label":          label,
         "symbol":         symbol,
@@ -2717,6 +2728,11 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
             REVERSAL_PARTIAL_TP_RATIO if label == "REVERSAL" else None
         ),
         "partial_tp_hit":   False,
+        # ── Floor & Chase fields ─────────────────────────────────────
+        "hard_floor_price": None,
+        "trailing_stop_price": None,
+        "trailing_active": False,
+        "last_tp_price": None,          # records the price at which a partial TP was taken
     }
 
     mode         = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
@@ -2809,6 +2825,29 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     )
     save_state()
     return trade
+
+# ── Floor & Chase activation (after partial TP) ──────────────────
+def activate_floor_and_chase(trade, exit_price):
+    """Setup floor & chase for the remaining position after a partial TP."""
+    true_be = calculate_true_breakeven(trade["entry_price"])
+    # Profit lock floor: max(true breakeven, exit_price * 0.995)
+    hard_floor = max(true_be, exit_price * 0.995)
+    trade["hard_floor_price"] = hard_floor
+    trade["trailing_active"] = True
+    trade["last_tp_price"] = exit_price
+
+    # Compute initial trailing stop based on current HWM and ATR
+    atr_pct = trade.get("atr_pct", 0.02)
+    hwm = trade["highest_price"]
+    peak_profit = (hwm / trade["entry_price"] - 1)
+    if peak_profit >= atr_pct * MOONSHOT_TRAIL_WIDE_THRESH:
+        trail_pct = MOONSHOT_TRAIL_ATR_WIDE
+    else:
+        trail_pct = MOONSHOT_TRAIL_PCT
+    trail_stop = hwm * (1 - trail_pct)
+    # Ensure trail stop is not below hard floor
+    trade["trailing_stop_price"] = max(trail_stop, hard_floor)
+    log.info(f"Floor & Chase activated: floor=${hard_floor:.6f}, trail=${trade['trailing_stop_price']:.6f}")
 
 def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
     symbol      = trade["symbol"]
@@ -3008,7 +3047,38 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
                 if not PAPER_TRADE and tp_order_id:
                     cancel_order(symbol, tp_order_id, label)
                 return True, "ROTATION"
-    elif label == "MOONSHOT" and trade.get("partial_tp_hit"):
+
+    # ── FLOOR & CHASE EXIT (for MOONSHOT, REVERSAL, PRE_BREAKOUT) ──
+    elif label in ("MOONSHOT", "REVERSAL", "PRE_BREAKOUT") and trade.get("trailing_active"):
+        # Update HWM and trailing stop if price rises
+        if price > trade.get("highest_price", trade["entry_price"]):
+            trade["highest_price"] = price
+            atr_pct = trade.get("atr_pct", 0.02)
+            peak_profit = (trade["highest_price"] / trade["entry_price"] - 1)
+            if peak_profit >= atr_pct * MOONSHOT_TRAIL_WIDE_THRESH:
+                trail_pct = MOONSHOT_TRAIL_ATR_WIDE
+            else:
+                trail_pct = MOONSHOT_TRAIL_PCT
+            new_trail = trade["highest_price"] * (1 - trail_pct)
+            # Trail can only go up
+            if new_trail > trade.get("trailing_stop_price", 0):
+                trade["trailing_stop_price"] = new_trail
+                log.debug(f"Trailing stop updated to ${new_trail:.6f} for {symbol}")
+
+        hard_floor = trade.get("hard_floor_price")
+        trail_stop = trade.get("trailing_stop_price")
+        if hard_floor is not None and trail_stop is not None:
+            active_trigger = max(trail_stop, hard_floor)
+            if price <= active_trigger:
+                log.info(f"Floor & Chase exit: {symbol} | price {price:.6f} ≤ trigger {active_trigger:.6f} | P&L {pct:.2f}%")
+                if not PAPER_TRADE and trade.get("tp_order_id"):
+                    cancel_order(symbol, trade["tp_order_id"], label)
+                    trade["tp_order_id"] = None
+                return True, "FLOOR_OR_TRAIL"
+
+    # ── ORIGINAL TRAILING LOGIC FOR MOONSHOT (if no floor & chase active) ──
+    elif label == "MOONSHOT" and trade.get("partial_tp_hit") and not trade.get("trailing_active"):
+        # Legacy trailing stop (fallback)
         atr_pct     = trade.get("atr_pct") or MOONSHOT_SL * 0.5
         peak_profit = (trade["highest_price"] / trade["entry_price"] - 1)
         trail_pct   = (MOONSHOT_TRAIL_ATR_WIDE
@@ -3019,10 +3089,14 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             log.info(f"📉 [{label}] Trail stop ({trail_pct*100:.0f}%): {symbol} | {pct:+.2f}% | "
                      f"high {((trade['highest_price']/trade['entry_price'])-1)*100:.1f}%")
             return True, "TRAILING_STOP"
+
     else:
+        # Normal TP for non‑scalper trades that haven't hit partial TP
         if price >= trade["tp_price"]:
             log.info(f"🎯 [{label}] TP: {symbol} | +{pct:.2f}%")
             return True, "TAKE_PROFIT"
+
+    # Timeout / momentum decay for MOONSHOT (only if not already risk‑free)
     if label == "MOONSHOT":
         _risk_free = trade.get("micro_tp_hit") or trade.get("partial_tp_hit")
         if not _risk_free and -1.0 <= pct < 0.5 and held_min >= MOONSHOT_TIMEOUT_FLAT_MINS:
@@ -3035,7 +3109,9 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             if detect_momentum_decay(symbol):
                 log.info(f"📉 [{label}] Momentum decay: {symbol} | {pct:+.2f}%")
                 return True, "VOL_COLLAPSE"
-    if label == "REVERSAL" and not trade.get("partial_tp_hit"):
+
+    # REVERSAL specials (weak bounce, flat progress) – but only if floor & chase not active
+    if label == "REVERSAL" and not trade.get("partial_tp_hit") and not trade.get("trailing_active"):
         if held_min >= REVERSAL_FLAT_MINS and pct >= 0:
             tp_range = trade["tp_price"] - trade["entry_price"]
             if tp_range > 0:
@@ -3050,6 +3126,7 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
                 and trade["sl_price"] < trade["entry_price"]):
             trade["sl_price"] = trade["entry_price"]
             log.info(f"🔄 [{label}] Weak bounce after {held_min:.0f}min — SL moved to entry")
+
     log.info(f"👀 [{label}] {symbol} | {pct:+.2f}% | {held_min:.0f}min | "
              f"High: {((trade['highest_price']/trade['entry_price'])-1)*100:.2f}%")
     return False, ""
@@ -3154,11 +3231,19 @@ def execute_partial_tp(trade, micro: bool = False) -> bool:
     })
     trade["qty"]               = remaining_qty
     trade["budget_used"]       = round(trade["budget_used"] * (1 - ratio), 4)
-    trade["sl_price"]          = trade["entry_price"]
-    if micro:
-        trade["micro_tp_hit"]  = True
+    # For SCALPER and TRINITY we still move SL to entry; for others we activate Floor & Chase
+    if label in ("MOONSHOT", "REVERSAL", "PRE_BREAKOUT"):
+        # Activate Floor & Chase using the actual exit price
+        activate_floor_and_chase(trade, actual_exit)
+        # Disable the old SL price to avoid interference
+        trade["sl_price"] = 0.0
     else:
-        trade["partial_tp_hit"]= True
+        # For SCALPER and TRINITY, just move SL to entry
+        trade["sl_price"] = trade["entry_price"]
+    if micro:
+        trade["micro_tp_hit"] = True
+    else:
+        trade["partial_tp_hit"] = True
     trade["bought_at_ms"]      = partial_sold_at_ms
     if label == "SCALPER" and not PAPER_TRADE and remaining_qty > 0:
         _, _, _, tick_size = get_symbol_rules(symbol)
@@ -3198,7 +3283,7 @@ def close_position(trade, reason) -> bool:
     label  = trade["label"]
     symbol = trade["symbol"]
     needs_sell = (
-        (label in ("MOONSHOT", "REVERSAL")) or
+        (label in ("MOONSHOT", "REVERSAL", "PRE_BREAKOUT")) or
         (label == "SCALPER" and reason in ("STOP_LOSS","TRAILING_STOP","TIMEOUT","FLAT_EXIT","ROTATION","VOL_COLLAPSE","PROTECT_STOP","MAJOR_PARTIAL_TP")) or
         (label == "TRINITY" and reason in ("STOP_LOSS","TIMEOUT"))
     )
@@ -3501,6 +3586,7 @@ def close_position(trade, reason) -> bool:
         "DYN_HWM":       ("🛡️","Dynamic HWM"),
         "MAJOR_PARTIAL_TP": ("🎯","Major Partial Fill"),
         "DUST":          ("🧹","Dust Position"),
+        "FLOOR_OR_TRAIL":("🛡️","Floor & Trail"),
     }
     emoji, reason_label = icons.get(reason, ("✅", reason))
     fee_line   = f"Fees:    ${fee_usdt:.4f}\n" if fee_usdt > 0 else ""
