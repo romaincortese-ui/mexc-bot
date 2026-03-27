@@ -13,6 +13,10 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Alert de‑duplication – prevents spam for the same symbol within 10 minutes
   • “Mission Over” threshold – switches to market sell if trade is already partially filled
   • Dust closure now sends a Telegram alert (so you never miss a final exit)
+  • Context‑aware exits:
+      - Defensive stops (SL, trailing, timeout, etc.) cancel all orders first, then market sell
+      - Moonshot TPs use a 1‑second hammer (limit → market after 1s)
+      - Scalper TPs keep patient maker orders
   • Capital allocation per strategy (Scalper 25%, Moonshot/Reversal 50%, Trinity 25%)
   • Maker orders (post-only limit) for both entry and TP to reduce fees
   • ATR-based moonshot stop-loss
@@ -2284,6 +2288,22 @@ def get_open_order_ids(symbol) -> set:
         log.debug(f"get_open_order_ids {symbol}: {e}")
         return set()
 
+def cancel_all_orders(symbol: str):
+    """Cancel all open orders for a given symbol."""
+    if PAPER_TRADE:
+        return
+    try:
+        open_orders = private_get("/api/v3/openOrders", {"symbol": symbol})
+        for order in open_orders:
+            order_id = order["orderId"]
+            try:
+                private_delete("/api/v3/order", {"symbol": symbol, "orderId": order_id})
+                log.info(f"✅ Cancelled order {order_id} for {symbol}")
+            except Exception as e:
+                log.debug(f"Failed to cancel order {order_id}: {e}")
+    except Exception as e:
+        log.debug(f"Failed to fetch open orders for {symbol}: {e}")
+
 def get_order_details(symbol: str, order_id: int) -> dict:
     """Fetch order details from exchange. Returns dict with keys: status, executedQty, cummulativeQuoteQty, etc."""
     try:
@@ -3076,6 +3096,14 @@ def execute_partial_tp(trade, micro: bool = False) -> bool:
             trade["partial_tp_hit"] = True
         return True
 
+    # For moonshot TPs, use a short timeout (1 second) to chase maker fee, then market
+    if label == "MOONSHOT" and reason_tag in ("PARTIAL_TP", "MICRO_TP", "FULL_CLOSE"):
+        timeout = 1.0
+        max_retries = 2
+    else:
+        timeout = CHASE_LIMIT_TIMEOUT
+        max_retries = CHASE_LIMIT_RETRIES
+
     partial_sell_id  = None
     partial_sold_at_ms = int(time.time() * 1000)
     if not PAPER_TRADE:
@@ -3083,7 +3111,7 @@ def execute_partial_tp(trade, micro: bool = False) -> bool:
             cancel_order(symbol, trade["tp_order_id"], label)
             trade["tp_order_id"] = None
         # Use chase limit order for partial TP
-        result = chase_limit_sell(symbol, partial_qty, label, tag=reason_tag)
+        result = chase_limit_sell(symbol, partial_qty, label, tag=reason_tag, timeout=timeout, max_retries=max_retries)
         partial_sell_id = result.get("orderId") if result else None
         if not result:
             log.error(f"🚨 [{label}] Partial TP sell failed (chase limit fallback failed).")
@@ -3224,34 +3252,13 @@ def close_position(trade, reason) -> bool:
                     break
             trade["tp_order_id"] = None
 
-        # First attempt: try chase_limit_sell if not forced to market
-        if not force_market:
-            result = chase_limit_sell(symbol, trade["qty"], label, tag=reason)
-            if result is not None:
-                sell_order_id = result.get("orderId")
-                if sell_order_id:
-                    # Check if order filled after a short wait
-                    time.sleep(1)
-                    remaining = get_asset_balance(symbol)
-                    if current_price is not None:
-                        remaining_notional = remaining * current_price
-                        if remaining_notional < DUST_THRESHOLD:
-                            log.info(f"🧹 [{label}] Dust after chase limit sell – treating as closed")
-                            return True
-                    if remaining < trade["qty"] * 0.01:
-                        log.info(f"✅ [{label}] Position {symbol} closed via chase limit sell")
-                        # Proceed to fill calculation
-                        # Continue to exit_fills logic (will happen after this block)
-                    else:
-                        log.info(f"⚠️ [{label}] Chase limit sell partially filled, remaining {remaining:.4f} – switching to market hammer")
-                        force_market = True
-            else:
-                # chase_limit_sell returned None (failure)
-                log.info(f"⚠️ [{label}] Chase limit sell failed – switching to market hammer")
-                force_market = True
-
-        # Market hammer: retry up to 5 times with short delays
-        if force_market:
+        # For defensive exits: cancel all open orders, then market sell
+        defensive_reasons = ("STOP_LOSS", "TRAILING_STOP", "TIMEOUT", "FLAT_EXIT", "ROTATION", "VOL_COLLAPSE", "PROTECT_STOP")
+        if reason in defensive_reasons:
+            # Cancel all open orders to unlock balance
+            cancel_all_orders(symbol)
+            time.sleep(0.5)  # wait for unlock
+            # Market sell
             market_attempts = 5
             for attempt in range(market_attempts):
                 try:
@@ -3259,20 +3266,20 @@ def close_position(trade, reason) -> bool:
                         "symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": str(trade["qty"])
                     })
                     sell_order_id = result.get("orderId")
-                    log.info(f"✅ [{label}] Market sell (hammer) attempt {attempt+1}/{market_attempts}: {result}")
+                    log.info(f"✅ [{label}] Market sell (defensive) attempt {attempt+1}/{market_attempts}: {result}")
                     # Wait a moment for order to process
                     time.sleep(1)
                     remaining = get_asset_balance(symbol)
                     if current_price is not None:
                         remaining_notional = remaining * current_price
                         if remaining_notional < DUST_THRESHOLD:
-                            log.info(f"🧹 [{label}] Market hammer succeeded – dust remaining, treating as closed")
+                            log.info(f"🧹 [{label}] Market sell succeeded – dust remaining, treating as closed")
                             return True
                     if remaining < trade["qty"] * 0.01:
-                        log.info(f"✅ [{label}] Position {symbol} closed via market hammer")
+                        log.info(f"✅ [{label}] Position {symbol} closed via market sell")
                         break
                     else:
-                        log.info(f"⚠️ [{label}] Market hammer attempt {attempt+1} still has {remaining:.4f} – retrying")
+                        log.info(f"⚠️ [{label}] Market sell attempt {attempt+1} still has {remaining:.4f} – retrying")
                 except requests.exceptions.HTTPError as e:
                     try: body = e.response.json()
                     except Exception: body = {}
@@ -3289,22 +3296,22 @@ def close_position(trade, reason) -> bool:
                         last_alert = _last_error_time.get(symbol, 0)
                         if now - last_alert > ERROR_ALERT_COOLDOWN:
                             _last_error_time[symbol] = now
-                            log.error(f"🚨 [{label}] Market sell hammer attempt {attempt+1} failed: {e}")
+                            log.error(f"🚨 [{label}] Market sell defensive attempt {attempt+1} failed: {e}")
                             telegram(f"🚨 <b>Market sell failed!</b> {label} {symbol}\n"
                                      f"Attempt {attempt+1}/{market_attempts}\n"
                                      f"Error: {str(body)[:200]}\n"
                                      f"Will retry.")
                         else:
-                            log.debug(f"🚨 [{label}] Market sell hammer attempt {attempt+1} failed (alert suppressed): {e}")
+                            log.debug(f"🚨 [{label}] Market sell defensive attempt {attempt+1} failed (alert suppressed): {e}")
                     sell_order_id = None
                 except Exception as e:
-                    log.error(f"🚨 [{label}] Market sell hammer attempt {attempt+1} failed: {e}")
+                    log.error(f"🚨 [{label}] Market sell defensive attempt {attempt+1} failed: {e}")
                     sell_order_id = None
 
                 if attempt < market_attempts - 1:
                     time.sleep(1)  # short delay between retries
 
-            # After all hammer attempts, check remaining balance
+            # After all attempts, check remaining balance
             final_remaining = get_asset_balance(symbol)
             if current_price is not None:
                 final_notional = final_remaining * current_price
@@ -3347,6 +3354,39 @@ def close_position(trade, reason) -> bool:
                     return False
                 else:
                     return True
+
+        # For non‑defensive exits: use the existing chase limit logic, possibly with short timeout for moonshot TP
+        else:
+            # For moonshot take profits, use short timeout
+            if label == "MOONSHOT" and reason == "TAKE_PROFIT":
+                timeout = 1.0
+                max_retries = 2
+            else:
+                timeout = CHASE_LIMIT_TIMEOUT
+                max_retries = CHASE_LIMIT_RETRIES
+
+            result = chase_limit_sell(symbol, trade["qty"], label, tag=reason, timeout=timeout, max_retries=max_retries)
+            if result is not None:
+                sell_order_id = result.get("orderId")
+                if sell_order_id:
+                    # Check if order filled after a short wait
+                    time.sleep(1)
+                    remaining = get_asset_balance(symbol)
+                    if current_price is not None:
+                        remaining_notional = remaining * current_price
+                        if remaining_notional < DUST_THRESHOLD:
+                            log.info(f"🧹 [{label}] Dust after chase limit sell – treating as closed")
+                            return True
+                    if remaining < trade["qty"] * 0.01:
+                        log.info(f"✅ [{label}] Position {symbol} closed via chase limit sell")
+                    else:
+                        log.warning(f"⚠️ [{label}] Chase limit sell partially filled, remaining {remaining:.4f} – proceeding anyway")
+                else:
+                    log.error(f"🚨 [{label}] Chase limit sell failed – no orderId")
+                    return False
+            else:
+                log.error(f"🚨 [{label}] Chase limit sell failed – result is None")
+                return False
 
     exit_fills = {}
     if not PAPER_TRADE:
