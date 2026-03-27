@@ -71,14 +71,14 @@ MIN_TRADE_FOR_PARTIAL_TP = float(os.getenv("MIN_TRADE_FOR_PARTIAL_TP", "15.0"))
 
 # ── Maker orders (post‑only) for both entry and TP ─────────────
 USE_MAKER_ORDERS = os.getenv("USE_MAKER_ORDERS", "True").lower() == "true"
-MAKER_ORDER_TIMEOUT_SEC = float(os.getenv("MAKER_ORDER_TIMEOUT_SEC", "2.0"))
+MAKER_ORDER_TIMEOUT_SEC = float(os.getenv("MAKER_ORDER_TIMEOUT_SEC", "1.5"))
 
 # Chase limit order settings (for exits)
-CHASE_LIMIT_TIMEOUT = float(os.getenv("CHASE_LIMIT_TIMEOUT", "2.0"))
+CHASE_LIMIT_TIMEOUT = float(os.getenv("CHASE_LIMIT_TIMEOUT", "1.5"))
 CHASE_LIMIT_RETRIES = int(os.getenv("CHASE_LIMIT_RETRIES", "3"))
 
 # ── Dust threshold – positions below this USD value are considered closed ──
-DUST_THRESHOLD = float(os.getenv("DUST_THRESHOLD", "5.0"))
+DUST_THRESHOLD = float(os.getenv("DUST_THRESHOLD", "3.0"))
 
 # ── Major fill threshold – if a limit order is ≥ this % filled, close trade ──
 MAJOR_FILL_THRESHOLD = float(os.getenv("MAJOR_FILL_THRESHOLD", "0.85"))
@@ -104,38 +104,38 @@ REGIME_TREND_MULT   = float(os.getenv("REGIME_TREND_MULT",   "1.1"))
 SCALPER_MAX_TRADES   = int(os.getenv("SCALPER_MAX_TRADES",   "3"))
 SCALPER_BUDGET_PCT   = float(os.getenv("SCALPER_BUDGET_PCT", "0.37"))   # per‑trade max % of allocated capital
 SCALPER_RISK_PER_TRADE = float(os.getenv("SCALPER_RISK_PER_TRADE", "0.01"))
-SCALPER_TRAIL_ACT    = 0.03
-SCALPER_TRAIL_PCT    = 0.015
+SCALPER_TRAIL_ACT    = float(os.getenv("SCALPER_TRAIL_ACT",    "0.03"))
+SCALPER_TRAIL_PCT    = float(os.getenv("SCALPER_TRAIL_PCT_LEG", "0.015"))
 SCALPER_TRAIL_ATR_MULT = float(os.getenv("SCALPER_TRAIL_ATR_MULT", "1.85"))
 SCALPER_TRAIL_MIN    = float(os.getenv("SCALPER_TRAIL_MIN",   "0.010"))
 SCALPER_TRAIL_MAX    = float(os.getenv("SCALPER_TRAIL_MAX",   "0.035"))
 SCALPER_CONFLUENCE_BONUS = float(os.getenv("SCALPER_CONFLUENCE_BONUS", "15"))
 SCALPER_ATR_PERIOD   = 21
-SCALPER_FLAT_MINS    = 30
-SCALPER_FLAT_RANGE   = 0.005
-SCALPER_ROTATE_GAP   = 20
+SCALPER_FLAT_MINS    = int(os.getenv("SCALPER_FLAT_MINS",     "25"))
+SCALPER_FLAT_RANGE   = float(os.getenv("SCALPER_FLAT_RANGE",  "0.008"))
+SCALPER_ROTATE_GAP   = int(os.getenv("SCALPER_ROTATE_GAP",    "25"))
 SCALPER_MIN_VOL      = 500_000
 SCALPER_MIN_PRICE    = 0.01
 SCALPER_MIN_CHANGE   = 0.1
 SCALPER_THRESHOLD    = int(os.getenv("SCALPER_THRESHOLD", "37"))
 SCALPER_MAX_RSI      = 70
 WATCHLIST_MIN_SCORE  = max(5, SCALPER_THRESHOLD // 2)
-SCALPER_BREAKEVEN_SCORE = int(os.getenv("SCALPER_BREAKEVEN_SCORE", "60"))
-SCALPER_BREAKEVEN_ACT   = 0.015
+SCALPER_BREAKEVEN_SCORE = int(os.getenv("SCALPER_BREAKEVEN_SCORE", "50"))
+SCALPER_BREAKEVEN_ACT   = float(os.getenv("SCALPER_BREAKEVEN_ACT", "0.015"))
 SCALPER_MIN_1H_VOL      = 50_000
-SCALPER_SYMBOL_COOLDOWN = 1800
+SCALPER_SYMBOL_COOLDOWN = int(os.getenv("SCALPER_SYMBOL_COOLDOWN", "1200"))
 SCALPER_DAILY_LOSS_PCT  = 0.05
 SCALPER_EMA50_PENALTY  = float(os.getenv("SCALPER_EMA50_PENALTY", "200"))
-SCALPER_MAX_CORRELATION = float(os.getenv("SCALPER_MAX_CORRELATION", "0.76"))
+SCALPER_MAX_CORRELATION = float(os.getenv("SCALPER_MAX_CORRELATION", "0.70"))
 
-# ── Dynamic TP/SL multipliers (unchanged) ─────────────────────
+# ── Dynamic TP/SL multipliers ─────────────────────────────────
 SCALPER_TP_MULT_CROSSOVER = 2.5
 SCALPER_TP_MULT_VOL_SPIKE = 1.8
 SCALPER_TP_MULT_OVERSOLD  = 2.2
 SCALPER_TP_MULT_DEFAULT   = 2.0
 SCALPER_TP_CANDLE_MULT    = 4.0
-SCALPER_TP_MIN            = 0.025
-SCALPER_TP_MAX            = 0.08
+SCALPER_TP_MIN            = float(os.getenv("SCALPER_TP_MIN",  "0.030"))
+SCALPER_TP_MAX            = float(os.getenv("SCALPER_TP_MAX",  "0.08"))
 SCALPER_SL_MULT_VOL_SPIKE = 1.0
 SCALPER_SL_MULT_OVERSOLD  = 1.0
 SCALPER_SL_MULT_HIGH_CONF = 1.8
@@ -152,13 +152,13 @@ BTC_REBOUND_PCT          = float(os.getenv("BTC_REBOUND_PCT",          "0.01"))
 BTC_REBOUND_CONFIRM_PCTS = float(os.getenv("BTC_REBOUND_CONFIRM_PCTS", "0.005"))
 WATCHLIST_REBOUND_MIN_INTERVAL = int(os.getenv("WATCHLIST_REBOUND_MIN_INTERVAL", "300"))
 
-# ── Moonshot (upgraded) ──────────────────────────────────────
+# ── Moonshot (optimized for profit capture) ──────────────────
 ALT_MAX_TRADES      = 2   # maximum moonshot + reversal combined
 MOONSHOT_BUDGET_PCT   = float(os.getenv("MOONSHOT_BUDGET_PCT",   "0.048"))   # per‑trade max % of allocated capital
-MOONSHOT_TP_INITIAL           = 0.15
+MOONSHOT_TP_INITIAL           = float(os.getenv("MOONSHOT_TP_INITIAL", "0.10"))
 MOONSHOT_SL           = float(os.getenv("MOONSHOT_SL",           "0.08"))           # fallback
-MOONSHOT_SL_ATR_MULT  = float(os.getenv("MOONSHOT_SL_ATR_MULT",  "2.5"))           # ATR multiplier for SL
-MOONSHOT_TRAIL_PCT    = float(os.getenv("MOONSHOT_TRAIL_PCT",     "0.08"))
+MOONSHOT_SL_ATR_MULT  = float(os.getenv("MOONSHOT_SL_ATR_MULT",  "2.0"))           # ATR multiplier for SL
+MOONSHOT_TRAIL_PCT    = float(os.getenv("MOONSHOT_TRAIL_PCT",     "0.05"))
 MOONSHOT_MAX_VOL_RATIO = float(os.getenv("MOONSHOT_MAX_VOL_RATIO", "100000"))
 MOONSHOT_MIN_VOL      = int(os.getenv("MOONSHOT_MIN_VOL", "50000"))
 MOONSHOT_MIN_SCORE    = 30
@@ -179,18 +179,18 @@ VOL_ZSCORE_MIN       = float(os.getenv("VOL_ZSCORE_MIN",       "2.0"))
 VOL_RATIO_FLOOR      = float(os.getenv("VOL_RATIO_FLOOR",      "1.5"))
 MOONSHOT_LIQUIDITY_RATIO = float(os.getenv("MOONSHOT_LIQUIDITY_RATIO", "200"))
 MOONSHOT_VOL_DIVISOR   = float(os.getenv("MOONSHOT_VOL_DIVISOR", "500000"))
-MOONSHOT_TIMEOUT_FLAT_MINS   = 45
-MOONSHOT_TIMEOUT_MARGINAL_MINS= 60
-MOONSHOT_TIMEOUT_MAX_MINS    = 120
+MOONSHOT_TIMEOUT_FLAT_MINS   = int(os.getenv("MOONSHOT_TIMEOUT_FLAT_MINS",    "35"))
+MOONSHOT_TIMEOUT_MARGINAL_MINS= int(os.getenv("MOONSHOT_TIMEOUT_MARGINAL_MINS","50"))
+MOONSHOT_TIMEOUT_MAX_MINS    = int(os.getenv("MOONSHOT_TIMEOUT_MAX_MINS",     "120"))
 MOONSHOT_VOL_CHECK_MINS      = 15
 MOONSHOT_VOL_COLLAPSE_RATIO  = 0.5
-MOONSHOT_PARTIAL_TP_PCT      = 0.10
-MOONSHOT_PARTIAL_TP_RATIO    = float(os.getenv("MOONSHOT_PARTIAL_TP_RATIO", "0.30"))   # reduced
+MOONSHOT_PARTIAL_TP_PCT      = float(os.getenv("MOONSHOT_PARTIAL_TP_PCT",   "0.06"))
+MOONSHOT_PARTIAL_TP_RATIO    = float(os.getenv("MOONSHOT_PARTIAL_TP_RATIO", "0.40"))
 MOONSHOT_BREAKEVEN_ACT       = float(os.getenv("MOONSHOT_BREAKEVEN_ACT", "0.02"))
-MOONSHOT_MICRO_TP_PCT        = float(os.getenv("MOONSHOT_MICRO_TP_PCT",   "0.02"))
+MOONSHOT_MICRO_TP_PCT        = float(os.getenv("MOONSHOT_MICRO_TP_PCT",   "0.025"))
 MOONSHOT_MICRO_TP_RATIO      = float(os.getenv("MOONSHOT_MICRO_TP_RATIO", "0.30"))
-MOONSHOT_PROTECT_ACT     = 0.05
-MOONSHOT_PROTECT_GIVEBACK = 0.015
+MOONSHOT_PROTECT_ACT     = float(os.getenv("MOONSHOT_PROTECT_ACT",     "0.04"))
+MOONSHOT_PROTECT_GIVEBACK = float(os.getenv("MOONSHOT_PROTECT_GIVEBACK","0.012"))
 
 # ── Pre-Breakout (unchanged) ──────────────────────────────────
 PRE_BREAKOUT_TP             = float(os.getenv("PRE_BREAKOUT_TP",             "0.08"))
@@ -209,18 +209,31 @@ DEAD_COIN_SPREAD_MAX      = float(os.getenv("DEAD_COIN_SPREAD_MAX",   "0.003"))
 DEAD_COIN_CONSECUTIVE     = int(os.getenv("DEAD_COIN_CONSECUTIVE",    "3"))
 DEAD_COIN_BLACKLIST_HOURS = int(os.getenv("DEAD_COIN_BLACKLIST_HOURS","24"))
 SCALPER_TRAIL_ATR_ACTIVATE = float(os.getenv("SCALPER_TRAIL_ATR_ACTIVATE", "2.0"))
-SCALPER_TRAIL_ATR_TIER1    = float(os.getenv("SCALPER_TRAIL_ATR_TIER1",    "1.0"))
-SCALPER_TRAIL_ATR_TIER2    = float(os.getenv("SCALPER_TRAIL_ATR_TIER2",    "2.0"))
+SCALPER_TRAIL_ATR_TIER1    = float(os.getenv("SCALPER_TRAIL_ATR_TIER1",    "0.8"))
+SCALPER_TRAIL_ATR_TIER2    = float(os.getenv("SCALPER_TRAIL_ATR_TIER2",    "1.5"))
 SCALPER_TRAIL_TIER2_THRESH = float(os.getenv("SCALPER_TRAIL_TIER2_THRESH", "4.0"))
-MOONSHOT_TRAIL_ATR_WIDE    = float(os.getenv("MOONSHOT_TRAIL_ATR_WIDE",    "0.12"))
-MOONSHOT_TRAIL_WIDE_THRESH = float(os.getenv("MOONSHOT_TRAIL_WIDE_THRESH", "4.0"))
+MOONSHOT_TRAIL_ATR_WIDE    = float(os.getenv("MOONSHOT_TRAIL_ATR_WIDE",    "0.08"))
+MOONSHOT_TRAIL_WIDE_THRESH = float(os.getenv("MOONSHOT_TRAIL_WIDE_THRESH", "3.0"))
+
+# ── Progressive trail (tightens as profit grows, adjusts for volatility) ──
+# Moonshot/Reversal/PreBreakout (Floor & Chase)
+PROG_TRAIL_CEILING     = float(os.getenv("PROG_TRAIL_CEILING",      "0.050"))   # trail % at low profit
+PROG_TRAIL_FLOOR       = float(os.getenv("PROG_TRAIL_FLOOR",        "0.018"))   # minimum trail % for big runners
+PROG_TRAIL_TIGHTEN     = float(os.getenv("PROG_TRAIL_TIGHTEN",      "0.25"))    # tighten rate per unit of profit
+PROG_TRAIL_VOL_ANCHOR  = float(os.getenv("PROG_TRAIL_VOL_ANCHOR",   "0.020"))   # ATR reference for vol adjustment
+PROG_TRAIL_VOL_MIN     = float(os.getenv("PROG_TRAIL_VOL_MIN",      "0.70"))    # min vol multiplier (low-vol coins)
+PROG_TRAIL_VOL_MAX     = float(os.getenv("PROG_TRAIL_VOL_MAX",      "1.40"))    # max vol multiplier (high-vol coins)
+# Scalper progressive trail
+SCALPER_PROG_CEILING   = float(os.getenv("SCALPER_PROG_CEILING",    "0.035"))   # trail % at low profit
+SCALPER_PROG_FLOOR     = float(os.getenv("SCALPER_PROG_FLOOR",      "0.010"))   # minimum trail % for runners
+SCALPER_PROG_TIGHTEN   = float(os.getenv("SCALPER_PROG_TIGHTEN",    "0.40"))    # tighten rate (faster for scalpers)
 SCALPER_PARTIAL_TP_SCORE     = int(os.getenv("SCALPER_PARTIAL_TP_SCORE",     "79"))
 SCALPER_PARTIAL_TP_RATIO     = float(os.getenv("SCALPER_PARTIAL_TP_RATIO",   "0.30"))
 SCALPER_PARTIAL_TP_TRAIL_MULT= float(os.getenv("SCALPER_PARTIAL_TP_TRAIL_MULT","2.0"))
 KELTNER_ATR_MULT   = float(os.getenv("KELTNER_ATR_MULT",   "3.0"))
 KELTNER_SCORE_BONUS= float(os.getenv("KELTNER_SCORE_BONUS","10"))
-REVERSAL_TP              = 0.040
-REVERSAL_SL              = 0.020
+REVERSAL_TP              = float(os.getenv("REVERSAL_TP",              "0.035"))
+REVERSAL_SL              = float(os.getenv("REVERSAL_SL",              "0.020"))
 REVERSAL_MIN_VOL         = 100_000
 REVERSAL_MAX_RSI         = 32
 REVERSAL_MIN_DROP        = 3.0
@@ -229,9 +242,9 @@ REVERSAL_BOUNCE_RECOVERY = 0.30
 REVERSAL_VOL_RECOVERY    = 1.20
 REVERSAL_CAP_SL_BUFFER   = 0.005
 REVERSAL_SL_MAX          = 0.050
-REVERSAL_PARTIAL_TP_PCT  = 0.025
-REVERSAL_PARTIAL_TP_RATIO= 0.50
-REVERSAL_WEAK_BOUNCE_MINS = int(os.getenv("REVERSAL_WEAK_BOUNCE_MINS", "24"))
+REVERSAL_PARTIAL_TP_PCT  = float(os.getenv("REVERSAL_PARTIAL_TP_PCT",  "0.020"))
+REVERSAL_PARTIAL_TP_RATIO= float(os.getenv("REVERSAL_PARTIAL_TP_RATIO","0.60"))
+REVERSAL_WEAK_BOUNCE_MINS = int(os.getenv("REVERSAL_WEAK_BOUNCE_MINS", "20"))
 REVERSAL_WEAK_BOUNCE_PCT  = float(os.getenv("REVERSAL_WEAK_BOUNCE_PCT", "0.65"))
 
 TRINITY_SYMBOLS       = ["SOLUSDT", "ETHUSDT", "BTCUSDT"]
@@ -239,13 +252,13 @@ TRINITY_BUDGET_PCT    = float(os.getenv("TRINITY_BUDGET_PCT",   "0.05"))   # per
 TRINITY_DROP_PCT      = float(os.getenv("TRINITY_DROP_PCT",     "0.02"))
 TRINITY_MIN_RSI       = float(os.getenv("TRINITY_MIN_RSI",      "25"))
 TRINITY_MAX_RSI       = float(os.getenv("TRINITY_MAX_RSI",      "50"))
-TRINITY_TP_ATR_MULT   = float(os.getenv("TRINITY_TP_ATR_MULT",  "1.8"))
+TRINITY_TP_ATR_MULT   = float(os.getenv("TRINITY_TP_ATR_MULT",  "1.5"))
 TRINITY_SL_ATR_MULT   = float(os.getenv("TRINITY_SL_ATR_MULT",  "1.0"))
 TRINITY_SL_MAX        = float(os.getenv("TRINITY_SL_MAX",       "0.025"))
 TRINITY_TP_MIN        = float(os.getenv("TRINITY_TP_MIN",       "0.008"))
 TRINITY_MAX_HOURS     = int(os.getenv("TRINITY_MAX_HOURS",      "6"))
 TRINITY_VOL_BURST     = float(os.getenv("TRINITY_VOL_BURST",    "1.2"))
-TRINITY_BREAKEVEN_ACT = float(os.getenv("TRINITY_BREAKEVEN_ACT","0.01"))
+TRINITY_BREAKEVEN_ACT = float(os.getenv("TRINITY_BREAKEVEN_ACT","0.008"))
 TRINITY_DROP_LOOKBACK_CANDLES = [16, 32]
 MIN_PRICE         = 0.001
 SCAN_INTERVAL     = 60
@@ -256,12 +269,12 @@ MATURITY_LOOKBACK       = int(os.getenv("MATURITY_LOOKBACK",       "20"))
 MATURITY_PENALTY_MULT   = float(os.getenv("MATURITY_PENALTY_MULT", "0.5"))
 MATURITY_THRESHOLD      = float(os.getenv("MATURITY_THRESHOLD",    "0.75"))
 MATURITY_MOONSHOT_THRESHOLD = float(os.getenv("MATURITY_MOONSHOT_THRESHOLD", "0.85"))
-MOMENTUM_DECAY_CANDLES  = int(os.getenv("MOMENTUM_DECAY_CANDLES",   "4"))
+MOMENTUM_DECAY_CANDLES  = int(os.getenv("MOMENTUM_DECAY_CANDLES",   "6"))
 MOMENTUM_DECAY_PRICE_RANGE = float(os.getenv("MOMENTUM_DECAY_PRICE_RANGE", "0.003"))
 MOMENTUM_DECAY_MIN_HELD = float(os.getenv("MOMENTUM_DECAY_MIN_HELD", "10"))
-ADAPTIVE_WINDOW         = int(os.getenv("ADAPTIVE_WINDOW",         "12"))
-ADAPTIVE_TIGHTEN_STEP   = float(os.getenv("ADAPTIVE_TIGHTEN_STEP", "5"))
-ADAPTIVE_RELAX_STEP     = float(os.getenv("ADAPTIVE_RELAX_STEP",   "3"))
+ADAPTIVE_WINDOW         = int(os.getenv("ADAPTIVE_WINDOW",         "16"))
+ADAPTIVE_TIGHTEN_STEP   = float(os.getenv("ADAPTIVE_TIGHTEN_STEP", "3"))
+ADAPTIVE_RELAX_STEP     = float(os.getenv("ADAPTIVE_RELAX_STEP",   "2"))
 ADAPTIVE_MAX_OFFSET     = float(os.getenv("ADAPTIVE_MAX_OFFSET",   "20"))
 ADAPTIVE_MIN_OFFSET     = float(os.getenv("ADAPTIVE_MIN_OFFSET",   "-5"))
 PERF_REBALANCE_TRADES   = int(os.getenv("PERF_REBALANCE_TRADES",   "20"))
@@ -271,10 +284,10 @@ PERF_MOONSHOT_FLOOR     = float(os.getenv("PERF_MOONSHOT_FLOOR",   "0.02"))
 PERF_MOONSHOT_CEIL      = float(os.getenv("PERF_MOONSHOT_CEIL",    "0.14"))
 PERF_SHIFT_STEP         = float(os.getenv("PERF_SHIFT_STEP",       "0.028"))
 FEE_RATE_TAKER          = float(os.getenv("FEE_RATE_TAKER",        "0.001"))
-FEE_SLIPPAGE_BUFFER     = float(os.getenv("FEE_SLIPPAGE_BUFFER",   "0.002"))
+FEE_SLIPPAGE_BUFFER     = float(os.getenv("FEE_SLIPPAGE_BUFFER",   "0.0015"))
 FEE_MIN_PROFIT          = float(os.getenv("FEE_MIN_PROFIT",        "0.010"))
 GIVEBACK_TARGET_LOW     = float(os.getenv("GIVEBACK_TARGET_LOW",    "0.25"))
-GIVEBACK_TARGET_HIGH    = float(os.getenv("GIVEBACK_TARGET_HIGH",   "0.40"))
+GIVEBACK_TARGET_HIGH    = float(os.getenv("GIVEBACK_TARGET_HIGH",   "0.30"))
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 HTTP_RETRIES           = 3
@@ -293,11 +306,11 @@ DEPTH_PCT_RANGE     = float(os.getenv("DEPTH_PCT_RANGE",   "0.02"))
 DEPTH_BID_RATIO     = float(os.getenv("DEPTH_BID_RATIO",   "3.0"))
 REVERSAL_FLAT_MINS     = int(os.getenv("REVERSAL_FLAT_MINS",     "45"))
 REVERSAL_FLAT_PROGRESS = float(os.getenv("REVERSAL_FLAT_PROGRESS","0.40"))
-KELLY_MULT_MARGINAL  = float(os.getenv("KELLY_MULT_MARGINAL",  "0.60"))
+KELLY_MULT_MARGINAL  = float(os.getenv("KELLY_MULT_MARGINAL",  "0.50"))
 KELLY_MULT_SOLID     = float(os.getenv("KELLY_MULT_SOLID",     "0.80"))
 KELLY_MULT_STANDARD  = float(os.getenv("KELLY_MULT_STANDARD",  "1.00"))
-KELLY_MULT_HIGH_CONF = float(os.getenv("KELLY_MULT_HIGH_CONF", "1.38"))
-MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
+KELLY_MULT_HIGH_CONF = float(os.getenv("KELLY_MULT_HIGH_CONF", "1.50"))
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
 STREAK_AUTO_RESET_MINS = int(os.getenv("STREAK_AUTO_RESET_MINS", "60"))
 WIN_RATE_CB_WINDOW     = int(os.getenv("WIN_RATE_CB_WINDOW",     "10"))
 WIN_RATE_CB_THRESHOLD  = float(os.getenv("WIN_RATE_CB_THRESHOLD","0.30"))
@@ -401,6 +414,44 @@ _ws_lock           = threading.Lock()
 def calculate_true_breakeven(entry_price: float) -> float:
     round_trip_cost = (FEE_RATE_TAKER * 2) + FEE_SLIPPAGE_BUFFER
     return entry_price * (1 + round_trip_cost)
+
+def calc_progressive_trail(peak_profit: float, atr_pct: float,
+                           ceiling: float = None, floor: float = None,
+                           tighten: float = None, strategy: str = "MOONSHOT") -> float:
+    """
+    Compute a trail % that tightens smoothly as profit grows, and widens for volatile coins.
+
+    At low profit  → wide trail (let it breathe)
+    At high profit → tight trail (lock gains)
+    High ATR       → widen slightly (avoid shakeouts)
+    Low ATR        → tighten slightly (grind = tighter exit)
+
+    Returns trail as a fraction (e.g. 0.03 = 3%).
+    """
+    if strategy == "SCALPER":
+        c = ceiling or SCALPER_PROG_CEILING
+        f = floor   or SCALPER_PROG_FLOOR
+        t = tighten or SCALPER_PROG_TIGHTEN
+    else:
+        c = ceiling or PROG_TRAIL_CEILING
+        f = floor   or PROG_TRAIL_FLOOR
+        t = tighten or PROG_TRAIL_TIGHTEN
+
+    # Base trail: linear tightening from ceiling toward floor as profit grows
+    base = max(f, c - peak_profit * t)
+
+    # Volatility adjustment: high-ATR coins get wider trails
+    vol_ratio = atr_pct / PROG_TRAIL_VOL_ANCHOR if PROG_TRAIL_VOL_ANCHOR > 0 else 1.0
+    vol_adj   = max(PROG_TRAIL_VOL_MIN, min(PROG_TRAIL_VOL_MAX, vol_ratio))
+
+    result = base * vol_adj
+    # Final clamp
+    if strategy == "SCALPER":
+        result = max(SCALPER_TRAIL_MIN, min(SCALPER_TRAIL_MAX, result))
+    else:
+        result = max(f * 0.8, min(c * 1.2, result))
+
+    return round(result, 5)
 
 def ws_price(symbol: str) -> float | None:
     with _ws_lock:
@@ -2841,18 +2892,18 @@ def activate_floor_and_chase(trade, exit_price):
     trade["trailing_active"] = True
     trade["last_tp_price"] = exit_price
 
-    # Compute initial trailing stop based on current HWM and ATR
+    # Compute initial trailing stop using progressive trail
     atr_pct = trade.get("atr_pct", 0.02)
     hwm = trade["highest_price"]
     peak_profit = (hwm / trade["entry_price"] - 1)
-    if peak_profit >= atr_pct * MOONSHOT_TRAIL_WIDE_THRESH:
-        trail_pct = MOONSHOT_TRAIL_ATR_WIDE
-    else:
-        trail_pct = MOONSHOT_TRAIL_PCT
+    label = trade.get("label", "MOONSHOT")
+    trail_pct = calc_progressive_trail(peak_profit, atr_pct, strategy=label)
     trail_stop = hwm * (1 - trail_pct)
     # Ensure trail stop is not below hard floor
     trade["trailing_stop_price"] = max(trail_stop, hard_floor)
-    log.info(f"Floor & Chase activated: floor=${hard_floor:.6f}, trail=${trade['trailing_stop_price']:.6f}")
+    log.info(f"🛡️ Floor & Chase activated: floor=${hard_floor:.6f}, "
+             f"trail=${trade['trailing_stop_price']:.6f} "
+             f"(prog {trail_pct*100:.1f}% at +{peak_profit*100:.1f}% profit)")
 
 def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
     symbol      = trade["symbol"]
@@ -3011,23 +3062,16 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
                 return True, "TAKE_PROFIT"
         atr_pct   = trade.get("atr_pct") or trade.get("trail_pct") or SCALPER_TRAIL_PCT
         peak_profit = (trade["highest_price"] / trade["entry_price"] - 1)
-        if peak_profit >= atr_pct * SCALPER_TRAIL_TIER2_THRESH:
-            active_trail = atr_pct * SCALPER_TRAIL_ATR_TIER2
-            tier_label   = f"tier2 {active_trail*100:.1f}%"
-        elif peak_profit >= atr_pct * SCALPER_TRAIL_ATR_ACTIVATE:
-            active_trail = atr_pct * SCALPER_TRAIL_ATR_TIER1
-            tier_label   = f"tier1 {active_trail*100:.1f}%"
-        else:
-            active_trail = None
-            tier_label   = ""
-        if trade.get("partial_tp_hit"):
-            active_trail = atr_pct * SCALPER_PARTIAL_TP_TRAIL_MULT
-            tier_label   = f"post-partial {active_trail*100:.1f}%"
-        if active_trail is not None:
-            active_trail = min(SCALPER_TRAIL_MAX,
-                               max(SCALPER_TRAIL_MIN, active_trail))
+
+        # Progressive trail: activate once profit exceeds activation threshold
+        trail_activated = (peak_profit >= atr_pct * SCALPER_TRAIL_ATR_ACTIVATE
+                           or trade.get("partial_tp_hit"))
+        if trail_activated:
+            active_trail = calc_progressive_trail(peak_profit, atr_pct, strategy="SCALPER")
+            trail_label  = f"prog {active_trail*100:.1f}%"
             if price <= trade["highest_price"] * (1 - active_trail):
-                log.info(f"📉 [{label}] ATR trail stop ({tier_label}): {symbol} | {pct:+.2f}%")
+                log.info(f"📉 [{label}] Progressive trail ({trail_label}): {symbol} | {pct:+.2f}% "
+                         f"| peak +{peak_profit*100:.1f}%")
                 if not PAPER_TRADE and tp_order_id:
                     cancel_order(symbol, tp_order_id, label)
                 return True, "TRAILING_STOP"
@@ -3060,39 +3104,43 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             trade["highest_price"] = price
             atr_pct = trade.get("atr_pct", 0.02)
             peak_profit = (trade["highest_price"] / trade["entry_price"] - 1)
-            if peak_profit >= atr_pct * MOONSHOT_TRAIL_WIDE_THRESH:
-                trail_pct = MOONSHOT_TRAIL_ATR_WIDE
-            else:
-                trail_pct = MOONSHOT_TRAIL_PCT
+            # Progressive trail: tightens as profit grows, adjusts for volatility
+            trail_pct = calc_progressive_trail(peak_profit, atr_pct, strategy=label)
             new_trail = trade["highest_price"] * (1 - trail_pct)
             # Trail can only go up
             if new_trail > trade.get("trailing_stop_price", 0):
                 trade["trailing_stop_price"] = new_trail
-                log.debug(f"Trailing stop updated to ${new_trail:.6f} for {symbol}")
+                log.debug(f"Progressive trail updated: ${new_trail:.6f} "
+                          f"(trail {trail_pct*100:.1f}% at +{peak_profit*100:.1f}% profit) "
+                          f"for {symbol}")
 
         hard_floor = trade.get("hard_floor_price")
         trail_stop = trade.get("trailing_stop_price")
         if hard_floor is not None and trail_stop is not None:
             active_trigger = max(trail_stop, hard_floor)
+            triggered_by = "floor" if hard_floor >= trail_stop else "trail"
             if price <= active_trigger:
-                log.info(f"Floor & Chase exit: {symbol} | price {price:.6f} ≤ trigger {active_trigger:.6f} | P&L {pct:.2f}%")
+                curr_peak = (trade["highest_price"] / trade["entry_price"] - 1)
+                curr_trail_pct = calc_progressive_trail(
+                    curr_peak, trade.get("atr_pct", 0.02), strategy=label)
+                log.info(f"🛡️ Floor & Chase exit: {symbol} | price {price:.6f} ≤ "
+                         f"{triggered_by} {active_trigger:.6f} | "
+                         f"trail {curr_trail_pct*100:.1f}% at peak +{curr_peak*100:.1f}% | "
+                         f"P&L {pct:.2f}%")
                 if not PAPER_TRADE and trade.get("tp_order_id"):
                     cancel_order(symbol, trade["tp_order_id"], label)
                     trade["tp_order_id"] = None
                 return True, "FLOOR_OR_TRAIL"
 
-    # ── ORIGINAL TRAILING LOGIC FOR MOONSHOT (if no floor & chase active) ──
+    # ── FALLBACK TRAILING FOR MOONSHOT (if no floor & chase active) ──
     elif label == "MOONSHOT" and trade.get("partial_tp_hit") and not trade.get("trailing_active"):
-        # Legacy trailing stop (fallback)
         atr_pct     = trade.get("atr_pct") or MOONSHOT_SL * 0.5
         peak_profit = (trade["highest_price"] / trade["entry_price"] - 1)
-        trail_pct   = (MOONSHOT_TRAIL_ATR_WIDE
-                       if peak_profit >= atr_pct * MOONSHOT_TRAIL_WIDE_THRESH
-                       else MOONSHOT_TRAIL_PCT)
-        trail_sl   = trade["highest_price"] * (1 - trail_pct)
+        trail_pct   = calc_progressive_trail(peak_profit, atr_pct, strategy="MOONSHOT")
+        trail_sl    = trade["highest_price"] * (1 - trail_pct)
         if price <= trail_sl:
-            log.info(f"📉 [{label}] Trail stop ({trail_pct*100:.0f}%): {symbol} | {pct:+.2f}% | "
-                     f"high {((trade['highest_price']/trade['entry_price'])-1)*100:.1f}%")
+            log.info(f"📉 [{label}] Progressive trail ({trail_pct*100:.1f}%): {symbol} | {pct:+.2f}% | "
+                     f"peak +{peak_profit*100:.1f}%")
             return True, "TRAILING_STOP"
 
     else:
