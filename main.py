@@ -12,6 +12,7 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
   • Emergency market liquidation with up to 5 retries
   • Alert de‑duplication – prevents spam for the same symbol within 10 minutes
   • “Mission Over” threshold – switches to market sell if trade is already partially filled
+  • Dust closure now sends a Telegram alert (so you never miss a final exit)
   • Capital allocation per strategy (Scalper 25%, Moonshot/Reversal 50%, Trinity 25%)
   • Maker orders (post-only limit) for both entry and TP to reduce fees
   • ATR-based moonshot stop-loss
@@ -3199,6 +3200,14 @@ def close_position(trade, reason) -> bool:
                 "fills_used":   False,
                 "note":         f"Position too small (< ${DUST_THRESHOLD}) – marked as closed",
             })
+            # Send a Telegram notification for dust closure
+            telegram(
+                f"🧹 <b>Dust Position — {label}</b>\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"Pair:    <b>{symbol}</b>\n"
+                f"Value:   ${remaining_notional:.2f} (< ${DUST_THRESHOLD})\n"
+                f"Closed automatically."
+            )
             return True
     # --- End dust handling ---
 
@@ -3313,6 +3322,14 @@ def close_position(trade, reason) -> bool:
                     return False
                 else:
                     log.info(f"🧹 [{label}] Position {symbol} left as dust (${final_notional:.2f}) – ignoring")
+                    # Send a dust notification
+                    telegram(
+                        f"🧹 <b>Dust Position — {label}</b>\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"Pair:    <b>{symbol}</b>\n"
+                        f"Value:   ${final_notional:.2f} (< ${DUST_THRESHOLD})\n"
+                        f"Closed automatically."
+                    )
                     return True
             else:
                 # Fallback to old check
@@ -3443,6 +3460,7 @@ def close_position(trade, reason) -> bool:
         "MICRO_HWM":     ("🛡️","Micro‑Cap HWM"),
         "DYN_HWM":       ("🛡️","Dynamic HWM"),
         "MAJOR_PARTIAL_TP": ("🎯","Major Partial Fill"),
+        "DUST":          ("🧹","Dust Position"),
     }
     emoji, reason_label = icons.get(reason, ("✅", reason))
     fee_line   = f"Fees:    ${fee_usdt:.4f}\n" if fee_usdt > 0 else ""
