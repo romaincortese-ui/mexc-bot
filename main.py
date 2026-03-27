@@ -2718,7 +2718,8 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         "breakeven_act":  (SCALPER_BREAKEVEN_ACT if (
                                label == "SCALPER" and
                                opp.get("score", 0) >= SCALPER_BREAKEVEN_SCORE
-                           ) else MOONSHOT_BREAKEVEN_ACT if label == "MOONSHOT"
+                           ) else 0.020 if label == "SCALPER"  # wider activation for lower-confidence scalpers
+                           else MOONSHOT_BREAKEVEN_ACT if label == "MOONSHOT"
                            else TRINITY_BREAKEVEN_ACT if label == "TRINITY"
                            else None),
         "breakeven_done": False,
@@ -3107,8 +3108,14 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             log.info(f"😴 [{label}] Flat timeout: {symbol} | {pct:+.2f}% after {held_min:.0f}min")
             return True, "TIMEOUT"
         if not _risk_free and pct < 5.0 and held_min >= MOONSHOT_TIMEOUT_MARGINAL_MINS:
-            log.info(f"⏰ [{label}] Marginal timeout: {symbol} | {pct:+.2f}% after {held_min:.0f}min")
-            return True, "TIMEOUT"
+            # Only exit if progress toward TP is truly marginal (< 35% of target)
+            tp_target_pct = trade.get("tp_pct", MOONSHOT_TP_INITIAL) * 100
+            marginal_threshold = tp_target_pct * 0.35
+            if pct < marginal_threshold:
+                log.info(f"⏰ [{label}] Marginal timeout: {symbol} | {pct:+.2f}% "
+                         f"(< {marginal_threshold:.1f}% = 35% of {tp_target_pct:.0f}% target) "
+                         f"after {held_min:.0f}min")
+                return True, "TIMEOUT"
         if not _risk_free and held_min >= MOMENTUM_DECAY_MIN_HELD and pct < 5.0:
             if detect_momentum_decay(symbol):
                 log.info(f"📉 [{label}] Momentum decay: {symbol} | {pct:+.2f}%")
@@ -3239,8 +3246,8 @@ def execute_partial_tp(trade, micro: bool = False) -> bool:
     if label in ("MOONSHOT", "REVERSAL", "PRE_BREAKOUT"):
         # Activate Floor & Chase using the actual exit price
         activate_floor_and_chase(trade, actual_exit)
-        # Disable the old SL price to avoid interference
-        trade["sl_price"] = 0.0
+        # Set SL to entry as safety backstop (Floor & Chase handles the real exit)
+        trade["sl_price"] = trade["entry_price"]
     else:
         # For SCALPER and TRINITY, just move SL to entry
         trade["sl_price"] = trade["entry_price"]
@@ -3274,11 +3281,16 @@ def execute_partial_tp(trade, micro: bool = False) -> bool:
         f"P&L:       <b>{partial_pct:+.2f}%  (${partial_pnl:+.2f})</b>\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Remaining: {remaining_qty} still open\n"
-        f"SL moved:  entry ${trade['entry_price']:.6f} (risk-free 🔒)\n"
+        + (f"Floor:     ${trade['hard_floor_price']:.6f} (profit locked 🔒)\n"
+           f"Trail:     ${trade['trailing_stop_price']:.6f} (dynamic)\n"
+           if trade.get("trailing_active") and trade.get("hard_floor_price")
+           else f"SL moved:  entry ${trade['entry_price']:.6f} (risk-free 🔒)\n")
         + (f"Next:      partial TP at +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}%"
            if micro and label == "MOONSHOT" else
            f"Trail:     {MOONSHOT_TRAIL_PCT*100:.0f}% below highest price (uncapped)"
-           if label == "MOONSHOT" else
+           if label == "MOONSHOT" and not trade.get("trailing_active") else
+           f"Exit:      Floor & Chase active (higher of floor/trail triggers exit)"
+           if trade.get("trailing_active") else
            f"Target:    ${trade['tp_price']:.6f}  (+{trade['tp_pct']*100:.0f}%)")
     )
     return True
@@ -3302,6 +3314,9 @@ def close_position(trade, reason) -> bool:
     if current_price is not None:
         remaining_notional = trade["qty"] * current_price
         if remaining_notional < DUST_THRESHOLD:
+            dust_cost = trade.get("budget_used", 0)
+            dust_pnl  = round(remaining_notional - dust_cost, 4) if dust_cost > 0 else 0.0
+            dust_pct  = round(dust_pnl / dust_cost * 100, 4) if dust_cost > 0 else 0.0
             log.info(f"🧹 [{label}] Dust position: {symbol} qty={trade['qty']:.6f} value=${remaining_notional:.2f} (< ${DUST_THRESHOLD}) — marking as closed")
             trade_history.append({
                 **{k: v for k, v in trade.items() if not k.startswith("_")},
@@ -3310,10 +3325,10 @@ def close_position(trade, reason) -> bool:
                 "exit_reason":  "DUST",
                 "closed_at":    datetime.now(timezone.utc).isoformat(),
                 "fee_usdt":     0.0,
-                "cost_usdt":    trade.get("budget_used", 0),
-                "revenue_usdt": 0.0,
-                "pnl_pct":      -100.0,
-                "pnl_usdt":     -trade.get("budget_used", 0),
+                "cost_usdt":    dust_cost,
+                "revenue_usdt": round(remaining_notional, 4),
+                "pnl_pct":      dust_pct,
+                "pnl_usdt":     dust_pnl,
                 "fills_used":   False,
                 "note":         f"Position too small (< ${DUST_THRESHOLD}) – marked as closed",
             })
@@ -3605,7 +3620,8 @@ def close_position(trade, reason) -> bool:
     full_trades = [t for t in trade_history if not t.get("is_partial")]
     wins        = [t for t in full_trades if t["pnl_pct"] > 0]
     win_rate    = len(wins) / len(full_trades) * 100 if full_trades else 0
-    total_pnl   = sum(t["pnl_usdt"] for t in trade_history)
+    total_pnl   = sum(t["pnl_usdt"] for t in trade_history)  # includes partials (real money)
+    partial_count = sum(1 for t in trade_history if t.get("is_partial"))
     mode      = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
     icons     = {
         "TAKE_PROFIT":   ("🎯","Take Profit Hit"),
@@ -3641,7 +3657,9 @@ def close_position(trade, reason) -> bool:
         f"{peak_line}"
         f"{fee_line}"
         f"━━━━━━━━━━━━━━━\n"
-        f"Session: {len(full_trades)} trades | Win: {win_rate:.0f}% | P&L: ${total_pnl:+.2f}"
+        f"Session: {len(full_trades)} trades"
+        + (f" +{partial_count} partials" if partial_count else "")
+        + f" | Win: {win_rate:.0f}% | P&L: ${total_pnl:+.2f}"
     )
     log.info(f"📈 Closed {symbol} [{reason}] {pnl_pct:+.2f}% | Win:{win_rate:.0f}% P&L:${total_pnl:+.2f}")
     save_state()
@@ -3681,9 +3699,10 @@ def send_heartbeat(balance: float):
             scalper_lines.append("  Scanning...")
     alt_lines = []
     for t in alt_trades:
-        _, pct = _trade_price_pct(t)
+        px, pct = _trade_price_pct(t)
         if pct is not None:
-            alt_lines.append(f"  {t['label']}: <b>{t['symbol']}</b> {pct:+.2f}%")
+            fc_tag = " 🔒" if t.get("trailing_active") else ""
+            alt_lines.append(f"  {t['label']}: <b>{t['symbol']}</b> {pct:+.2f}%{fc_tag}")
         else:
             alt_lines.append(f"  {t['label']}: {t['symbol']}")
     if not alt_trades:
@@ -3691,10 +3710,18 @@ def send_heartbeat(balance: float):
             alt_lines.append(f"  Watching: {last_top_alt['symbol']} (score {last_top_alt['score']})")
         else:
             alt_lines.append("  Scanning...")
+    # Compute total value (free balance + open position values)
+    total_value = balance
+    for t in scalper_trades + alt_trades:
+        px, _ = _trade_price_pct(t)
+        if px is not None:
+            total_value += px * t["qty"]
+        else:
+            total_value += t.get("budget_used", 0)
     telegram(
         f"💓 <b>Heartbeat</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"Balance:  <b>${balance:.2f} USDT</b>\n"
+        f"Free USDT: <b>${balance:.2f}</b> | Total: <b>${total_value:.2f}</b>\n"
         f"Scalpers ({len(scalper_trades)}/{SCALPER_MAX_TRADES}):\n"
         + "\n".join(scalper_lines) + "\n"
         + f"Alt ({len(alt_trades)}/{ALT_MAX_TRADES}):\n"
@@ -3991,8 +4018,13 @@ def _cmd_status(balance: float):
     for t in alt_trades:
         _, pct = _trade_price_pct(t)
         if pct is not None:
+            if t.get("trailing_active") and t.get("hard_floor_price"):
+                sl_display = (f"Floor: ${t['hard_floor_price']:.6f} | "
+                              f"Trail: ${t['trailing_stop_price']:.6f}")
+            else:
+                sl_display = f"SL: ${t['sl_price']:.6f}"
             lines.append(f"{t['label']}: <b>{t['symbol']}</b> | {pct:+.2f}% | "
-                         f"TP: ${t['tp_price']:.6f} | SL: ${t['sl_price']:.6f}")
+                         f"TP: ${t['tp_price']:.6f} | {sl_display}")
         else:
             lines.append(f"{t['label']}: {t['symbol']} (unavailable)")
     if not alt_trades:
