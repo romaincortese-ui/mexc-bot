@@ -71,10 +71,10 @@ MIN_TRADE_FOR_PARTIAL_TP = float(os.getenv("MIN_TRADE_FOR_PARTIAL_TP", "15.0"))
 
 # ── Maker orders (post‑only) for both entry and TP ─────────────
 USE_MAKER_ORDERS = os.getenv("USE_MAKER_ORDERS", "True").lower() == "true"
-MAKER_ORDER_TIMEOUT_SEC = float(os.getenv("MAKER_ORDER_TIMEOUT_SEC", "1.5"))
+MAKER_ORDER_TIMEOUT_SEC = float(os.getenv("MAKER_ORDER_TIMEOUT_SEC", "2.5"))
 
 # Chase limit order settings (for exits)
-CHASE_LIMIT_TIMEOUT = float(os.getenv("CHASE_LIMIT_TIMEOUT", "1.5"))
+CHASE_LIMIT_TIMEOUT = float(os.getenv("CHASE_LIMIT_TIMEOUT", "2.5"))
 CHASE_LIMIT_RETRIES = int(os.getenv("CHASE_LIMIT_RETRIES", "3"))
 
 # ── Dust threshold – positions below this USD value are considered closed ──
@@ -118,11 +118,11 @@ SCALPER_MIN_VOL      = 500_000
 SCALPER_MIN_PRICE    = 0.01
 SCALPER_MIN_CHANGE   = 0.1
 SCALPER_THRESHOLD    = int(os.getenv("SCALPER_THRESHOLD", "37"))
-SCALPER_MAX_RSI      = 70
+SCALPER_MAX_RSI      = int(os.getenv("SCALPER_MAX_RSI",      "70"))
 WATCHLIST_MIN_SCORE  = max(5, SCALPER_THRESHOLD // 2)
 SCALPER_BREAKEVEN_SCORE = int(os.getenv("SCALPER_BREAKEVEN_SCORE", "50"))
 SCALPER_BREAKEVEN_ACT   = float(os.getenv("SCALPER_BREAKEVEN_ACT", "0.015"))
-SCALPER_MIN_1H_VOL      = 50_000
+SCALPER_MIN_1H_VOL      = int(os.getenv("SCALPER_MIN_1H_VOL",   "50000"))
 SCALPER_SYMBOL_COOLDOWN = int(os.getenv("SCALPER_SYMBOL_COOLDOWN", "1200"))
 SCALPER_DAILY_LOSS_PCT  = 0.05
 SCALPER_EMA50_PENALTY  = float(os.getenv("SCALPER_EMA50_PENALTY", "200"))
@@ -130,7 +130,7 @@ SCALPER_MAX_CORRELATION = float(os.getenv("SCALPER_MAX_CORRELATION", "0.70"))
 
 # ── Dynamic TP/SL multipliers ─────────────────────────────────
 SCALPER_TP_MULT_CROSSOVER = 2.5
-SCALPER_TP_MULT_VOL_SPIKE = 1.8
+SCALPER_TP_MULT_VOL_SPIKE = float(os.getenv("SCALPER_TP_MULT_VOL_SPIKE", "1.8"))
 SCALPER_TP_MULT_OVERSOLD  = 2.2
 SCALPER_TP_MULT_DEFAULT   = 2.0
 SCALPER_TP_CANDLE_MULT    = 4.0
@@ -139,7 +139,7 @@ SCALPER_TP_MAX            = float(os.getenv("SCALPER_TP_MAX",  "0.08"))
 SCALPER_SL_MULT_VOL_SPIKE = 1.0
 SCALPER_SL_MULT_OVERSOLD  = 1.0
 SCALPER_SL_MULT_HIGH_CONF = 1.8
-SCALPER_SL_MULT_DEFAULT   = 1.3
+SCALPER_SL_MULT_DEFAULT   = float(os.getenv("SCALPER_SL_MULT_DEFAULT", "1.3"))
 SCALPER_SL_NOISE_MULT     = 2.0
 SCALPER_SL_MAX            = 0.04
 SCALPER_SL_MIN            = 0.015
@@ -157,8 +157,8 @@ ALT_MAX_TRADES      = 2   # maximum moonshot + reversal combined
 MOONSHOT_BUDGET_PCT   = float(os.getenv("MOONSHOT_BUDGET_PCT",   "0.048"))   # per‑trade max % of allocated capital
 MOONSHOT_TP_INITIAL           = float(os.getenv("MOONSHOT_TP_INITIAL", "0.10"))
 MOONSHOT_SL           = float(os.getenv("MOONSHOT_SL",           "0.08"))           # fallback
-MOONSHOT_SL_ATR_MULT  = float(os.getenv("MOONSHOT_SL_ATR_MULT",  "2.0"))           # ATR multiplier for SL
-MOONSHOT_TRAIL_PCT    = float(os.getenv("MOONSHOT_TRAIL_PCT",     "0.05"))
+MOONSHOT_SL_ATR_MULT  = float(os.getenv("MOONSHOT_SL_ATR_MULT",  "2.3"))           # ATR multiplier for SL
+MOONSHOT_TRAIL_PCT    = float(os.getenv("MOONSHOT_TRAIL_PCT",     "0.06"))
 MOONSHOT_MAX_VOL_RATIO = float(os.getenv("MOONSHOT_MAX_VOL_RATIO", "100000"))
 MOONSHOT_MIN_VOL      = int(os.getenv("MOONSHOT_MIN_VOL", "50000"))
 MOONSHOT_MIN_SCORE    = 30
@@ -190,7 +190,7 @@ MOONSHOT_BREAKEVEN_ACT       = float(os.getenv("MOONSHOT_BREAKEVEN_ACT", "0.02")
 MOONSHOT_MICRO_TP_PCT        = float(os.getenv("MOONSHOT_MICRO_TP_PCT",   "0.025"))
 MOONSHOT_MICRO_TP_RATIO      = float(os.getenv("MOONSHOT_MICRO_TP_RATIO", "0.30"))
 MOONSHOT_PROTECT_ACT     = float(os.getenv("MOONSHOT_PROTECT_ACT",     "0.04"))
-MOONSHOT_PROTECT_GIVEBACK = float(os.getenv("MOONSHOT_PROTECT_GIVEBACK","0.012"))
+MOONSHOT_PROTECT_GIVEBACK = float(os.getenv("MOONSHOT_PROTECT_GIVEBACK","0.015"))  # floor for dynamic ATR giveback
 
 # ── Pre-Breakout (unchanged) ──────────────────────────────────
 PRE_BREAKOUT_TP             = float(os.getenv("PRE_BREAKOUT_TP",             "0.08"))
@@ -225,7 +225,7 @@ PROG_TRAIL_VOL_MIN     = float(os.getenv("PROG_TRAIL_VOL_MIN",      "0.70"))    
 PROG_TRAIL_VOL_MAX     = float(os.getenv("PROG_TRAIL_VOL_MAX",      "1.40"))    # max vol multiplier (high-vol coins)
 # Scalper progressive trail
 SCALPER_PROG_CEILING   = float(os.getenv("SCALPER_PROG_CEILING",    "0.035"))   # trail % at low profit
-SCALPER_PROG_FLOOR     = float(os.getenv("SCALPER_PROG_FLOOR",      "0.010"))   # minimum trail % for runners
+SCALPER_PROG_FLOOR     = float(os.getenv("SCALPER_PROG_FLOOR",      "0.012"))   # minimum trail % for runners
 SCALPER_PROG_TIGHTEN   = float(os.getenv("SCALPER_PROG_TIGHTEN",    "0.40"))    # tighten rate (faster for scalpers)
 SCALPER_PARTIAL_TP_SCORE     = int(os.getenv("SCALPER_PARTIAL_TP_SCORE",     "79"))
 SCALPER_PARTIAL_TP_RATIO     = float(os.getenv("SCALPER_PARTIAL_TP_RATIO",   "0.30"))
@@ -284,7 +284,7 @@ PERF_MOONSHOT_FLOOR     = float(os.getenv("PERF_MOONSHOT_FLOOR",   "0.02"))
 PERF_MOONSHOT_CEIL      = float(os.getenv("PERF_MOONSHOT_CEIL",    "0.14"))
 PERF_SHIFT_STEP         = float(os.getenv("PERF_SHIFT_STEP",       "0.028"))
 FEE_RATE_TAKER          = float(os.getenv("FEE_RATE_TAKER",        "0.001"))
-FEE_SLIPPAGE_BUFFER     = float(os.getenv("FEE_SLIPPAGE_BUFFER",   "0.0015"))
+FEE_SLIPPAGE_BUFFER     = float(os.getenv("FEE_SLIPPAGE_BUFFER",   "0.002"))
 FEE_MIN_PROFIT          = float(os.getenv("FEE_MIN_PROFIT",        "0.010"))
 GIVEBACK_TARGET_LOW     = float(os.getenv("GIVEBACK_TARGET_LOW",    "0.25"))
 GIVEBACK_TARGET_HIGH    = float(os.getenv("GIVEBACK_TARGET_HIGH",   "0.30"))
@@ -300,7 +300,7 @@ API_FAIL_SLEEP_BASE    = 30
 API_FAIL_SLEEP_MAX     = 300
 FILL_QTY_TOLERANCE     = 1.02
 SCALPER_MAX_SPREAD     = 0.004
-SCALPER_MIN_ATR_PCT    = 0.003
+SCALPER_MIN_ATR_PCT    = float(os.getenv("SCALPER_MIN_ATR_PCT",  "0.003"))
 DEPTH_BID_LEVELS    = int(os.getenv("DEPTH_BID_LEVELS",    "20"))
 DEPTH_PCT_RANGE     = float(os.getenv("DEPTH_PCT_RANGE",   "0.02"))
 DEPTH_BID_RATIO     = float(os.getenv("DEPTH_BID_RATIO",   "3.0"))
@@ -445,6 +445,11 @@ def calc_progressive_trail(peak_profit: float, atr_pct: float,
     vol_adj   = max(PROG_TRAIL_VOL_MIN, min(PROG_TRAIL_VOL_MAX, vol_ratio))
 
     result = base * vol_adj
+
+    # ATR-aware floor: never trail tighter than 0.8×ATR (avoids wick shakeouts)
+    atr_floor = atr_pct * 0.8
+    result = max(result, atr_floor)
+
     # Final clamp
     if strategy == "SCALPER":
         result = max(SCALPER_TRAIL_MIN, min(SCALPER_TRAIL_MAX, result))
@@ -2769,7 +2774,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         "breakeven_act":  (SCALPER_BREAKEVEN_ACT if (
                                label == "SCALPER" and
                                opp.get("score", 0) >= SCALPER_BREAKEVEN_SCORE
-                           ) else 0.020 if label == "SCALPER"  # wider activation for lower-confidence scalpers
+                           ) else 0.025 if label == "SCALPER"  # wider 2.5% activation for lower-confidence scalpers
                            else MOONSHOT_BREAKEVEN_ACT if label == "MOONSHOT"
                            else TRINITY_BREAKEVEN_ACT if label == "TRINITY"
                            else None),
@@ -2959,10 +2964,11 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             giveback = MICRO_CAP_GIVEBACK             # 0.5%
             reason_tag = "MICRO_HWM"
         else:
-            protect_act = MOONSHOT_PROTECT_ACT        # 5.0%
-            # Dynamic ATR-based giveback
+            protect_act = MOONSHOT_PROTECT_ACT        # 4.0%
+            # Dynamic ATR-based giveback (floor = MOONSHOT_PROTECT_GIVEBACK)
             atr_pct = trade.get("atr_pct", 0.02)
-            dynamic_giveback = max(0.005, min(0.03, atr_pct * MOONSHOT_HWM_ATR_MULT))
+            dynamic_giveback = max(MOONSHOT_PROTECT_GIVEBACK,
+                                   min(0.03, atr_pct * MOONSHOT_HWM_ATR_MULT))
             giveback = dynamic_giveback
             reason_tag = "DYN_HWM"
 
