@@ -36,6 +36,10 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
         and a dynamic trailing stop (based on ATR and high‑water mark) are activated.
       - Exit is triggered when price hits the higher of the two, and execution uses
         chase limit orders (avoiding market sell unless absolutely necessary).
+  • CRITICAL FIXES IN CLOSE_POSITION:
+      - Added 1.5s delay after cancel_all_orders to let MEXC unlock funds.
+      - Non‑defensive exits now verify success; if partial fill, fallback to market sell.
+      - Trade removed only when fully closed; otherwise kept in memory for retry.
 """
 
 import time, hmac, hashlib, logging, logging.handlers, requests, json, os, threading, collections, re, math
@@ -3342,7 +3346,7 @@ def close_position(trade, reason) -> bool:
         if reason in defensive_reasons:
             # Cancel all open orders to unlock balance
             cancel_all_orders(symbol)
-            time.sleep(0.5)  # wait for unlock
+            time.sleep(1.5)          # ← ADDED: give MEXC time to unlock funds
             # Market sell
             market_attempts = 5
             for attempt in range(market_attempts):
@@ -3440,7 +3444,7 @@ def close_position(trade, reason) -> bool:
                 else:
                     return True
 
-        # For non‑defensive exits: use the existing chase limit logic, possibly with short timeout for moonshot TP
+        # For non‑defensive exits: use chase limit, but ensure full closure
         else:
             # For moonshot take profits, use short timeout
             if label == "MOONSHOT" and reason == "TAKE_PROFIT":
@@ -3450,27 +3454,59 @@ def close_position(trade, reason) -> bool:
                 timeout = CHASE_LIMIT_TIMEOUT
                 max_retries = CHASE_LIMIT_RETRIES
 
-            result = chase_limit_sell(symbol, trade["qty"], label, tag=reason, timeout=timeout, max_retries=max_retries)
-            if result is not None:
-                sell_order_id = result.get("orderId")
-                if sell_order_id:
-                    # Check if order filled after a short wait
-                    time.sleep(1)
-                    remaining = get_asset_balance(symbol)
-                    if current_price is not None:
-                        remaining_notional = remaining * current_price
-                        if remaining_notional < DUST_THRESHOLD:
-                            log.info(f"🧹 [{label}] Dust after chase limit sell – treating as closed")
-                            return True
-                    if remaining < trade["qty"] * 0.01:
-                        log.info(f"✅ [{label}] Position {symbol} closed via chase limit sell")
-                    else:
-                        log.warning(f"⚠️ [{label}] Chase limit sell partially filled, remaining {remaining:.4f} – proceeding anyway")
-                else:
-                    log.error(f"🚨 [{label}] Chase limit sell failed – no orderId")
+            # Attempt to sell the whole position with chase limit
+            remaining_qty = trade["qty"]
+            success = False
+            while remaining_qty > 0:
+                result = chase_limit_sell(symbol, remaining_qty, label, tag=reason,
+                                          timeout=timeout, max_retries=max_retries)
+                if result is None:
+                    log.error(f"🚨 [{label}] Chase limit sell failed – result is None")
                     return False
-            else:
-                log.error(f"🚨 [{label}] Chase limit sell failed – result is None")
+
+                sell_order_id = result.get("orderId")
+                if not sell_order_id:
+                    log.error(f"🚨 [{label}] Chase limit sell returned no orderId")
+                    return False
+
+                # Give the order a moment to fill
+                time.sleep(1)
+
+                # Check how much is still left
+                remaining = get_asset_balance(symbol)
+                if current_price is not None:
+                    remaining_notional = remaining * current_price
+                    if remaining_notional < DUST_THRESHOLD:
+                        log.info(f"🧹 [{label}] Dust after chase limit sell – treating as closed")
+                        success = True
+                        break
+
+                # If we sold the whole position or only dust remains, done
+                if remaining < trade["qty"] * 0.01 or (current_price is not None and remaining_notional < DUST_THRESHOLD):
+                    log.info(f"✅ [{label}] Position {symbol} closed via chase limit sell")
+                    success = True
+                    break
+                else:
+                    # Partial fill – update remaining_qty and retry with market order
+                    log.warning(f"⚠️ [{label}] Chase limit sell partially filled. "
+                                f"Remaining {remaining:.4f} – switching to market sell.")
+                    # Cancel any remaining open orders for this symbol
+                    cancel_all_orders(symbol)
+                    # Now use a market sell to finish
+                    market_result = private_post("/api/v3/order", {
+                        "symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": str(remaining)
+                    })
+                    if market_result:
+                        log.info(f"✅ [{label}] Market sell completed the position: {market_result}")
+                        success = True
+                        break
+                    else:
+                        log.error(f"🚨 [{label}] Market sell failed after partial fill. Manual intervention needed.")
+                        return False
+
+            if not success:
+                log.error(f"🚨 [{label}] Failed to close position {symbol} after all attempts. Remaining {remaining_qty:.4f}")
+                # DO NOT remove the trade; keep it in memory for retry
                 return False
 
     exit_fills = {}
