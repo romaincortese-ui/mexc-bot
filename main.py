@@ -4615,7 +4615,7 @@ def _cmd_close():
 def _cmd_restart():
     telegram("🔄 <b>Restarting...</b> State saved. Railway will redeploy.")
     save_state()
-    os._exit(0)
+    os._exit(1)  # non-zero exit code triggers Railway auto-restart
 
 def _cmd_resetstreak():
     global _consecutive_losses, _win_rate_pause_until, _streak_paused_at
@@ -4862,6 +4862,25 @@ def compute_market_regime_multiplier(df_btc: pd.DataFrame) -> float:
         log.debug(f"Market regime computation failed: {e}")
         return 1.0
 
+def flush_telegram_updates():
+    """Consume all pending Telegram updates without processing them.
+    Prevents stale commands (like /restart) from re-triggering on boot."""
+    global last_telegram_update
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        data = _get_session().get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params={"timeout": 0, "limit": 100},
+            timeout=5,
+        ).json()
+        updates = data.get("result", [])
+        if updates:
+            last_telegram_update = updates[-1]["update_id"]
+            log.info(f"🔌 Flushed {len(updates)} stale Telegram update(s)")
+    except Exception as e:
+        log.debug(f"Telegram flush failed: {e}")
+
 def startup() -> float:
     global scalper_trades, alt_trades, trade_history, _consecutive_losses, \
            _win_rate_pause_until, _streak_paused_at, _paused, \
@@ -4871,6 +4890,7 @@ def startup() -> float:
            _dynamic_scalper_budget, _dynamic_moonshot_budget
     mode = "📝 PAPER TRADING" if PAPER_TRADE else "💰 LIVE TRADING"
     log.info(f"🚀 MEXC Bot — {mode}")
+    flush_telegram_updates()  # clear stale commands (e.g. /restart) before processing
     _load_symbol_rules()
     (scalper_trades, alt_trades, trade_history,
      _consecutive_losses, _win_rate_pause_until, _streak_paused_at,
