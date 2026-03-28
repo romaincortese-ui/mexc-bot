@@ -2188,9 +2188,14 @@ def evaluate_prebreakout_candidate(sym: str) -> dict | None:
             current_atr = float(atr_series.iloc[-1])
             min_atr     = float(recent_atrs.min())
             if current_atr > 0 and current_atr <= min_atr * 1.10:
-                pattern = "SQUEEZE"
-                ema_dist = (price_now / float(ema21.iloc[-1]) - 1)
-                score = 35 + min(20, ema_dist * 500) + min(25, (1.0 - current_atr / float(recent_atrs.mean())) * 50)
+                # SQUEEZE needs momentum confirmation — flat RSI = dead coin, not coiling energy
+                if rsi_delta < 1.0:
+                    log.debug(f"[PRE_BREAKOUT] Skip {sym} — SQUEEZE but RSI flat "
+                              f"(delta {rsi_delta:+.1f} < +1.0)")
+                else:
+                    pattern = "SQUEEZE"
+                    ema_dist = (price_now / float(ema21.iloc[-1]) - 1)
+                    score = 35 + min(20, ema_dist * 500) + min(25, (1.0 - current_atr / float(recent_atrs.mean())) * 50)
     if pattern is None:
         lookback = 30
         if len(df) >= lookback:
