@@ -3142,25 +3142,30 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
                         # Record the partial fill as a trade
                         filled_cost = float(order.get("cummulativeQuoteQty", 0))
                         filled_price = filled_cost / filled_qty if filled_qty > 0 else price
+                        # P&L based on entry price (not budget_used which drifts)
+                        actual_cost = round(trade["entry_price"] * filled_qty, 4)
+                        actual_rev  = round(filled_qty * filled_price, 4)
+                        actual_pnl  = round(actual_rev - actual_cost, 4)
+                        actual_pct  = round((filled_price / trade["entry_price"] - 1) * 100, 4) if trade["entry_price"] > 0 else 0
                         partial_trade = trade.copy()
                         partial_trade["qty"] = filled_qty
-                        partial_trade["budget_used"] = trade["budget_used"] * filled_ratio
+                        partial_trade["budget_used"] = actual_cost
                         partial_trade["exit_price"] = filled_price
                         partial_trade["exit_ticker"] = filled_price
                         partial_trade["exit_reason"] = "MAJOR_PARTIAL_TP"
                         partial_trade["closed_at"] = datetime.now(timezone.utc).isoformat()
                         partial_trade["fee_usdt"] = 0
-                        partial_trade["cost_usdt"] = partial_trade["budget_used"]
-                        partial_trade["revenue_usdt"] = filled_qty * filled_price
-                        partial_trade["pnl_usdt"] = partial_trade["revenue_usdt"] - partial_trade["cost_usdt"]
-                        partial_trade["pnl_pct"] = (partial_trade["pnl_usdt"] / partial_trade["cost_usdt"] * 100) if partial_trade["cost_usdt"] > 0 else 0
+                        partial_trade["cost_usdt"] = actual_cost
+                        partial_trade["revenue_usdt"] = actual_rev
+                        partial_trade["pnl_usdt"] = actual_pnl
+                        partial_trade["pnl_pct"] = actual_pct
                         partial_trade["fills_used"] = True
                         partial_trade["is_partial"] = True
                         trade_history.append(partial_trade)
                         # Sync remaining with exchange (properly rounded)
                         synced_remaining = get_sellable_qty(symbol)
                         trade["qty"] = synced_remaining if synced_remaining >= 0 else remaining_qty
-                        trade["budget_used"] = trade["budget_used"] * (1 - filled_ratio)
+                        trade["budget_used"] = round(trade["entry_price"] * trade["qty"], 4)
                         return True, "MAJOR_PARTIAL_TP"
         # --- End major partial fill detection ---
 
@@ -3403,19 +3408,19 @@ def execute_partial_tp(trade, micro: bool = False) -> bool:
 
     # ── Step 4: Sync trade["qty"] with ACTUAL exchange balance ─────
     if not PAPER_TRADE:
-        time.sleep(0.5)  # let MEXC settle
+        time.sleep(1.0)  # let MEXC settle and index fills
         synced_qty = get_sellable_qty(symbol)
         if synced_qty >= 0:
             remaining_qty = synced_qty
             log.info(f"[{label}] Post-sell sync: exchange has {synced_qty} {symbol.replace('USDT','')}")
     trade["qty"] = remaining_qty
 
-    # ── Step 5: Record P&L ─────────────────────────────────────────
+    # ── Step 5: Record P&L (using entry_price, not budget_used) ────
     partial_fills = {}
     if not PAPER_TRADE:
         sell_ids = {partial_sell_id} if partial_sell_id else None
         partial_fills = get_actual_fills(
-            symbol, since_ms=partial_sold_at_ms, retries=3,
+            symbol, since_ms=partial_sold_at_ms, retries=4,
             buy_order_id=None, sell_order_ids=sell_ids,
         )
     try:
@@ -3426,12 +3431,12 @@ def execute_partial_tp(trade, micro: bool = False) -> bool:
     actual_entry = partial_fills.get("avg_buy_price")  or trade["entry_price"]
     actual_exit  = partial_fills.get("avg_sell_price") or ticker_price
     fee_usdt     = partial_fills.get("fee_usdt", 0.0)
-    # Use actual ratio sold (may differ from target ratio if sell_all)
-    actual_ratio = partial_qty / actual_qty if actual_qty > 0 else ratio
-    partial_cost = round(trade["budget_used"] * actual_ratio, 4)
-    partial_rev  = round(actual_exit * partial_qty, 4)
+    fills_used   = bool(partial_fills.get("avg_sell_price"))
+    # P&L based on actual entry price × qty (not budget_used which drifts)
+    partial_cost = round(actual_entry * partial_qty, 4)
+    partial_rev  = partial_fills.get("revenue_usdt") or round(actual_exit * partial_qty, 4)
     partial_pnl  = round(partial_rev - partial_cost - fee_usdt, 4)
-    partial_pct  = round(partial_pnl / partial_cost * 100, 4) if partial_cost > 0 else 0.0
+    partial_pct  = round((actual_exit / actual_entry - 1) * 100, 4) if actual_entry > 0 else 0.0
     trade_history.append({
         **{k: v for k, v in trade.items() if not k.startswith("_")},
         "qty":           partial_qty,
@@ -3445,12 +3450,13 @@ def execute_partial_tp(trade, micro: bool = False) -> bool:
         "revenue_usdt":  partial_rev,
         "pnl_pct":       partial_pct,
         "pnl_usdt":      partial_pnl,
-        "fills_used":    bool(partial_fills.get("avg_sell_price")),
+        "fills_used":    fills_used,
         "is_partial":    True,
     })
 
     # ── Step 6: Update trade state ─────────────────────────────────
-    trade["budget_used"] = round(trade["budget_used"] * (1 - actual_ratio), 4)
+    # budget_used tracks entry_price × remaining_qty (stays accurate)
+    trade["budget_used"] = round(actual_entry * remaining_qty, 4)
     if label in ("MOONSHOT", "REVERSAL", "PRE_BREAKOUT"):
         activate_floor_and_chase(trade, actual_exit)
         trade["sl_price"] = trade["entry_price"]
@@ -3472,18 +3478,20 @@ def execute_partial_tp(trade, micro: bool = False) -> bool:
     save_state()
 
     # ── Step 7: Telegram notification ──────────────────────────────
-    mode      = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
-    fills_note= "✅ actual fills" if partial_fills.get("avg_sell_price") else "⚠️ estimated"
-    icon      = "🎯μ" if micro else {"MOONSHOT":"🌙","REVERSAL":"🔄"}.get(label, "🎯")
-    stage_str = "Micro TP" if micro else ("Full Close" if reason_tag == "FULL_CLOSE" else "Partial TP")
+    mode       = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
+    fills_note = "✅ actual fills" if fills_used else "⚠️ estimated"
+    sell_pct   = round(partial_qty / (partial_qty + remaining_qty) * 100) if (partial_qty + remaining_qty) > 0 else 100
+    icon       = "🎯μ" if micro else {"MOONSHOT":"🌙","REVERSAL":"🔄"}.get(label, "🎯")
+    stage_str  = "Micro TP" if micro else ("Full Close" if reason_tag == "FULL_CLOSE" else "Partial TP")
     log.info(f"{icon} [{label}] {stage_str} {symbol}: sold {partial_qty} @ ${actual_exit:.6f} "
-             f"P&L ${partial_pnl:+.4f} ({partial_pct:+.2f}%) | "
+             f"(entry ${actual_entry:.6f}) P&L {partial_pct:+.2f}% (${partial_pnl:+.2f}) | "
              f"Remaining: {remaining_qty}")
     telegram(
         f"{icon} <b>{stage_str} — {label}</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Pair:      <b>{symbol}</b>\n"
-        f"Sold:      {partial_qty} ({actual_ratio*100:.0f}%) @ <b>${actual_exit:.6f}</b>  [{fills_note}]\n"
+        f"Entry:     ${actual_entry:.6f}\n"
+        f"Sold:      {partial_qty} ({sell_pct}%) @ <b>${actual_exit:.6f}</b>  [{fills_note}]\n"
         f"P&L:       <b>{partial_pct:+.2f}%  (${partial_pnl:+.2f})</b>\n"
         f"━━━━━━━━━━━━━━━\n"
         + (f"Remaining: {remaining_qty} still open\n"
