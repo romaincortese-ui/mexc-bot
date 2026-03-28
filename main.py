@@ -2153,6 +2153,8 @@ def evaluate_prebreakout_candidate(sym: str) -> dict | None:
     rsi = calc_rsi(close)
     if np.isnan(rsi) or rsi > 70 or rsi < 25:
         return None
+    rsi_prev  = calc_rsi(close.iloc[:-1])
+    rsi_delta = round(rsi - rsi_prev, 2) if not np.isnan(rsi_prev) else 0.0
     ema21 = calc_ema(close, 21)
     above_ema21 = price_now > float(ema21.iloc[-1])
     atr     = calc_atr(df, period=14)
@@ -2216,17 +2218,23 @@ def evaluate_prebreakout_candidate(sym: str) -> dict | None:
     if pattern is None:
         return None
     score = round(min(score, 100), 2)
+    # Volume floor — reject dead coins where low vol mimics patterns
+    avg_vol = float(volume.iloc[-20:-1].mean()) if len(volume) >= 21 else 0.0
+    vol_ratio = round(float(volume.iloc[-1]) / avg_vol, 2) if avg_vol > 0 else 0.0
+    if vol_ratio < 0.5:
+        log.debug(f"[PRE_BREAKOUT] Skip {sym} — vol {vol_ratio:.1f}x too low for {pattern}")
+        return None
     log.debug(f"🔮 [PRE_BREAKOUT] {sym} {pattern} | score={score:.0f} | "
-              f"RSI={rsi:.0f} | ATR={atr_pct*100:.2f}%")
+              f"RSI={rsi:.0f} | ATR={atr_pct*100:.2f}% | Vol={vol_ratio:.1f}x")
     return {
         "symbol":       sym,
         "price":        price_now,
         "score":        score,
         "rsi":          round(rsi, 2),
+        "rsi_delta":    rsi_delta,
         "atr_pct":      round(atr_pct, 6),
         "entry_signal": pattern,
-        "vol_ratio":    round(float(volume.iloc[-1]) / float(volume.iloc[-20:-1].mean())
-                              if float(volume.iloc[-20:-1].mean()) > 0 else 1.0, 2),
+        "vol_ratio":    vol_ratio,
     }
 
 def find_prebreakout_opportunity(tickers: pd.DataFrame, budget: float,
@@ -4942,6 +4950,20 @@ def run():
            _strategy_loss_streaks, _strategy_paused_until
     startup_balance  = startup()
     balance          = get_available_balance()
+    # Initialize BTC macro EMA gap BEFORE first entry cycle (prevents gate race condition)
+    try:
+        df_btc_init = parse_klines("BTCUSDT", interval="1h", limit=120, min_len=50)
+        if df_btc_init is not None:
+            btc_ema_init = calc_ema(df_btc_init["close"], BTC_REGIME_EMA_PERIOD)
+            _btc_ema_gap_macro = (float(df_btc_init["close"].iloc[-1]) / float(btc_ema_init.iloc[-1]) - 1)
+            _market_regime_mult = compute_market_regime_multiplier(df_btc_init)
+            if _btc_ema_gap_macro < MOONSHOT_BTC_EMA_GATE:
+                _moonshot_gate_open = False
+            log.info(f"📊 BTC 1h EMA gap: {_btc_ema_gap_macro*100:+.1f}% | "
+                     f"Regime: {_market_regime_mult:.2f}× | "
+                     f"Moon gate: {'✅' if _moonshot_gate_open else '⛔'}")
+    except Exception as e:
+        log.warning(f"BTC 1h init failed: {e} — gate defaults to open")
     while True:
         try:
             listen_for_commands(balance)
