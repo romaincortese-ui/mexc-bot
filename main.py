@@ -2601,7 +2601,7 @@ def calc_dynamic_tp_sl(opp: dict) -> tuple[float, float, str, str]:
     dynamic_tp_floor = calc_fee_aware_tp_floor()
     # Regime-adaptive TP cap: wider in bull (captures bigger moves), tighter stays default
     effective_tp_max = SCALPER_TP_MAX / min(_market_regime_mult, 1.0) if _market_regime_mult < 1.0 else SCALPER_TP_MAX
-    tp_pct      = min(effective_tp_max, max(dynamic_tp_floor, tp_pct))
+    tp_pct      = min(effective_tp_max, max(SCALPER_TP_MIN, dynamic_tp_floor, tp_pct))
     if atr_tp > candle_cap:
         tp_label += f" (candle-capped {candle_cap*100:.1f}%)"
     if signal in _SIGNAL_SL_MULT:
@@ -3622,8 +3622,8 @@ def close_position(trade, reason) -> bool:
                     if current_price is not None:
                         remaining_notional = remaining * current_price
                         if remaining_notional < DUST_THRESHOLD:
-                            log.info(f"🧹 [{label}] Market sell succeeded – dust remaining, treating as closed")
-                            return True
+                            log.info(f"✅ [{label}] Market sell succeeded – remaining ${remaining_notional:.2f} (dust)")
+                            break
                     if remaining < sell_qty * 0.01:
                         log.info(f"✅ [{label}] Position {symbol} closed via market sell")
                         break
@@ -3667,8 +3667,8 @@ def close_position(trade, reason) -> bool:
             if current_price is not None:
                 final_notional = final_remaining * current_price
                 if final_notional >= DUST_THRESHOLD:
-                    log.error(f"🚨 [{label}] Could not close position {symbol} after {market_attempts} market hammer attempts! Remaining {final_remaining:.4f} (${final_notional:.2f})")
-                    # Only alert once per symbol per cooldown
+                    log.error(f"🚨 [{label}] Could not close {symbol} after {market_attempts} attempts! "
+                              f"Remaining {final_remaining:.4f} (${final_notional:.2f})")
                     now = time.time()
                     last_alert = _last_error_time.get(symbol, 0)
                     if now - last_alert > ERROR_ALERT_COOLDOWN:
@@ -3676,16 +3676,12 @@ def close_position(trade, reason) -> bool:
                         telegram(f"🚨 <b>Close failed!</b> {label} {symbol}\n"
                                  f"{reason} | {final_remaining:.4f} (~${final_notional:.2f}) remaining")
                     return False
-                else:
-                    log.info(f"🧹 [{label}] Position {symbol} left as dust (${final_notional:.2f}) – ignoring")
-                    # Send a dust notification
-                    telegram(f"🧹 <b>Dust — {label} {symbol}</b> | ${final_notional:.2f} | auto-closed")
-                    return True
+                # Dust remaining — fall through to normal close notification
+                log.info(f"🧹 [{label}] {symbol} dust remaining (${final_notional:.2f}) — recording close")
             else:
-                # Fallback to old check
                 if final_remaining > trade["qty"] * 0.01:
-                    log.error(f"🚨 [{label}] Could not close position {symbol} after {market_attempts} market hammer attempts! Remaining {final_remaining:.4f}")
-                    # Alert with dedup
+                    log.error(f"🚨 [{label}] Could not close {symbol} after {market_attempts} attempts! "
+                              f"Remaining {final_remaining:.4f}")
                     now = time.time()
                     last_alert = _last_error_time.get(symbol, 0)
                     if now - last_alert > ERROR_ALERT_COOLDOWN:
@@ -3693,8 +3689,7 @@ def close_position(trade, reason) -> bool:
                         telegram(f"🚨 <b>Close failed!</b> {label} {symbol}\n"
                                  f"{reason} | {final_remaining:.4f} remaining")
                     return False
-                else:
-                    return True
+                # Success — fall through to normal close notification
 
         # For non‑defensive exits: use chase limit, but ensure full closure
         else:
