@@ -96,9 +96,9 @@ REGIME_HIGH_VOL_ATR_RATIO = float(os.getenv("REGIME_HIGH_VOL_ATR_RATIO", "1.85")
 REGIME_LOW_VOL_ATR_RATIO  = float(os.getenv("REGIME_LOW_VOL_ATR_RATIO",  "0.80"))
 REGIME_STRONG_UPTREND_GAP = float(os.getenv("REGIME_STRONG_UPTREND_GAP", "0.01"))   # 1% above EMA
 REGIME_STRONG_DOWNTREND_GAP = float(os.getenv("REGIME_STRONG_DOWNTREND_GAP", "-0.01")) # 1% below EMA
-REGIME_TIGHTEN_MULT = float(os.getenv("REGIME_TIGHTEN_MULT", "0.8"))
-REGIME_LOOSEN_MULT  = float(os.getenv("REGIME_LOOSEN_MULT",  "1.2"))
-REGIME_TREND_MULT   = float(os.getenv("REGIME_TREND_MULT",   "1.1"))
+REGIME_TIGHTEN_MULT = float(os.getenv("REGIME_TIGHTEN_MULT", "1.25"))  # raises threshold in bad conditions
+REGIME_LOOSEN_MULT  = float(os.getenv("REGIME_LOOSEN_MULT",  "0.85"))  # lowers threshold in good conditions
+REGIME_TREND_MULT   = float(os.getenv("REGIME_TREND_MULT",   "0.90"))  # lowers threshold in uptrend (momentum works)
 
 # ── Scalper (max 3 concurrent) ────────────────────────────────
 SCALPER_MAX_TRADES   = int(os.getenv("SCALPER_MAX_TRADES",   "3"))
@@ -187,6 +187,7 @@ MOONSHOT_MICRO_TP_RATIO      = float(os.getenv("MOONSHOT_MICRO_TP_RATIO", "0.30"
 MICRO_TP_MIN_PROFIT          = float(os.getenv("MICRO_TP_MIN_PROFIT",     "1.0"))    # min $ profit to trigger micro TP
 MOONSHOT_PROTECT_ACT     = float(os.getenv("MOONSHOT_PROTECT_ACT",     "0.04"))
 MOONSHOT_PROTECT_GIVEBACK = float(os.getenv("MOONSHOT_PROTECT_GIVEBACK","0.015"))  # floor for dynamic ATR giveback
+MOONSHOT_BTC_EMA_GATE    = float(os.getenv("MOONSHOT_BTC_EMA_GATE",    "-0.02"))  # skip moonshot if BTC EMA gap below this
 
 # ── Pre-Breakout (unchanged) ──────────────────────────────────
 PRE_BREAKOUT_TP             = float(os.getenv("PRE_BREAKOUT_TP",             "0.08"))
@@ -240,17 +241,18 @@ REVERSAL_WEAK_BOUNCE_PCT  = float(os.getenv("REVERSAL_WEAK_BOUNCE_PCT", "0.65"))
 TRINITY_SYMBOLS       = ["SOLUSDT", "ETHUSDT", "BTCUSDT"]
 TRINITY_BUDGET_PCT    = float(os.getenv("TRINITY_BUDGET_PCT",   "0.20"))   # per‑trade % of allocated Trinity capital
 TRINITY_MAX_CONCURRENT = int(os.getenv("TRINITY_MAX_CONCURRENT", "2"))
-TRINITY_DROP_PCT      = float(os.getenv("TRINITY_DROP_PCT",     "0.02"))
-TRINITY_MIN_RSI       = float(os.getenv("TRINITY_MIN_RSI",      "25"))
-TRINITY_MAX_RSI       = float(os.getenv("TRINITY_MAX_RSI",      "50"))
-TRINITY_TP_ATR_MULT   = float(os.getenv("TRINITY_TP_ATR_MULT",  "1.5"))
-TRINITY_SL_ATR_MULT   = float(os.getenv("TRINITY_SL_ATR_MULT",  "1.0"))
-TRINITY_SL_MAX        = float(os.getenv("TRINITY_SL_MAX",       "0.025"))
-TRINITY_TP_MIN        = float(os.getenv("TRINITY_TP_MIN",       "0.008"))
-TRINITY_MAX_HOURS     = int(os.getenv("TRINITY_MAX_HOURS",      "6"))
-TRINITY_VOL_BURST     = float(os.getenv("TRINITY_VOL_BURST",    "1.2"))
-TRINITY_BREAKEVEN_ACT = float(os.getenv("TRINITY_BREAKEVEN_ACT","0.008"))
-TRINITY_DROP_LOOKBACK_CANDLES = [16, 32, 48, 96]  # 4h, 8h, 12h, 24h on 15m candles
+TRINITY_DROP_PCT      = float(os.getenv("TRINITY_DROP_PCT",     "0.03"))
+TRINITY_MIN_RSI       = float(os.getenv("TRINITY_MIN_RSI",      "20"))
+TRINITY_MAX_RSI       = float(os.getenv("TRINITY_MAX_RSI",      "45"))
+TRINITY_TP_ATR_MULT   = float(os.getenv("TRINITY_TP_ATR_MULT",  "2.0"))
+TRINITY_SL_ATR_MULT   = float(os.getenv("TRINITY_SL_ATR_MULT",  "1.2"))
+TRINITY_SL_MAX        = float(os.getenv("TRINITY_SL_MAX",       "0.04"))
+TRINITY_TP_MIN        = float(os.getenv("TRINITY_TP_MIN",       "0.015"))
+TRINITY_MAX_HOURS     = int(os.getenv("TRINITY_MAX_HOURS",      "48"))
+TRINITY_VOL_BURST     = float(os.getenv("TRINITY_VOL_BURST",    "1.0"))
+TRINITY_BREAKEVEN_ACT = float(os.getenv("TRINITY_BREAKEVEN_ACT","0.012"))
+TRINITY_INTERVAL      = os.getenv("TRINITY_INTERVAL",           "1h")
+TRINITY_DROP_LOOKBACK_CANDLES = [16, 32, 48, 96]  # 16h, 32h, 2d, 4d on 1h candles
 MIN_PRICE         = 0.001
 SCAN_INTERVAL     = 60
 STATE_FILE        = "state.json"
@@ -1384,7 +1386,7 @@ def calc_fee_aware_tp_floor() -> float:
     recent = [t for t in trade_history if t.get("fee_usdt", 0) > 0][-25:]
     if len(recent) < 6:
         return 0.0018 + FEE_SLIPPAGE_BUFFER + 0.0105
-    avg_fee = sum(t["fee_usdt"] / t["cost_usdt"] for t in recent) / len(recent)
+    avg_fee = sum(t["fee_usdt"] / t["cost_usdt"] for t in recent if t.get("cost_usdt", 0) > 0) / len(recent)
     return round(avg_fee + FEE_SLIPPAGE_BUFFER + 0.010, 4)
 
 def classify_entry_signal(crossed_now: bool = False, vol_ratio: float = 1.0,
@@ -1815,8 +1817,8 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
     df = df[df["quoteVolume"] <= max_vol]
     df = df[df["lastPrice"]   >= MIN_PRICE]
     df = df[~df["symbol"].isin(open_symbols | exclude | _api_blacklist)]
-    momentum_candidates = (df.assign(abs_change=df["priceChangePercent"].abs())
-                             .sort_values("abs_change", ascending=False)
+    momentum_candidates = (df[df["priceChangePercent"] > 0]  # only positive momentum for longs
+                             .sort_values("priceChangePercent", ascending=False)
                              .head(40)["symbol"].tolist())
     new_listings = find_new_listings(tickers, exclude=exclude, open_symbols=open_symbols)
     new_symbols  = [n["symbol"] for n in new_listings]
@@ -2250,7 +2252,7 @@ def find_prebreakout_opportunity(tickers: pd.DataFrame, budget: float,
     return pick_tradeable(scored, budget, "PRE_BREAKOUT")
 
 def evaluate_trinity_candidate(sym: str) -> dict | None:
-    df = parse_klines(sym, interval="15m", limit=200, min_len=40)
+    df = parse_klines(sym, interval=TRINITY_INTERVAL, limit=200, min_len=50)
     if df is None:
         return None
     close  = df["close"]
@@ -2919,7 +2921,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     }
 
     mode         = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
-    icon         = {"SCALPER":"🟢","MOONSHOT":"🌙","REVERSAL":"🔄"}.get(label,"🟢")
+    icon         = {"SCALPER":"🟢","MOONSHOT":"🌙","REVERSAL":"🔄","TRINITY":"🔱","PRE_BREAKOUT":"🔮"}.get(label,"🟢")
     timeout_line = f"Max hold:    {max_hours}h\n" if max_hours else ""
     breakeven_line = ""
     if trade.get("breakeven_act"):
@@ -3507,7 +3509,7 @@ def execute_partial_tp(trade, micro: bool = False) -> bool:
     mode       = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
     fills_note = "✅ actual fills" if fills_used else "⚠️ estimated"
     sell_pct   = round(partial_qty / (partial_qty + remaining_qty) * 100) if (partial_qty + remaining_qty) > 0 else 100
-    icon       = "🎯μ" if micro else {"MOONSHOT":"🌙","REVERSAL":"🔄"}.get(label, "🎯")
+    icon       = "🎯μ" if micro else {"MOONSHOT":"🌙","REVERSAL":"🔄","PRE_BREAKOUT":"🔮"}.get(label, "🎯")
     stage_str  = "Micro TP" if micro else ("Full Close" if reason_tag == "FULL_CLOSE" else "Partial TP")
     log.info(f"{icon} [{label}] {stage_str} {symbol}: sold {partial_qty} @ ${actual_exit:.6f} "
              f"(entry ${actual_entry:.6f}) P&L {partial_pct:+.2f}% (${partial_pnl:+.2f}) | "
@@ -4336,7 +4338,7 @@ def _compute_metrics(trades: list, since_label: str = "all-time") -> dict:
             pass
     avg_hold_min = sum(hold_times) / len(hold_times) if hold_times else 0.0
     by_label = {}
-    for lbl in ("SCALPER", "MOONSHOT", "REVERSAL", "TRINITY"):
+    for lbl in ("SCALPER", "MOONSHOT", "REVERSAL", "TRINITY", "PRE_BREAKOUT"):
         lt = [t for t in full if t.get("label") == lbl]
         if not lt:
             continue
@@ -4414,8 +4416,8 @@ def _cmd_pnl(balance: float):
 
     def _strategy_line(trades: list) -> str:
         lines = []
-        icons = {"SCALPER": "🟢", "MOONSHOT": "🌙", "REVERSAL": "🔄", "TRINITY": "🔱"}
-        for lbl in ("SCALPER", "MOONSHOT", "REVERSAL", "TRINITY"):
+        icons = {"SCALPER": "🟢", "MOONSHOT": "🌙", "REVERSAL": "🔄", "TRINITY": "🔱", "PRE_BREAKOUT": "🔮"}
+        for lbl in ("SCALPER", "MOONSHOT", "REVERSAL", "TRINITY", "PRE_BREAKOUT"):
             lt = [t for t in trades if t.get("label") == lbl]
             if not lt:
                 continue
@@ -4501,7 +4503,7 @@ def _cmd_metrics(balance: float):
         f"Total P&L:   <b>${m['total_pnl']:+.2f}</b>  |  Max DD: <b>-${m['max_drawdown']:.2f}</b>",
         f"Balance:     <b>${balance:.2f}</b>",
     ]
-    icons = {"SCALPER": "🟢", "MOONSHOT": "🌙", "REVERSAL": "🔄", "TRINITY": "🔱"}
+    icons = {"SCALPER": "🟢", "MOONSHOT": "🌙", "REVERSAL": "🔄", "TRINITY": "🔱", "PRE_BREAKOUT": "🔮"}
     if m["by_label"]:
         lines.append("━━━━━━━━━━━━━━━")
         for lbl, s in m["by_label"].items():
@@ -4605,7 +4607,7 @@ def _cmd_config():
         f"  TP: +{PRE_BREAKOUT_TP*100:.0f}% | SL: -{PRE_BREAKOUT_SL*100:.0f}% | Max: {PRE_BREAKOUT_MAX_HOURS}h\n"
         f"\n🔱 <b>Trinity</b>  [exchange TP + bot SL]\n"
         f"  Pairs: {', '.join(s.replace('USDT','') for s in TRINITY_SYMBOLS)} | Max: {TRINITY_MAX_CONCURRENT} concurrent | Budget: {TRINITY_BUDGET_PCT*100:.0f}% of allocated capital\n"
-        f"  Entry: drop ≥{TRINITY_DROP_PCT*100:.0f}% (4h/8h/12h/24h) | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | vol ≥{TRINITY_VOL_BURST:.1f}× | bounce candle\n"
+        f"  Entry: drop ≥{TRINITY_DROP_PCT*100:.0f}% (16h/32h/2d/4d on {TRINITY_INTERVAL} candles) | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | bounce candle\n"
         f"  TP: {TRINITY_TP_ATR_MULT}×ATR | SL: {TRINITY_SL_ATR_MULT}×ATR (cap {TRINITY_SL_MAX*100:.1f}%) | Max: {TRINITY_MAX_HOURS}h\n"
         f"\n🔄 <b>Reversal</b>  [bot-monitored]\n"
         f"  TP: +{REVERSAL_TP*100:.1f}% | SL: cap-candle anchor | Max: {REVERSAL_MAX_HOURS}h\n"
@@ -4891,7 +4893,7 @@ def compute_market_regime_multiplier(df_btc: pd.DataFrame) -> float:
             multiplier *= REGIME_TIGHTEN_MULT
             log.debug(f"Market regime: strong downtrend (EMA gap {ema_gap*100:.1f}%) → tighten ×{REGIME_TIGHTEN_MULT}")
 
-        return max(0.6, min(1.4, multiplier))  # clamp to 0.6–1.4
+        return max(0.7, min(1.6, multiplier))  # clamp to 0.7–1.6
     except Exception as e:
         log.debug(f"Market regime computation failed: {e}")
         return 1.0
@@ -4972,7 +4974,7 @@ def startup() -> float:
         f"  HWM stop: micro‑cap triggers at +{MICRO_CAP_PROTECT_ACT*100:.1f}%, giveback {MICRO_CAP_GIVEBACK*100:.1f}%; normal coins use ATR×{MOONSHOT_HWM_ATR_MULT:.1f} giveback\n"
         f"  Pre-breakout: accumulation/squeeze/base patterns → +{PRE_BREAKOUT_TP*100:.0f}%/-{PRE_BREAKOUT_SL*100:.0f}% | {PRE_BREAKOUT_MAX_HOURS}h\n"
         f"\n🔱 <b>Trinity</b> (max {TRINITY_MAX_CONCURRENT} trades, {TRINITY_BUDGET_PCT*100:.0f}% of allocated capital) [exchange TP + bot SL]\n"
-        f"  {'/'.join(s.replace('USDT','') for s in TRINITY_SYMBOLS)} | drop ≥{TRINITY_DROP_PCT*100:.0f}% | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | max {TRINITY_MAX_HOURS}h\n"
+        f"  {'/'.join(s.replace('USDT','') for s in TRINITY_SYMBOLS)} | {TRINITY_INTERVAL} candles | drop ≥{TRINITY_DROP_PCT*100:.0f}% (16h–4d) | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | max {TRINITY_MAX_HOURS}h\n"
         f"\n🔄 <b>Reversal</b> (via moonshot slot) [bot-monitored]\n"
         f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%  max {REVERSAL_MAX_HOURS}h\n"
         f"  Partial TP: {REVERSAL_PARTIAL_TP_RATIO*100:.0f}% sold at +{REVERSAL_PARTIAL_TP_PCT*100:.1f}% → SL entry (disabled if trade < ${MIN_TRADE_FOR_PARTIAL_TP:.0f})\n"
@@ -5246,7 +5248,7 @@ def run():
                                     _scalper_excluded[trade["symbol"]] = time.time() + 900
             # Alt entries (moonshot, reversal, trinity)
             # Trinity gets PRIORITY entry — dip recovery on majors shouldn't wait for altcoin slots
-            if not _paused:
+            if not _paused and not btc_panic and not over_exposed:
                 used_trinity = sum(t["budget_used"] for t in alt_trades if t["label"] == "TRINITY")
                 available_trinity = trinity_capital - used_trinity
                 if available_trinity > 0:
@@ -5274,11 +5276,19 @@ def run():
                     budget = min(available_moonshot, round(total_value * get_effective_budget_pct("MOONSHOT"), 2))
                     min_alt = MOONSHOT_MIN_NOTIONAL
                     if budget >= min_alt:
-                        # Scan moonshot and reversal in parallel — pick the best opportunity
-                        moon_opp = find_moonshot_opportunity(tickers, budget,
-                                                              total_value,
-                                                              exclude=_alt_excluded,
-                                                              open_symbols=open_symbols)
+                        # BTC health gate: skip moonshot (momentum-long) when BTC is in sustained downtrend
+                        # Reversal still scans — it's designed for dips
+                        btc_healthy_for_moonshot = _btc_ema_gap >= MOONSHOT_BTC_EMA_GATE
+                        if not btc_healthy_for_moonshot:
+                            log.debug(f"[MOONSHOT] Skipped — BTC {_btc_ema_gap*100:.1f}% below EMA "
+                                      f"(gate: {MOONSHOT_BTC_EMA_GATE*100:.0f}%). Reversal still active.")
+
+                        moon_opp = None
+                        if btc_healthy_for_moonshot:
+                            moon_opp = find_moonshot_opportunity(tickers, budget,
+                                                                  total_value,
+                                                                  exclude=_alt_excluded,
+                                                                  open_symbols=open_symbols)
                         rev_opp  = find_reversal_opportunity(tickers, budget,
                                                               exclude=_alt_excluded,
                                                               open_symbols=open_symbols)
@@ -5320,7 +5330,7 @@ def run():
                                                                open_symbols=open_symbols)
                             if opp:
                                 trade = open_position(opp, budget, PRE_BREAKOUT_TP, PRE_BREAKOUT_SL,
-                                                      "MOONSHOT", max_hours=PRE_BREAKOUT_MAX_HOURS)
+                                                      "PRE_BREAKOUT", max_hours=PRE_BREAKOUT_MAX_HOURS)
                                 if trade:
                                     alt_trades.append(trade)
                                     _alt_excluded = set()
