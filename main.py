@@ -184,6 +184,7 @@ MOONSHOT_PARTIAL_TP_RATIO    = float(os.getenv("MOONSHOT_PARTIAL_TP_RATIO", "0.4
 MOONSHOT_BREAKEVEN_ACT       = float(os.getenv("MOONSHOT_BREAKEVEN_ACT", "0.02"))
 MOONSHOT_MICRO_TP_PCT        = float(os.getenv("MOONSHOT_MICRO_TP_PCT",   "0.025"))
 MOONSHOT_MICRO_TP_RATIO      = float(os.getenv("MOONSHOT_MICRO_TP_RATIO", "0.30"))
+MICRO_TP_MIN_PROFIT          = float(os.getenv("MICRO_TP_MIN_PROFIT",     "1.0"))    # min $ profit to trigger micro TP
 MOONSHOT_PROTECT_ACT     = float(os.getenv("MOONSHOT_PROTECT_ACT",     "0.04"))
 MOONSHOT_PROTECT_GIVEBACK = float(os.getenv("MOONSHOT_PROTECT_GIVEBACK","0.015"))  # floor for dynamic ATR giveback
 
@@ -3108,13 +3109,20 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             log.info(f"🔒 [{label}] Breakeven locked: {symbol} | peak +{peak_pct:.1f}% | "
                      f"SL moved to entry ${trade['entry_price']:.6f}")
 
-    # Micro TP (if enabled)
+    # Micro TP (if enabled) — must also yield at least $1 profit
     if (label == "MOONSHOT"
             and not trade.get("micro_tp_hit")
             and trade.get("micro_tp_price")
             and peak_pct >= MOONSHOT_MICRO_TP_PCT * 100):
-        log.info(f"🎯μ [{label}] Micro TP triggered (peak): {symbol} | peak +{peak_pct:.1f}%")
-        return True, "MICRO_TP"
+        micro_ratio = trade.get("micro_tp_ratio", MOONSHOT_MICRO_TP_RATIO)
+        micro_qty   = trade["qty"] * micro_ratio
+        micro_profit_est = micro_qty * (price - trade["entry_price"])
+        if micro_profit_est >= MICRO_TP_MIN_PROFIT:
+            log.info(f"🎯μ [{label}] Micro TP triggered: {symbol} | +{peak_pct:.1f}% | est ${micro_profit_est:.2f}")
+            return True, "MICRO_TP"
+        else:
+            log.debug(f"[{label}] Micro TP % hit but profit too low "
+                      f"(${micro_profit_est:.2f} < ${MICRO_TP_MIN_PROFIT:.2f}) — waiting")
 
     # Partial TP (if enabled)
     if (label in ("MOONSHOT", "REVERSAL")
@@ -4578,8 +4586,8 @@ def _cmd_config():
         f"  Patterns: accumulation | squeeze | base-spring\n"
         f"  TP: +{PRE_BREAKOUT_TP*100:.0f}% | SL: -{PRE_BREAKOUT_SL*100:.0f}% | Max: {PRE_BREAKOUT_MAX_HOURS}h\n"
         f"\n🔱 <b>Trinity</b>  [exchange TP + bot SL]\n"
-        f"  Pairs: {', '.join(s.replace('USDT','') for s in TRINITY_SYMBOLS)} | Budget: {TRINITY_BUDGET_PCT*100:.0f}% of allocated capital\n"
-        f"  Entry: drop ≥{TRINITY_DROP_PCT*100:.0f}% (4h/8h) | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | vol ≥{TRINITY_VOL_BURST:.1f}× | green candle\n"
+        f"  Pairs: {', '.join(s.replace('USDT','') for s in TRINITY_SYMBOLS)} | Max: {TRINITY_MAX_CONCURRENT} concurrent | Budget: {TRINITY_BUDGET_PCT*100:.0f}% of allocated capital\n"
+        f"  Entry: drop ≥{TRINITY_DROP_PCT*100:.0f}% (4h/8h/12h/24h) | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | vol ≥{TRINITY_VOL_BURST:.1f}× | bounce candle\n"
         f"  TP: {TRINITY_TP_ATR_MULT}×ATR | SL: {TRINITY_SL_ATR_MULT}×ATR (cap {TRINITY_SL_MAX*100:.1f}%) | Max: {TRINITY_MAX_HOURS}h\n"
         f"\n🔄 <b>Reversal</b>  [bot-monitored]\n"
         f"  TP: +{REVERSAL_TP*100:.1f}% | SL: cap-candle anchor | Max: {REVERSAL_MAX_HOURS}h\n"
@@ -4945,7 +4953,7 @@ def startup() -> float:
         f"  Partial TP: +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% then progressive trail (disabled if trade < ${MIN_TRADE_FOR_PARTIAL_TP:.0f})\n"
         f"  HWM stop: micro‑cap triggers at +{MICRO_CAP_PROTECT_ACT*100:.1f}%, giveback {MICRO_CAP_GIVEBACK*100:.1f}%; normal coins use ATR×{MOONSHOT_HWM_ATR_MULT:.1f} giveback\n"
         f"  Pre-breakout: accumulation/squeeze/base patterns → +{PRE_BREAKOUT_TP*100:.0f}%/-{PRE_BREAKOUT_SL*100:.0f}% | {PRE_BREAKOUT_MAX_HOURS}h\n"
-        f"\n🔱 <b>Trinity</b> (max 1 trade, {TRINITY_BUDGET_PCT*100:.0f}% of allocated capital) [exchange TP + bot SL]\n"
+        f"\n🔱 <b>Trinity</b> (max {TRINITY_MAX_CONCURRENT} trades, {TRINITY_BUDGET_PCT*100:.0f}% of allocated capital) [exchange TP + bot SL]\n"
         f"  {'/'.join(s.replace('USDT','') for s in TRINITY_SYMBOLS)} | drop ≥{TRINITY_DROP_PCT*100:.0f}% | RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | max {TRINITY_MAX_HOURS}h\n"
         f"\n🔄 <b>Reversal</b> (via moonshot slot) [bot-monitored]\n"
         f"  TP: +{REVERSAL_TP*100:.1f}%  SL: -{REVERSAL_SL*100:.1f}%  max {REVERSAL_MAX_HOURS}h\n"
