@@ -397,6 +397,10 @@ _trending_coins_at:   float = 0.0
 _social_boost_cache:  dict  = {}
 _btc_ema_gap:         float = 0.0
 _btc_ema_gap_macro:   float = 0.0  # 1h EMA gap for moonshot macro gate
+_btc_ema_gap_daily:   float = 0.0  # 1D EMA gap (20-period) for macro regime anchor
+_btc_daily_at:        float = 0.0  # last fetch timestamp for daily data
+_fear_greed_index:    int   = 50   # 0=extreme fear, 100=extreme greed
+_fear_greed_at:       float = 0.0  # last fetch timestamp
 _moonshot_gate_open:  bool  = True  # hysteresis state for BTC gate
 _session_loss_paused_until: float = 0.0  # timestamp when session loss pause expires
 _strategy_loss_streaks: dict = {}   # {"TRINITY": 2, "REVERSAL": 0, ...}
@@ -3961,11 +3965,13 @@ def send_heartbeat(balance: float):
     for t in scalper_trades + alt_trades:
         px, _ = _trade_price_pct(t)
         total_value += px * t["qty"] if px else t.get("budget_used", 0)
+    fg_icon = "😱" if _fear_greed_index <= 25 else "😨" if _fear_greed_index <= 40 else "😐" if _fear_greed_index <= 60 else "😀" if _fear_greed_index <= 75 else "🤑"
     moon_gate = "✅" if _moonshot_gate_open else "⛔"
     telegram(
         f"💓 <b>Heartbeat</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"{regime_label} | BTC {_btc_ema_gap_macro*100:+.1f}% | Moon {moon_gate}\n"
+        f"{regime_label} (×{mult:.2f}) | F&G {fg_icon}{_fear_greed_index}\n"
+        f"BTC 1h {_btc_ema_gap_macro*100:+.1f}% | 1d {_btc_ema_gap_daily*100:+.1f}% | Moon {moon_gate}\n"
         f"💰 ${balance:.2f} free | ${total_value:.2f} total | P&L ${session_pnl:+.2f}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Scalper ({len(scalper_trades)}/{SCALPER_MAX_TRADES}):\n"
@@ -4260,8 +4266,9 @@ def _cmd_status(balance: float):
         regime_label = "🚀 STRONG BULL"
     session_pnl = sum(t.get("pnl_usdt", 0) for t in trade_history)
     lines = [f"📋 <b>Status</b> [{mode}]\n━━━━━━━━━━━━━━━"]
-    lines.append(f"Market: <b>{regime_label}</b> (×{mult:.2f}) | BTC EMA: {btc_gap*100:+.1f}%")
-    lines.append(f"Session: <b>${session_pnl:+.2f}</b> | Moon gate: {'✅' if _moonshot_gate_open else '⛔'}")
+    fg_icon = "😱" if _fear_greed_index <= 25 else "😨" if _fear_greed_index <= 40 else "😐" if _fear_greed_index <= 60 else "😀" if _fear_greed_index <= 75 else "🤑"
+    lines.append(f"Market: <b>{regime_label}</b> (×{mult:.2f}) | F&G: {fg_icon}{_fear_greed_index}")
+    lines.append(f"BTC: 1h {btc_gap*100:+.1f}% | 1d {_btc_ema_gap_daily*100:+.1f}% | Moon {'✅' if _moonshot_gate_open else '⛔'}")
     # Strategy pauses
     pauses = []
     if _session_loss_paused_until > time.time():
@@ -4586,10 +4593,12 @@ def _cmd_config():
     elif mult > 0.80: rl = "🟢 BULL"
     else: rl = "🚀 STRONG BULL"
     mg = "✅" if _moonshot_gate_open else "⛔"
+    fg_icon = "😱" if _fear_greed_index <= 25 else "😨" if _fear_greed_index <= 40 else "😐" if _fear_greed_index <= 60 else "😀" if _fear_greed_index <= 75 else "🤑"
     telegram(
         f"⚙️ <b>Config</b>\n━━━━━━━━━━━━━━━\n"
-        f"<b>Market</b>: {rl} (×{mult:.2f}) | BTC {_btc_ema_gap_macro*100:+.1f}%\n"
-        f"Moon gate: {mg} ({MOONSHOT_BTC_EMA_GATE*100:.0f}%/{MOONSHOT_BTC_GATE_REOPEN*100:.0f}%)\n"
+        f"<b>Market</b>: {rl} (×{mult:.2f}) | F&G {fg_icon}{_fear_greed_index}\n"
+        f"BTC: 1h {_btc_ema_gap_macro*100:+.1f}% | 1d {_btc_ema_gap_daily*100:+.1f}%\n"
+        f"Moon gate: {mg} ({MOONSHOT_BTC_EMA_GATE*100:.1f}%/{MOONSHOT_BTC_GATE_REOPEN*100:.1f}%)\n"
         f"━━━━━━━━━━━━━━━\n"
         f"💰 S {SCALPER_ALLOCATION_PCT*100:.0f}% | M {MOONSHOT_ALLOCATION_PCT*100:.0f}% | T {TRINITY_ALLOCATION_PCT*100:.0f}%\n"
         f"🟢 <b>Scalper</b> ×{SCALPER_MAX_TRADES}\n"
@@ -4821,6 +4830,68 @@ def get_strategy_capital(balance: float, strategy: str) -> float:
     else:
         return balance
 
+def update_btc_daily_ema():
+    """Layer 1: Fetch BTC daily candles and compute macro EMA gap.
+    20-period daily EMA = ~1 month. This NEVER forgets a crash —
+    BTC at $66K with 20d EMA at $72K shows -8.3% gap regardless
+    of how calm the 1h chart looks."""
+    global _btc_ema_gap_daily, _btc_daily_at
+    if time.time() - _btc_daily_at < 1800:  # cache 30 min
+        return
+    try:
+        df = parse_klines("BTCUSDT", interval="1d", limit=60, min_len=25)
+        if df is None:
+            return
+        ema20 = calc_ema(df["close"], 20)
+        _btc_ema_gap_daily = (float(df["close"].iloc[-1]) / float(ema20.iloc[-1]) - 1)
+        _btc_daily_at = time.time()
+        log.info(f"📊 [MACRO] BTC daily EMA20 gap: {_btc_ema_gap_daily*100:+.1f}%")
+    except Exception as e:
+        log.debug(f"BTC daily EMA update failed: {e}")
+
+def fetch_fear_greed():
+    """Layer 2: Fetch Crypto Fear & Greed Index from alternative.me.
+    Returns 0-100 (0=extreme fear, 100=extreme greed).
+    Cached for 30 minutes."""
+    global _fear_greed_index, _fear_greed_at
+    if time.time() - _fear_greed_at < 1800:  # cache 30 min
+        return _fear_greed_index
+    try:
+        r = _get_session().get("https://api.alternative.me/fng/?limit=1", timeout=5)
+        if r.ok:
+            data = r.json().get("data", [{}])[0]
+            _fear_greed_index = int(data.get("value", 50))
+            _fear_greed_at = time.time()
+            log.info(f"📊 [MACRO] Fear & Greed: {_fear_greed_index} ({data.get('value_classification', '?')})")
+    except Exception as e:
+        log.debug(f"Fear & Greed fetch failed: {e}")
+    return _fear_greed_index
+
+def calc_adaptive_moonshot_gate() -> float:
+    """Layer 3: Self-tuning moonshot gate based on recent performance.
+    If recent moonshots are losing, tighten the gate. If winning, loosen.
+    Returns an adjustment to add to MOONSHOT_BTC_EMA_GATE."""
+    recent_moon = [t for t in trade_history
+                   if t.get("label") in ("MOONSHOT", "PRE_BREAKOUT")
+                   and not t.get("is_partial")][-8:]
+    if len(recent_moon) < 4:
+        return 0.0
+    avg_pnl = sum(t["pnl_pct"] for t in recent_moon) / len(recent_moon)
+    win_rate = sum(1 for t in recent_moon if t["pnl_pct"] > 0) / len(recent_moon)
+    # Losing streak → tighten gate (add positive value = harder to open)
+    if avg_pnl < -1.0 and win_rate < 0.35:
+        adj = 0.005  # tighten by 0.5%
+        log.debug(f"[ADAPTIVE] Moonshot gate tightened +{adj*100:.1f}% "
+                  f"(recent avg {avg_pnl:+.1f}%, WR {win_rate*100:.0f}%)")
+        return adj
+    # Winning streak → loosen gate (add negative value = easier to open)
+    elif avg_pnl > 2.0 and win_rate >= 0.50:
+        adj = -0.005  # loosen by 0.5%
+        log.debug(f"[ADAPTIVE] Moonshot gate loosened {adj*100:.1f}% "
+                  f"(recent avg {avg_pnl:+.1f}%, WR {win_rate*100:.0f}%)")
+        return adj
+    return 0.0
+
 def compute_market_regime_multiplier(df_btc: pd.DataFrame) -> float:
     """
     Compute a multiplier for entry thresholds based on BTC volatility and trend.
@@ -4859,7 +4930,33 @@ def compute_market_regime_multiplier(df_btc: pd.DataFrame) -> float:
             multiplier *= REGIME_TIGHTEN_MULT
             log.debug(f"Market regime: strong downtrend (EMA gap {ema_gap*100:.1f}%) → tighten ×{REGIME_TIGHTEN_MULT}")
 
-        return max(0.7, min(1.6, multiplier))  # clamp to 0.7–1.6
+        # Layer 1: Daily EMA macro anchor — prevents "forgetting" crashes
+        if _btc_ema_gap_daily < -0.05:       # BTC >5% below 20d EMA (crash territory)
+            multiplier *= REGIME_TIGHTEN_MULT
+            log.debug(f"Market regime: daily macro bearish ({_btc_ema_gap_daily*100:+.1f}%) → tighten ×{REGIME_TIGHTEN_MULT}")
+        elif _btc_ema_gap_daily < -0.02:     # BTC 2-5% below 20d EMA (weak)
+            multiplier *= 1.10               # mild tighten
+            log.debug(f"Market regime: daily macro weak ({_btc_ema_gap_daily*100:+.1f}%) → mild tighten ×1.10")
+        elif _btc_ema_gap_daily > 0.03:      # BTC >3% above 20d EMA (strong bull)
+            multiplier *= REGIME_TREND_MULT
+            log.debug(f"Market regime: daily macro bullish ({_btc_ema_gap_daily*100:+.1f}%) → loosen ×{REGIME_TREND_MULT}")
+
+        # Layer 2: Fear & Greed sentiment anchor
+        fg = _fear_greed_index
+        if fg <= 20:                         # extreme fear
+            multiplier *= 1.15
+            log.debug(f"Market regime: extreme fear (F&G {fg}) → tighten ×1.15")
+        elif fg <= 35:                       # fear
+            multiplier *= 1.05
+            log.debug(f"Market regime: fear (F&G {fg}) → mild tighten ×1.05")
+        elif fg >= 70:                       # greed
+            multiplier *= 0.92
+            log.debug(f"Market regime: greed (F&G {fg}) → loosen ×0.92")
+        elif fg >= 85:                       # extreme greed
+            multiplier *= 0.85
+            log.debug(f"Market regime: extreme greed (F&G {fg}) → loosen ×0.85")
+
+        return max(0.7, min(2.0, multiplier))  # wider clamp for multi-layer
     except Exception as e:
         log.debug(f"Market regime computation failed: {e}")
         return 1.0
@@ -4944,26 +5041,40 @@ def run():
     global _last_rotation_scan, _watchlist, _watchlist_at, \
            _last_rebound_rebuild, \
            _scalper_excluded, _alt_excluded, _btc_ema_gap, _btc_ema_gap_macro, \
+           _btc_ema_gap_daily, _btc_daily_at, _fear_greed_index, _fear_greed_at, \
            _streak_paused_at, _consecutive_losses, _win_rate_pause_until, \
            _paused, _fast_cycle_counter, _market_regime_mult, \
            _moonshot_gate_open, _session_loss_paused_until, \
            _strategy_loss_streaks, _strategy_paused_until
     startup_balance  = startup()
     balance          = get_available_balance()
-    # Initialize BTC macro EMA gap BEFORE first entry cycle (prevents gate race condition)
+    # Initialize ALL macro signals BEFORE first entry cycle
+    # Layer 1: Daily BTC EMA (macro anchor — never forgets crashes)
+    update_btc_daily_ema()
+    # Layer 2: Fear & Greed index
+    fetch_fear_greed()
+    # 1h BTC EMA (short-term gate)
     try:
         df_btc_init = parse_klines("BTCUSDT", interval="1h", limit=120, min_len=50)
         if df_btc_init is not None:
             btc_ema_init = calc_ema(df_btc_init["close"], BTC_REGIME_EMA_PERIOD)
             _btc_ema_gap_macro = (float(df_btc_init["close"].iloc[-1]) / float(btc_ema_init.iloc[-1]) - 1)
+            # Regime with all 3 layers now available
             _market_regime_mult = compute_market_regime_multiplier(df_btc_init)
-            if _btc_ema_gap_macro < MOONSHOT_BTC_EMA_GATE:
-                _moonshot_gate_open = False
-            log.info(f"📊 BTC 1h EMA gap: {_btc_ema_gap_macro*100:+.1f}% | "
-                     f"Regime: {_market_regime_mult:.2f}× | "
-                     f"Moon gate: {'✅' if _moonshot_gate_open else '⛔'}")
     except Exception as e:
-        log.warning(f"BTC 1h init failed: {e} — gate defaults to open")
+        log.warning(f"BTC 1h init failed: {e}")
+    # Apply moonshot gate using ALL layers (1h hysteresis + daily hard gate)
+    if _btc_ema_gap_daily < -0.05:
+        _moonshot_gate_open = False
+        log.info(f"[MOONSHOT] Gate CLOSED at startup (daily EMA {_btc_ema_gap_daily*100:+.1f}% < -5%)")
+    elif _btc_ema_gap_macro < MOONSHOT_BTC_EMA_GATE:
+        _moonshot_gate_open = False
+        log.info(f"[MOONSHOT] Gate CLOSED at startup (1h EMA {_btc_ema_gap_macro*100:+.1f}% < {MOONSHOT_BTC_EMA_GATE*100:.1f}%)")
+    fg_label = ("EXTREME FEAR" if _fear_greed_index <= 25 else "FEAR" if _fear_greed_index <= 40
+                else "NEUTRAL" if _fear_greed_index <= 60 else "GREED" if _fear_greed_index <= 75 else "EXTREME GREED")
+    log.info(f"📊 Startup: regime {_market_regime_mult:.2f}× | "
+             f"1h {_btc_ema_gap_macro*100:+.1f}% | 1d {_btc_ema_gap_daily*100:+.1f}% | "
+             f"F&G {_fear_greed_index} ({fg_label}) | Moon {'✅' if _moonshot_gate_open else '⛔'}")
     while True:
         try:
             listen_for_commands(balance)
@@ -5109,6 +5220,9 @@ def run():
                         log.warning(f"🌪️ BTC extreme volatility regime (ATR ratio {atr_ratio:.2f}) — scalper entries PAUSED")
                 except Exception as e:
                     log.debug(f"Volatility guard error: {e}")
+            # Layer 1+2: Update macro signals (cached 30min, cheap to call every cycle)
+            update_btc_daily_ema()
+            fetch_fear_greed()
             # Compute market regime multiplier (prefer 1h macro data)
             if df_btc_1h is not None:
                 _market_regime_mult = compute_market_regime_multiplier(df_btc_1h)
@@ -5288,20 +5402,33 @@ def run():
                                  round(total_value * get_effective_budget_pct("MOONSHOT") * budget_regime_mult, 2))
                     min_alt = MOONSHOT_MIN_NOTIONAL
                     if budget >= min_alt:
-                        # BTC health gate with hysteresis (P3):
-                        # Close gate at -2% (MOONSHOT_BTC_EMA_GATE)
-                        # Reopen only at -1% (MOONSHOT_BTC_GATE_REOPEN) to prevent flickering
-                        if _moonshot_gate_open:
-                            if _btc_ema_gap_macro < MOONSHOT_BTC_EMA_GATE:
+                        # Layer 1 HARD GATE: Daily EMA — if BTC is deeply below 20d EMA, no moonshots
+                        if _btc_ema_gap_daily < -0.05:
+                            btc_healthy_for_moonshot = False
+                            if _moonshot_gate_open:
                                 _moonshot_gate_open = False
-                                log.info(f"[MOONSHOT] BTC gate CLOSED (1h EMA {_btc_ema_gap_macro*100:+.1f}% < {MOONSHOT_BTC_EMA_GATE*100:.0f}%)")
+                                log.info(f"[MOONSHOT] BTC gate CLOSED by daily macro "
+                                         f"(daily EMA {_btc_ema_gap_daily*100:+.1f}% < -5%)")
                         else:
-                            if _btc_ema_gap_macro >= MOONSHOT_BTC_GATE_REOPEN:
-                                _moonshot_gate_open = True
-                                log.info(f"[MOONSHOT] BTC gate REOPENED (1h EMA {_btc_ema_gap_macro*100:+.1f}% >= {MOONSHOT_BTC_GATE_REOPEN*100:.0f}%)")
-                        btc_healthy_for_moonshot = _moonshot_gate_open
+                            # Layer 3: Adaptive gate adjustment from recent performance
+                            adaptive_adj = calc_adaptive_moonshot_gate()
+                            eff_gate   = MOONSHOT_BTC_EMA_GATE + adaptive_adj
+                            eff_reopen = MOONSHOT_BTC_GATE_REOPEN + adaptive_adj
+                            # Hysteresis on 1h EMA with adaptive adjustment
+                            if _moonshot_gate_open:
+                                if _btc_ema_gap_macro < eff_gate:
+                                    _moonshot_gate_open = False
+                                    log.info(f"[MOONSHOT] BTC gate CLOSED (1h EMA {_btc_ema_gap_macro*100:+.1f}% "
+                                             f"< gate {eff_gate*100:+.1f}%"
+                                             f"{f' adj {adaptive_adj*100:+.1f}%' if adaptive_adj else ''})")
+                            else:
+                                if _btc_ema_gap_macro >= eff_reopen:
+                                    _moonshot_gate_open = True
+                                    log.info(f"[MOONSHOT] BTC gate REOPENED (1h EMA {_btc_ema_gap_macro*100:+.1f}% "
+                                             f">= {eff_reopen*100:+.1f}%)")
+                            btc_healthy_for_moonshot = _moonshot_gate_open
                         if not btc_healthy_for_moonshot:
-                            log.debug(f"[MOONSHOT] Skipped — BTC gate closed (1h EMA {_btc_ema_gap_macro*100:+.1f}%)")
+                            log.debug(f"[MOONSHOT] Skipped — gate closed")
 
                         moon_opp = None
                         if btc_healthy_for_moonshot:
