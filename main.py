@@ -5063,10 +5063,13 @@ def run():
             _market_regime_mult = compute_market_regime_multiplier(df_btc_init)
     except Exception as e:
         log.warning(f"BTC 1h init failed: {e}")
-    # Apply moonshot gate using ALL layers (1h hysteresis + daily hard gate)
+    # Apply moonshot gate using ALL layers
     if _btc_ema_gap_daily < -0.05:
         _moonshot_gate_open = False
         log.info(f"[MOONSHOT] Gate CLOSED at startup (daily EMA {_btc_ema_gap_daily*100:+.1f}% < -5%)")
+    elif _fear_greed_index <= 20:
+        _moonshot_gate_open = False
+        log.info(f"[MOONSHOT] Gate CLOSED at startup (F&G {_fear_greed_index} = extreme fear)")
     elif _btc_ema_gap_macro < MOONSHOT_BTC_EMA_GATE:
         _moonshot_gate_open = False
         log.info(f"[MOONSHOT] Gate CLOSED at startup (1h EMA {_btc_ema_gap_macro*100:+.1f}% < {MOONSHOT_BTC_EMA_GATE*100:.1f}%)")
@@ -5402,13 +5405,21 @@ def run():
                                  round(total_value * get_effective_budget_pct("MOONSHOT") * budget_regime_mult, 2))
                     min_alt = MOONSHOT_MIN_NOTIONAL
                     if budget >= min_alt:
-                        # Layer 1 HARD GATE: Daily EMA — if BTC is deeply below 20d EMA, no moonshots
+                        # HARD GATES: block moonshot in hostile macro conditions
+                        # Gate 1: Daily EMA — BTC deeply below 20d EMA (crash territory)
+                        # Gate 2: Extreme Fear — no momentum-long trades when market is panic-selling
                         if _btc_ema_gap_daily < -0.05:
                             btc_healthy_for_moonshot = False
                             if _moonshot_gate_open:
                                 _moonshot_gate_open = False
-                                log.info(f"[MOONSHOT] BTC gate CLOSED by daily macro "
-                                         f"(daily EMA {_btc_ema_gap_daily*100:+.1f}% < -5%)")
+                                log.info(f"[MOONSHOT] Gate CLOSED — daily macro "
+                                         f"({_btc_ema_gap_daily*100:+.1f}% < -5%)")
+                        elif _fear_greed_index <= 20:
+                            btc_healthy_for_moonshot = False
+                            if _moonshot_gate_open:
+                                _moonshot_gate_open = False
+                                log.info(f"[MOONSHOT] Gate CLOSED — extreme fear "
+                                         f"(F&G {_fear_greed_index})")
                         else:
                             # Layer 3: Adaptive gate adjustment from recent performance
                             adaptive_adj = calc_adaptive_moonshot_gate()
