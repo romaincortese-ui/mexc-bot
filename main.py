@@ -3109,20 +3109,38 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             log.info(f"🔒 [{label}] Breakeven locked: {symbol} | peak +{peak_pct:.1f}% | "
                      f"SL moved to entry ${trade['entry_price']:.6f}")
 
-    # Micro TP (if enabled) — must also yield at least $1 profit
+    # Micro TP (if enabled) — dynamic ratio to guarantee minimum profit
     if (label == "MOONSHOT"
             and not trade.get("micro_tp_hit")
             and trade.get("micro_tp_price")
             and peak_pct >= MOONSHOT_MICRO_TP_PCT * 100):
-        micro_ratio = trade.get("micro_tp_ratio", MOONSHOT_MICRO_TP_RATIO)
-        micro_qty   = trade["qty"] * micro_ratio
-        micro_profit_est = micro_qty * (price - trade["entry_price"])
-        if micro_profit_est >= MICRO_TP_MIN_PROFIT:
-            log.info(f"🎯μ [{label}] Micro TP triggered: {symbol} | +{peak_pct:.1f}% | est ${micro_profit_est:.2f}")
-            return True, "MICRO_TP"
-        else:
-            log.debug(f"[{label}] Micro TP % hit but profit too low "
-                      f"(${micro_profit_est:.2f} < ${MICRO_TP_MIN_PROFIT:.2f}) — waiting")
+        gain_per_unit = price - trade["entry_price"]
+        total_qty     = trade["qty"]
+        default_ratio = trade.get("micro_tp_ratio", MOONSHOT_MICRO_TP_RATIO)
+        max_micro_ratio = 0.70  # never sell more than 70% as a "micro" TP
+
+        if gain_per_unit > 0 and total_qty > 0:
+            # Calculate minimum ratio needed to hit $1 profit (with small buffer for float precision)
+            needed_ratio = (MICRO_TP_MIN_PROFIT * 1.01) / (total_qty * gain_per_unit)
+            # Use the larger of default ratio or needed ratio, capped at 70%
+            actual_ratio = max(default_ratio, min(needed_ratio, max_micro_ratio))
+            estimated_profit = total_qty * actual_ratio * gain_per_unit
+
+            if estimated_profit >= MICRO_TP_MIN_PROFIT:
+                # Store dynamic ratio so execute_partial_tp uses it
+                trade["micro_tp_ratio"] = round(actual_ratio, 3)
+                log.info(f"🎯μ [{label}] Micro TP triggered: {symbol} | +{peak_pct:.1f}% | "
+                         f"ratio {actual_ratio*100:.0f}% ({'default' if actual_ratio <= default_ratio else 'raised'}) | "
+                         f"est ${estimated_profit:.2f}")
+                return True, "MICRO_TP"
+
+        # Position too small even at max ratio — raise SL to lock half the gain instead
+        half_gain_price = trade["entry_price"] * (1 + (pct / 100) * 0.5)
+        if half_gain_price > trade["sl_price"] * 1.002:
+            old_sl = trade["sl_price"]
+            trade["sl_price"] = round(half_gain_price, 8)
+            log.info(f"[{label}] Micro TP too small for ${MICRO_TP_MIN_PROFIT:.0f} profit "
+                     f"— SL raised ${old_sl:.6f} → ${half_gain_price:.6f} (+{pct/2:.1f}%)")
 
     # Partial TP (if enabled)
     if (label in ("MOONSHOT", "REVERSAL")
