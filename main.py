@@ -113,6 +113,8 @@ SCALPER_CONFLUENCE_BONUS = float(os.getenv("SCALPER_CONFLUENCE_BONUS", "15"))
 SCALPER_ATR_PERIOD   = 21
 SCALPER_FLAT_MINS    = int(os.getenv("SCALPER_FLAT_MINS",     "25"))
 SCALPER_FLAT_RANGE   = float(os.getenv("SCALPER_FLAT_RANGE",  "0.008"))
+SCALPER_STALL_MINS   = float(os.getenv("SCALPER_STALL_MINS",  "5"))    # no new high for this long → stall
+SCALPER_STALL_GIVEBACK = float(os.getenv("SCALPER_STALL_GIVEBACK", "0.35"))  # 35% giveback → cut
 SCALPER_ROTATE_GAP   = int(os.getenv("SCALPER_ROTATE_GAP",    "25"))
 SCALPER_MIN_VOL      = 500_000
 SCALPER_MIN_PRICE    = 0.01
@@ -2912,6 +2914,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         "sl_pct":         actual_sl,
         "tp_order_id":    tp_order_id,
         "highest_price":  actual_entry,
+        "last_new_high_at": time.time(),
         "max_hours":      max_hours,
         "opened_at":      datetime.now(timezone.utc).isoformat(),
         "score":          opp.get("score", 0),
@@ -2939,7 +2942,12 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         "partial_tp_price": partial_tp_price,
         "partial_tp_ratio": (
             SCALPER_PARTIAL_TP_RATIO  if (label == "SCALPER" and opp.get("score", 0) >= SCALPER_PARTIAL_TP_SCORE) else
+            # Regime-adaptive: sell less in bull (ride more), sell more in bear (lock profit)
+            max(0.25, MOONSHOT_PARTIAL_TP_RATIO - 0.10)  if (label == "MOONSHOT" and _market_regime_mult < 0.95) else
+            min(0.55, MOONSHOT_PARTIAL_TP_RATIO + 0.10)  if (label == "MOONSHOT" and _market_regime_mult > 1.20) else
             MOONSHOT_PARTIAL_TP_RATIO if label == "MOONSHOT" else
+            max(0.40, REVERSAL_PARTIAL_TP_RATIO - 0.15)  if (label == "REVERSAL" and _market_regime_mult < 0.95) else
+            min(0.75, REVERSAL_PARTIAL_TP_RATIO + 0.10)  if (label == "REVERSAL" and _market_regime_mult > 1.20) else
             REVERSAL_PARTIAL_TP_RATIO if label == "REVERSAL" else None
         ),
         "partial_tp_hit":   False,
@@ -3057,7 +3065,10 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             return False, ""
     pct = (price - trade["entry_price"]) / trade["entry_price"] * 100
     peak_pct = (trade["highest_price"] / trade["entry_price"] - 1) * 100
-    trade["highest_price"] = max(trade.get("highest_price", price), price)
+    old_high = trade.get("highest_price", price)
+    trade["highest_price"] = max(old_high, price)
+    if price > old_high:
+        trade["last_new_high_at"] = time.time()
     hard_sl_pct = -(trade.get("sl_pct", 0.05) * 100 + 4.0)
     if pct <= hard_sl_pct:
         log.info(f"🚨 [{label}] Hard SL: {symbol} | {pct:.2f}%")
@@ -3234,8 +3245,28 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
                     if not PAPER_TRADE and tp_order_id:
                         cancel_order(symbol, tp_order_id, label)
                     return True, "TRAILING_STOP"
-        if held_min >= SCALPER_FLAT_MINS and abs(pct) <= SCALPER_FLAT_RANGE * 100:
-            log.info(f"😴 [{label}] Flat exit: {symbol} | {pct:+.2f}%")
+        # ── PEAK STALL DETECTOR ──────────────────────────────────────
+        # If price peaked, stopped making new highs, and is giving back → cut early
+        if pct > 0.1 and peak_profit > 0.002:  # only when in profit with a real peak
+            mins_since_high = (time.time() - trade.get("last_new_high_at", time.time())) / 60
+            giveback = (trade["highest_price"] - price) / (trade["highest_price"] - trade["entry_price"]) if peak_profit > 0 else 0
+            if mins_since_high >= SCALPER_STALL_MINS and giveback >= SCALPER_STALL_GIVEBACK:
+                log.info(f"🛡️ [{label}] Peak stall: {symbol} | {pct:+.2f}% | "
+                         f"peak +{peak_profit*100:.1f}% | stall {mins_since_high:.0f}min | "
+                         f"giveback {giveback*100:.0f}%")
+                if not PAPER_TRADE and tp_order_id:
+                    cancel_order(symbol, tp_order_id, label)
+                return True, "PROTECT_STOP"
+        # Dynamic flat exit — scale timeout and range by coin's ATR
+        atr_pct   = trade.get("atr_pct") or trade.get("trail_pct") or SCALPER_TRAIL_PCT
+        atr_norm  = atr_pct / 0.01 if atr_pct > 0 else 1.0  # normalize: 1.0% ATR = 1.0×
+        # Low ATR (slow coin) → more time. High ATR (fast coin) → less time
+        dyn_flat_mins  = max(15, min(50, SCALPER_FLAT_MINS / max(0.3, atr_norm)))
+        # Scale flat range to ATR — volatile coins can chop ±2% and still be "flat"
+        dyn_flat_range = max(SCALPER_FLAT_RANGE, atr_pct * 1.5)
+        if held_min >= dyn_flat_mins and abs(pct) <= dyn_flat_range * 100:
+            log.info(f"😴 [{label}] Flat exit: {symbol} | {pct:+.2f}% | "
+                     f"{held_min:.0f}min (dyn={dyn_flat_mins:.0f}min, range ±{dyn_flat_range*100:.1f}%)")
             if not PAPER_TRADE and tp_order_id:
                 cancel_order(symbol, tp_order_id, label)
             return True, "FLAT_EXIT"
@@ -3252,6 +3283,7 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
         # Update HWM and trailing stop if price rises
         if price > trade.get("highest_price", trade["entry_price"]):
             trade["highest_price"] = price
+            trade["last_new_high_at"] = time.time()
             atr_pct = trade.get("atr_pct", 0.02)
             peak_profit = (trade["highest_price"] / trade["entry_price"] - 1)
             # Progressive trail: tightens as profit grows, adjusts for volatility
@@ -3295,15 +3327,23 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
 
     else:
         # Normal TP for non-scalper trades that haven't hit partial TP
-        if label in ("MOONSHOT", "REVERSAL", "PRE_BREAKOUT"):
+        if label in ("MOONSHOT", "REVERSAL", "PRE_BREAKOUT", "TRINITY"):
             # In bull regime: trail instead of fixed TP (captures 3-5× more on runners)
             # Also trail if SL has been ratcheted above entry (micro TP was blocked but price is up)
             sl_ratcheted = trade["sl_price"] > trade["entry_price"] * 1.005
             bull_regime  = _market_regime_mult < 0.95
             if bull_regime or sl_ratcheted:
+                # For Trinity in bull: cancel exchange TP order so trail can ride higher
+                if label == "TRINITY" and bull_regime and not PAPER_TRADE and tp_order_id:
+                    if not trade.get("_bull_tp_cancelled"):
+                        cancel_order(symbol, tp_order_id, label)
+                        trade["tp_order_id"] = None
+                        trade["_bull_tp_cancelled"] = True
+                        log.info(f"📈 [{label}] Bull regime — cancelled exchange TP to let trail ride")
                 # Progressive trail — no ceiling
                 if price > trade.get("highest_price", trade["entry_price"]):
                     trade["highest_price"] = price
+                    trade["last_new_high_at"] = time.time()
                 atr_pct = trade.get("atr_pct", 0.02)
                 peak_profit = (trade.get("highest_price", price) / trade["entry_price"] - 1)
                 if peak_profit > 0.02:  # only trail once 2%+ up
@@ -3362,6 +3402,24 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
                 and trade["sl_price"] < trade["entry_price"]):
             trade["sl_price"] = trade["entry_price"]
             log.info(f"🔄 [{label}] Weak bounce after {held_min:.0f}min — SL moved to entry")
+
+    # ── PEAK STALL for MOONSHOT/REVERSAL/PRE_BREAKOUT/TRINITY ─────
+    # After breakeven locks, if peak stalls and gives back → exit with profit
+    # More generous than scalper: 8min stall, 40% giveback (these trades need breathing room)
+    if (label in ("MOONSHOT", "REVERSAL", "PRE_BREAKOUT", "TRINITY")
+            and trade.get("breakeven_done")
+            and not trade.get("trailing_active")
+            and pct > 0.3 and peak_pct > 0.5):
+        mins_since_high = (time.time() - trade.get("last_new_high_at", time.time())) / 60
+        peak_gain = trade["highest_price"] - trade["entry_price"]
+        giveback = (trade["highest_price"] - price) / peak_gain if peak_gain > 0 else 0
+        if mins_since_high >= 8 and giveback >= 0.40:
+            log.info(f"🛡️ [{label}] Peak stall: {symbol} | {pct:+.2f}% | "
+                     f"peak +{peak_pct:.1f}% | stall {mins_since_high:.0f}min | "
+                     f"giveback {giveback*100:.0f}%")
+            if not PAPER_TRADE and tp_order_id:
+                cancel_order(symbol, tp_order_id, label)
+            return True, "PROTECT_STOP"
 
     log.info(f"👀 [{label}] {symbol} | {pct:+.2f}% | {held_min:.0f}min | "
              f"High: {((trade['highest_price']/trade['entry_price'])-1)*100:.2f}%")
