@@ -1537,10 +1537,22 @@ def _score_scalper(sym: str, strict: bool = False, btc_pulse_ratio: float = 1.0)
     crossed_now    = (ema9.iloc[-1] > ema21.iloc[-1]) and (ema9.iloc[-2] <= ema21.iloc[-2])
     crossed_recent = (ema9.iloc[-2] > ema21.iloc[-2]) and (ema9.iloc[-3] <= ema21.iloc[-3])
     crossed        = crossed_now or crossed_recent
+
+    # Hard reject: strongly falling RSI with no EMA cross = distribution (sell volume)
+    if strict and rsi_delta < -5.0 and not crossed_now:
+        log.debug(f"[SCALPER] Skip {sym} — RSI falling hard ({rsi_delta:+.1f}), likely sell volume")
+        return None
+
     ma_score       = 30 if crossed else (15 if ema9.iloc[-1] > ema21.iloc[-1] else 0)
     avg_vol        = volume.iloc[-20:-1].mean()
     vol_ratio      = (float(volume.iloc[-1]) / avg_vol) if avg_vol > 0 else 1.0
     vol_score      = min(30, (vol_ratio - 1) * 15) if vol_ratio > 1 else 0
+
+    # RSI delta penalty: falling momentum reduces vol_score effectiveness
+    rsi_delta_penalty = 0.0
+    if rsi_delta < -3.0:
+        rsi_delta_penalty = round(abs(rsi_delta) * 2, 1)  # -7.5 delta → -15pts
+        log.debug(f"[SCALPER] {sym} RSI falling ({rsi_delta:+.1f}) → -{rsi_delta_penalty:.0f}pts")
 
     if strict and not crossed_now and vol_ratio < 3.0 and rsi >= 40:
         if rsi_delta < 1.0:
@@ -1552,7 +1564,7 @@ def _score_scalper(sym: str, strict: bool = False, btc_pulse_ratio: float = 1.0)
                         if crossed_now and vol_ratio > 2.0 and rsi_delta > 0
                         else 0.0)
 
-    score          = rsi_score + ma_score + vol_score + confluence_bonus - ema50_penalty
+    score          = rsi_score + ma_score + vol_score + confluence_bonus - ema50_penalty - rsi_delta_penalty
 
     move_mat = calc_move_maturity(df5m, MATURITY_LOOKBACK)
     mat_pen  = maturity_penalty(move_mat, max(score, 1.0), MATURITY_THRESHOLD)
