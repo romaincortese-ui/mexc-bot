@@ -1,5 +1,5 @@
 """
-MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
+MEXC Trading Bot — 6 Strategies + Adaptive Learning + High-ROI Engine Upgrades
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Added features (restored in this version):
   • Fixed Trinity budget calculation (uses allocated capital, not total value)
@@ -17,7 +17,7 @@ MEXC Trading Bot — 5 Strategies + Adaptive Learning + High-ROI Engine Upgrades
       - Defensive stops (SL, trailing, timeout, etc.) cancel all orders first, then market sell
       - Moonshot TPs use a 1‑second hammer (limit → market after 1s)
       - Scalper TPs keep patient maker orders
-  • Capital allocation per strategy (Scalper 25%, Moonshot/Reversal 50%, Trinity 25%)
+  • Capital allocation per strategy (Scalper 25%, Moonshot/Reversal 45%, Trinity 20%, Grid 10%)
   • Maker orders (post-only limit) for both entry and TP to reduce fees
   • ATR-based moonshot stop-loss
   • Reduced partial TP ratio for moonshots
@@ -63,8 +63,9 @@ PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "50"))
 
 # Capital allocation (percentages of total balance)
 SCALPER_ALLOCATION_PCT   = float(os.getenv("SCALPER_ALLOCATION_PCT",   "0.25"))
-MOONSHOT_ALLOCATION_PCT  = float(os.getenv("MOONSHOT_ALLOCATION_PCT",  "0.50"))
-TRINITY_ALLOCATION_PCT   = float(os.getenv("TRINITY_ALLOCATION_PCT",   "0.25"))
+MOONSHOT_ALLOCATION_PCT  = float(os.getenv("MOONSHOT_ALLOCATION_PCT",  "0.45"))
+TRINITY_ALLOCATION_PCT   = float(os.getenv("TRINITY_ALLOCATION_PCT",   "0.20"))
+GRID_ALLOCATION_PCT      = float(os.getenv("GRID_ALLOCATION_PCT",      "0.10"))
 
 # Minimum trade size for enabling micro/partial TP (to avoid dust)
 MIN_TRADE_FOR_PARTIAL_TP = float(os.getenv("MIN_TRADE_FOR_PARTIAL_TP", "15.0"))
@@ -200,6 +201,41 @@ PRE_BREAKOUT_ACCUM_CANDLES  = int(os.getenv("PRE_BREAKOUT_ACCUM_CANDLES",    "5"
 PRE_BREAKOUT_ACCUM_PRICE_RANGE = float(os.getenv("PRE_BREAKOUT_ACCUM_PRICE_RANGE", "0.01"))
 PRE_BREAKOUT_SQUEEZE_LOOKBACK  = int(os.getenv("PRE_BREAKOUT_SQUEEZE_LOOKBACK",  "20"))
 PRE_BREAKOUT_BASE_TESTS     = int(os.getenv("PRE_BREAKOUT_BASE_TESTS",       "2"))
+
+# ── Grid (mean-reversion in range-bound markets) ─────────────
+GRID_SYMBOLS              = os.getenv("GRID_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",")
+GRID_BUDGET_PCT           = float(os.getenv("GRID_BUDGET_PCT",           "0.30"))   # per-trade % of allocated grid capital
+GRID_MAX_CONCURRENT       = int(os.getenv("GRID_MAX_CONCURRENT",        "2"))
+GRID_MAX_HOURS            = int(os.getenv("GRID_MAX_HOURS",             "12"))
+GRID_INTERVAL             = os.getenv("GRID_INTERVAL",                  "15m")
+GRID_BB_PERIOD            = int(os.getenv("GRID_BB_PERIOD",             "20"))
+GRID_BB_STD               = float(os.getenv("GRID_BB_STD",              "2.0"))
+# Range detection: BB width must be below this percentile of its own history
+GRID_BB_WIDTH_MAX_PCT     = float(os.getenv("GRID_BB_WIDTH_MAX_PCT",    "0.04"))    # 4% BB width = tight range
+GRID_BB_WIDTH_SQUEEZE_PCT = float(os.getenv("GRID_BB_WIDTH_SQUEEZE_PCT","0.50"))    # current width < 50th pctile = squeeze
+# Entry: buy when price is within this % of the lower Bollinger Band
+GRID_ENTRY_BB_ZONE        = float(os.getenv("GRID_ENTRY_BB_ZONE",       "0.20"))    # bottom 20% of BB range
+GRID_RSI_MAX              = float(os.getenv("GRID_RSI_MAX",             "45"))       # must be oversold-ish
+GRID_RSI_MIN              = float(os.getenv("GRID_RSI_MIN",             "20"))       # not in freefall
+GRID_ADX_MAX              = float(os.getenv("GRID_ADX_MAX",             "25"))       # no strong trend
+GRID_MIN_VOL              = int(os.getenv("GRID_MIN_VOL",              "500000"))   # min 24h volume
+GRID_MIN_SCORE            = int(os.getenv("GRID_MIN_SCORE",            "30"))
+# TP: target upper half of range
+GRID_TP_BB_ZONE           = float(os.getenv("GRID_TP_BB_ZONE",         "0.70"))     # TP at 70% of BB range (upper middle)
+GRID_TP_MIN               = float(os.getenv("GRID_TP_MIN",             "0.008"))    # floor 0.8% TP
+GRID_TP_MAX               = float(os.getenv("GRID_TP_MAX",             "0.025"))    # cap 2.5% TP
+GRID_SL_BB_MULT           = float(os.getenv("GRID_SL_BB_MULT",         "1.2"))      # SL at 1.2× below lower BB
+GRID_SL_MIN               = float(os.getenv("GRID_SL_MIN",             "0.010"))    # floor 1.0% SL
+GRID_SL_MAX               = float(os.getenv("GRID_SL_MAX",             "0.025"))    # cap 2.5% SL
+GRID_FLAT_MINS            = int(os.getenv("GRID_FLAT_MINS",            "60"))       # exit if stuck for 1h
+GRID_FLAT_RANGE           = float(os.getenv("GRID_FLAT_RANGE",         "0.003"))    # ±0.3% = flat
+GRID_BREAKEVEN_ACT        = float(os.getenv("GRID_BREAKEVEN_ACT",      "0.006"))    # lock BE at +0.6%
+GRID_SYMBOL_COOLDOWN      = int(os.getenv("GRID_SYMBOL_COOLDOWN",      "600"))      # 10min cooldown after exit
+# Regime gate: only activate grid when market is range-bound (regime_mult near 1.0)
+GRID_REGIME_MIN           = float(os.getenv("GRID_REGIME_MIN",         "0.85"))     # no deep bear
+GRID_REGIME_MAX           = float(os.getenv("GRID_REGIME_MAX",         "1.15"))     # no strong bull (momentum strategies work better)
+GRID_SPREAD_MAX           = float(os.getenv("GRID_SPREAD_MAX",         "0.002"))    # tight spread required for mean reversion
+GRID_RANGE_LOOKBACK       = int(os.getenv("GRID_RANGE_LOOKBACK",       "96"))       # candles for range detection (96×15m = 24h)
 
 # ── Dead coin / depth (unchanged) ─────────────────────────────
 DEAD_COIN_VOL_SCALPER     = int(os.getenv("DEAD_COIN_VOL_SCALPER",    "500000"))
@@ -354,6 +390,7 @@ log = logging.getLogger(__name__)
 trade_history        = []
 scalper_trades       = []
 alt_trades           = []
+grid_trades          = []
 last_heartbeat_at    = 0
 last_daily_summary   = ""
 last_weekly_summary  = ""
@@ -394,6 +431,7 @@ _streak_paused_at     = 0.0
 _moonshot_scan_sem = threading.Semaphore(5)
 _scalper_excluded: dict = {}
 _alt_excluded:     set  = set()
+_grid_excluded:    dict = {}      # symbol -> cooldown_until timestamp
 _trending_coins:      list  = []
 _trending_coins_at:   float = 0.0
 _social_boost_cache:  dict  = {}
@@ -489,7 +527,7 @@ async def _ws_loop():
     backoff = 2
     last_wanted = set()
     while True:
-        wanted = {t["symbol"] for t in list(scalper_trades) + list(alt_trades)}
+        wanted = {t["symbol"] for t in list(scalper_trades) + list(alt_trades) + list(grid_trades)}
         if not wanted:
             await asyncio.sleep(5)
             continue
@@ -502,7 +540,7 @@ async def _ws_loop():
                 subscribed = set()
                 last_ping = time.time()
                 while True:
-                    wanted = {t["symbol"] for t in list(scalper_trades) + list(alt_trades)}
+                    wanted = {t["symbol"] for t in list(scalper_trades) + list(alt_trades) + list(grid_trades)}
                     if wanted != last_wanted:
                         new_subs = wanted - subscribed
                         if new_subs:
@@ -565,6 +603,7 @@ def save_state():
         payload = {
             "scalper_trades":       scalper_trades,
             "alt_trades":           alt_trades,
+            "grid_trades":          grid_trades,
             "trade_history":        trade_history,
             "consecutive_losses":   _consecutive_losses,
             "win_rate_pause_until": _win_rate_pause_until,
@@ -572,6 +611,7 @@ def save_state():
             "paused":               _paused,
             "scalper_excluded":     _scalper_excluded,
             "alt_excluded":         list(_alt_excluded),
+            "grid_excluded":        _grid_excluded,
             "api_blacklist":        list(_api_blacklist),
             "liquidity_blacklist":  _liquidity_blacklist,
             "liquidity_fail_count": _liquidity_fail_count,
@@ -589,7 +629,7 @@ def save_state():
         log.warning(f"State save failed: {e}")
 
 def load_state() -> tuple:
-    defaults = ([], [], [], 0, 0.0, 0.0, False, {}, set(), set(), {}, {},
+    defaults = ([], [], [], [], 0, 0.0, 0.0, False, {}, set(), {}, set(), {}, {},
                 {"SCALPER": 0.0, "MOONSHOT": 0.0}, 0, None, None)
     try:
         if not os.path.exists(STATE_FILE):
@@ -601,11 +641,13 @@ def load_state() -> tuple:
                ).total_seconds()
         log.info(f"📂 Loading state (saved {age/60:.0f}min ago): "
                  f"{len(d.get('scalper_trades',[]))} scalper, "
-                 f"{len(d.get('alt_trades',[]))} alt trades, "
+                 f"{len(d.get('alt_trades',[]))} alt, "
+                 f"{len(d.get('grid_trades',[]))} grid trades, "
                  f"{len(d.get('trade_history',[]))} history entries")
         return (
             d.get("scalper_trades",       []),
             d.get("alt_trades",           []),
+            d.get("grid_trades",          []),
             d.get("trade_history",        []),
             d.get("consecutive_losses",   0),
             d.get("win_rate_pause_until", 0.0),
@@ -613,6 +655,7 @@ def load_state() -> tuple:
             d.get("paused",               False),
             d.get("scalper_excluded",     {}),
             set(d.get("alt_excluded",     [])),
+            d.get("grid_excluded",        {}),
             set(d.get("api_blacklist",    [])),
             d.get("liquidity_blacklist",  {}),
             d.get("liquidity_fail_count", {}),
@@ -1088,7 +1131,7 @@ def get_asset_balance(symbol: str) -> float:
     """Return total (free + locked) balance of the base asset."""
     if PAPER_TRADE:
         # For paper trading, just return the qty from the trade state
-        for t in scalper_trades + alt_trades:
+        for t in scalper_trades + alt_trades + grid_trades:
             if t["symbol"] == symbol:
                 return t["qty"]
         return 0.0
@@ -1413,6 +1456,8 @@ def classify_entry_signal(crossed_now: bool = False, vol_ratio: float = 1.0,
         return "CAPITULATION_BOUNCE"
     if label in ("TRINITY",):
         return "DEEP_DIP_RECOVERY"
+    if label in ("GRID",):
+        return "GRID_MEAN_REVERT"
     if crossed_now:
         return "CROSSOVER"
     if vol_ratio >= 3.0:
@@ -2295,6 +2340,278 @@ def find_prebreakout_opportunity(tickers: pd.DataFrame, budget: float,
                 f"Score: {best['score']:.0f} | RSI: {best['rsi']}")
     return pick_tradeable(scored, budget, "PRE_BREAKOUT")
 
+# ═══════════════════════════════════════════════════════════════
+#  GRID STRATEGY — Mean reversion in range-bound markets
+#  Buys near lower Bollinger Band in tight consolidation ranges,
+#  sells near upper BB. Thrives in exactly the choppy conditions
+#  where momentum strategies (Scalper/Moonshot) sit idle.
+# ═══════════════════════════════════════════════════════════════
+
+def calc_adx(df: pd.DataFrame, period: int = 14) -> float:
+    """Calculate Average Directional Index (trend strength indicator).
+    ADX < 20–25 = no trend (range-bound), ADX > 25 = trending."""
+    try:
+        high  = df["high"].astype(float)
+        low   = df["low"].astype(float)
+        close = df["close"].astype(float)
+        if len(df) < period + 2:
+            return 50.0  # default: assume trending to be safe
+
+        plus_dm  = high.diff()
+        minus_dm = -low.diff()
+        plus_dm  = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+        minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+
+        tr = pd.concat([
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low  - close.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+
+        atr    = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+        plus_di  = 100 * (plus_dm.ewm(alpha=1.0 / period, adjust=False).mean() / atr)
+        minus_di = 100 * (minus_dm.ewm(alpha=1.0 / period, adjust=False).mean() / atr)
+
+        dx  = (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) * 100
+        adx = dx.ewm(alpha=1.0 / period, adjust=False).mean()
+        val = float(adx.iloc[-1])
+        return val if not np.isnan(val) else 50.0
+    except Exception:
+        return 50.0
+
+def calc_bollinger_bands(close: pd.Series, period: int = 20, std_mult: float = 2.0
+                         ) -> tuple[float, float, float, float]:
+    """Returns (upper, middle, lower, bb_width_pct).
+    bb_width_pct = (upper - lower) / middle — measures range tightness."""
+    sma    = close.rolling(window=period).mean()
+    std    = close.rolling(window=period).std()
+    upper  = float(sma.iloc[-1] + std_mult * std.iloc[-1])
+    middle = float(sma.iloc[-1])
+    lower  = float(sma.iloc[-1] - std_mult * std.iloc[-1])
+    width  = (upper - lower) / middle if middle > 0 else 1.0
+    return upper, middle, lower, width
+
+def evaluate_grid_candidate(sym: str) -> dict | None:
+    """Evaluate a symbol for grid (mean-reversion) entry.
+
+    Requirements:
+    1. Bollinger Bands are tight (consolidation detected)
+    2. ADX is low (no strong trend)
+    3. RSI is in the lower zone but not in freefall
+    4. Price is near the lower Bollinger Band (buy zone)
+    5. Spread is tight enough for small moves
+
+    Returns opportunity dict or None.
+    """
+    df = parse_klines(sym, interval=GRID_INTERVAL, limit=GRID_RANGE_LOOKBACK + 10,
+                      min_len=GRID_BB_PERIOD + 5)
+    if df is None:
+        return None
+
+    close  = df["close"]
+    volume = df["volume"]
+    price_now = float(close.iloc[-1])
+    if price_now <= 0:
+        return None
+
+    # ── Bollinger Bands ──────────────────────────────────────────
+    upper, middle, lower, bb_width = calc_bollinger_bands(
+        close, period=GRID_BB_PERIOD, std_mult=GRID_BB_STD
+    )
+    if bb_width <= 0 or middle <= 0:
+        return None
+
+    # BB width must indicate consolidation (tight range)
+    if bb_width > GRID_BB_WIDTH_MAX_PCT:
+        log.debug(f"[GRID] Skip {sym} — BB too wide ({bb_width*100:.2f}% > {GRID_BB_WIDTH_MAX_PCT*100:.0f}%)")
+        return None
+
+    # Check if current BB width is below historical median (squeeze detection)
+    bb_hist = []
+    sma_hist = close.rolling(window=GRID_BB_PERIOD).mean()
+    std_hist = close.rolling(window=GRID_BB_PERIOD).std()
+    for i in range(GRID_BB_PERIOD, len(close)):
+        m = float(sma_hist.iloc[i])
+        s = float(std_hist.iloc[i])
+        if m > 0:
+            w = (2 * GRID_BB_STD * s) / m
+            bb_hist.append(w)
+    if len(bb_hist) < 10:
+        return None
+    width_percentile = sum(1 for w in bb_hist if w < bb_width) / len(bb_hist)
+    if width_percentile > GRID_BB_WIDTH_SQUEEZE_PCT:
+        log.debug(f"[GRID] Skip {sym} — BB width at {width_percentile*100:.0f}th percentile "
+                  f"(need < {GRID_BB_WIDTH_SQUEEZE_PCT*100:.0f}th)")
+        return None
+
+    # ── ADX trend filter ─────────────────────────────────────────
+    adx = calc_adx(df, period=14)
+    if adx > GRID_ADX_MAX:
+        log.debug(f"[GRID] Skip {sym} — ADX {adx:.1f} > {GRID_ADX_MAX} (trending)")
+        return None
+
+    # ── RSI filter ───────────────────────────────────────────────
+    rsi = calc_rsi(close)
+    if np.isnan(rsi):
+        return None
+    if rsi > GRID_RSI_MAX or rsi < GRID_RSI_MIN:
+        log.debug(f"[GRID] Skip {sym} — RSI {rsi:.0f} outside [{GRID_RSI_MIN:.0f}, {GRID_RSI_MAX:.0f}]")
+        return None
+
+    # ── Price position within BB (entry zone check) ──────────────
+    bb_range = upper - lower
+    if bb_range <= 0:
+        return None
+    bb_position = (price_now - lower) / bb_range   # 0.0 = at lower, 1.0 = at upper
+    if bb_position > GRID_ENTRY_BB_ZONE:
+        log.debug(f"[GRID] Skip {sym} — price at {bb_position*100:.0f}% of BB "
+                  f"(need < {GRID_ENTRY_BB_ZONE*100:.0f}% for entry)")
+        return None
+
+    # ── Volume check ─────────────────────────────────────────────
+    avg_vol  = float(volume.iloc[-20:-1].mean()) if len(volume) >= 21 else 0.0
+    curr_vol = float(volume.iloc[-1])
+    vol_ratio = round(curr_vol / avg_vol, 2) if avg_vol > 0 else 0.0
+    # Don't require high volume for grid — just need decent liquidity
+    if vol_ratio < 0.3:
+        log.debug(f"[GRID] Skip {sym} — volume too low ({vol_ratio:.1f}x)")
+        return None
+
+    # ── ATR for position sizing / SL calibration ─────────────────
+    atr     = calc_atr(df, period=14)
+    atr_pct = atr / price_now if price_now > 0 else 0.01
+
+    # ── Scoring ──────────────────────────────────────────────────
+    score = 0.0
+    # BB position: closer to lower band = higher score (max 30pts at lower band)
+    score += max(0, (GRID_ENTRY_BB_ZONE - bb_position) / GRID_ENTRY_BB_ZONE) * 30
+
+    # BB squeeze tightness: tighter = higher score (max 25pts)
+    squeeze_score = max(0, (GRID_BB_WIDTH_SQUEEZE_PCT - width_percentile) / GRID_BB_WIDTH_SQUEEZE_PCT) * 25
+    score += squeeze_score
+
+    # ADX: lower = more range-bound = higher score (max 20pts)
+    adx_score = max(0, (GRID_ADX_MAX - adx) / GRID_ADX_MAX) * 20
+    score += adx_score
+
+    # RSI: closer to lower bound (but above floor) = more oversold = higher score (max 15pts)
+    rsi_mid = (GRID_RSI_MAX + GRID_RSI_MIN) / 2
+    if rsi < rsi_mid:
+        rsi_score = max(0, (rsi_mid - rsi) / (rsi_mid - GRID_RSI_MIN)) * 15
+    else:
+        rsi_score = 0.0
+    score += rsi_score
+
+    # Volume stability bonus (steady volume = healthy range, not dead) (max 10pts)
+    vol_std = float(volume.iloc[-10:].std()) / avg_vol if avg_vol > 0 else 1.0
+    if vol_std < 0.5:  # low vol variance = stable
+        score += 10
+    elif vol_std < 0.8:
+        score += 5
+
+    score = round(min(score, 100), 2)
+    if score < GRID_MIN_SCORE:
+        log.debug(f"[GRID] Skip {sym} — score {score:.0f} < {GRID_MIN_SCORE}")
+        return None
+
+    # ── Compute TP/SL from BB geometry ───────────────────────────
+    # TP target: upper portion of BB range
+    tp_price_target = lower + bb_range * GRID_TP_BB_ZONE
+    tp_pct = (tp_price_target / price_now - 1)
+    tp_pct = max(GRID_TP_MIN, min(GRID_TP_MAX, tp_pct))
+    # Also ensure TP covers fees
+    fee_floor = calc_fee_aware_tp_floor() if 'calc_fee_aware_tp_floor' in dir() else 0.012
+    tp_pct = max(tp_pct, fee_floor)
+
+    # SL: below lower BB by a buffer
+    sl_price_target = lower * (1 - (bb_width * (GRID_SL_BB_MULT - 1)))
+    sl_pct = (price_now - sl_price_target) / price_now
+    sl_pct = max(GRID_SL_MIN, min(GRID_SL_MAX, sl_pct))
+
+    # R:R check: require at least 1.3:1
+    if sl_pct > 0 and tp_pct / sl_pct < 1.3:
+        log.debug(f"[GRID] Skip {sym} — R:R {tp_pct/sl_pct:.1f}:1 too low")
+        return None
+
+    log.info(f"📊 [GRID] {sym} | score {score:.0f} | BB pos {bb_position*100:.0f}% | "
+             f"width {bb_width*100:.2f}% (pctile {width_percentile*100:.0f}%) | "
+             f"ADX {adx:.0f} | RSI {rsi:.0f} | "
+             f"TP +{tp_pct*100:.2f}% SL -{sl_pct*100:.2f}% R:R {tp_pct/sl_pct:.1f}:1")
+    return {
+        "symbol":       sym,
+        "price":        price_now,
+        "score":        score,
+        "rsi":          round(rsi, 2),
+        "rsi_delta":    0.0,
+        "atr_pct":      round(atr_pct, 6),
+        "vol_ratio":    vol_ratio,
+        "entry_signal": "GRID_MEAN_REVERT",
+        "tp_pct":       round(tp_pct, 6),
+        "sl_pct":       round(sl_pct, 6),
+        "bb_position":  round(bb_position, 4),
+        "bb_width":     round(bb_width, 6),
+        "adx":          round(adx, 2),
+        "bb_upper":     round(upper, 8),
+        "bb_lower":     round(lower, 8),
+        "bb_middle":    round(middle, 8),
+    }
+
+def find_grid_opportunity(balance: float, exclude: dict,
+                          open_symbols: set) -> dict | None:
+    """Scan GRID_SYMBOLS for mean-reversion opportunities.
+    Only activates when market regime is neutral (not trending)."""
+    grid_count = len(grid_trades)
+    if grid_count >= GRID_MAX_CONCURRENT:
+        return None
+
+    # Regime gate: grid only works in range-bound markets
+    if _market_regime_mult < GRID_REGIME_MIN or _market_regime_mult > GRID_REGIME_MAX:
+        log.debug(f"[GRID] Skipped — regime {_market_regime_mult:.2f} "
+                  f"outside [{GRID_REGIME_MIN:.2f}, {GRID_REGIME_MAX:.2f}]")
+        return None
+
+    now_ts = time.time()
+    scored = []
+    for sym in GRID_SYMBOLS:
+        sym = sym.strip()
+        if not sym:
+            continue
+        if sym in open_symbols or sym in _api_blacklist:
+            continue
+        # Check cooldown
+        cooldown_until = exclude.get(sym, 0)
+        if now_ts < cooldown_until:
+            continue
+
+        opp = evaluate_grid_candidate(sym)
+        if opp and opp["score"] >= GRID_MIN_SCORE:
+            # Spread check
+            try:
+                depth = public_get("/api/v3/depth", {"symbol": sym, "limit": 5})
+                bids  = depth.get("bids", [])
+                asks  = depth.get("asks", [])
+                if bids and asks:
+                    best_bid = float(bids[0][0])
+                    best_ask = float(asks[0][0])
+                    mid = (best_bid + best_ask) / 2
+                    spread = (best_ask - best_bid) / mid if mid > 0 else 1.0
+                    if spread > GRID_SPREAD_MAX:
+                        log.info(f"[GRID] Skip {sym} — spread {spread*100:.3f}% "
+                                 f"> {GRID_SPREAD_MAX*100:.1f}%")
+                        continue
+            except Exception:
+                pass
+            scored.append(opp)
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    best = scored[0]
+    scanner_log(f"📊 [GRID] Top: {best['symbol']} | score {best['score']:.0f} | "
+                f"BB {best['bb_position']*100:.0f}% | ADX {best['adx']:.0f} | RSI {best['rsi']:.0f}")
+    return best
+
 def evaluate_trinity_candidate(sym: str) -> dict | None:
     df = parse_klines(sym, interval=TRINITY_INTERVAL, limit=200, min_len=50)
     if df is None:
@@ -2778,7 +3095,7 @@ def chase_limit_sell(symbol: str, qty: float, label: str, tag: str = "", timeout
 
 def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     symbol                              = opp["symbol"]
-    if any(t["symbol"] == symbol for t in scalper_trades + alt_trades):
+    if any(t["symbol"] == symbol for t in scalper_trades + alt_trades + grid_trades):
         log.warning(f"[{label}] Duplicate guard: {symbol} already in open positions — skipping")
         return None
     min_qty, step_size, min_notional, tick_size = get_symbol_rules(symbol)
@@ -2796,8 +3113,8 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         log.warning(f"[{label}] {symbol} notional ${notional:.2f} < min ${min_notional:.2f}")
         return None
     bought_at_ms = int(time.time() * 1000)
-    spread_limit = SCALPER_MAX_SPREAD if label in ("SCALPER", "TRINITY") else MOONSHOT_MAX_SPREAD
-    if label in ("SCALPER", "MOONSHOT", "TRINITY") and not PAPER_TRADE:
+    spread_limit = GRID_SPREAD_MAX if label == "GRID" else (SCALPER_MAX_SPREAD if label in ("SCALPER", "TRINITY") else MOONSHOT_MAX_SPREAD)
+    if label in ("SCALPER", "MOONSHOT", "TRINITY", "GRID") and not PAPER_TRADE:
         try:
             depth    = public_get("/api/v3/depth", {"symbol": symbol, "limit": DEPTH_BID_LEVELS})
             bids     = depth.get("bids", [])
@@ -2825,7 +3142,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
                                  f"< ${min_depth:,.0f} required = {DEPTH_BID_RATIO:.0f}× "
                                  f"${notional:.2f} position)")
                         return None
-                strategy_key = "SCALPER" if label in ("SCALPER", "TRINITY") else "MOONSHOT"
+                strategy_key = "SCALPER" if label in ("SCALPER", "TRINITY", "GRID") else "MOONSHOT"
                 check_dead_coin(symbol, 0.0, spread, strategy_key)
         except Exception:
             pass
@@ -2899,7 +3216,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
             partial_tp_price = tp_price   # now tp_price is defined
 
     # Place TP order with maker option (if enabled)
-    if label in ("SCALPER", "TRINITY"):
+    if label in ("SCALPER", "TRINITY", "GRID"):
         tp_order_id = place_limit_sell(symbol, actual_qty, tp_price, label, tag="TP", maker=USE_MAKER_ORDERS)
         if not PAPER_TRADE and not tp_order_id:
             log.warning(f"[{label}] TP limit failed — monitoring manually.")
@@ -2946,6 +3263,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
                            ) else 0.025 if label == "SCALPER"  # wider 2.5% activation for lower-confidence scalpers
                            else MOONSHOT_BREAKEVEN_ACT if label == "MOONSHOT"
                            else TRINITY_BREAKEVEN_ACT if label == "TRINITY"
+                           else GRID_BREAKEVEN_ACT if label == "GRID"
                            else None),
         "breakeven_done": False,
         "micro_tp_price": micro_tp_price,
@@ -2971,7 +3289,7 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
     }
 
     mode         = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
-    icon         = {"SCALPER":"🟢","MOONSHOT":"🌙","REVERSAL":"🔄","TRINITY":"🔱","PRE_BREAKOUT":"🔮"}.get(label,"🟢")
+    icon         = {"SCALPER":"🟢","MOONSHOT":"🌙","REVERSAL":"🔄","TRINITY":"🔱","PRE_BREAKOUT":"🔮","GRID":"📊"}.get(label,"🟢")
     slippage_line = ""
     if actual_fills.get("avg_buy_price") and abs(actual_entry - price) > 0.000001:
         slippage_pct  = (actual_entry / price - 1) * 100
@@ -2991,6 +3309,8 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         exit_plan += "Floor & Chase"
     elif label == "SCALPER":
         exit_plan += "trail"
+    elif label == "GRID":
+        exit_plan += "BB trail"
     exit_line = f"Exit: {exit_plan}\n" if exit_plan else ""
     # Score line
     score_parts = [f"Score {opp.get('score',0):.0f}",
@@ -3299,6 +3619,53 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
                 if not PAPER_TRADE and tp_order_id:
                     cancel_order(symbol, tp_order_id, label)
                 return True, "ROTATION"
+
+    # ── GRID EXIT LOGIC ──────────────────────────────────────────
+    if label == "GRID":
+        # TP limit fill detection (same as SCALPER)
+        if not PAPER_TRADE and tp_order_id:
+            near_tp = price >= trade["tp_price"] * 0.98
+            if near_tp and tp_order_id not in get_open_order_ids(symbol):
+                if price >= trade["tp_price"] * 0.995:
+                    log.info(f"🎯 [{label}] TP limit filled: {symbol}")
+                    return True, "TAKE_PROFIT"
+                else:
+                    log.warning(f"⚠️ [{label}] TP order vanished but price ${price:.6f} "
+                                f"never reached TP ${trade['tp_price']:.6f} — monitoring manually.")
+                    trade["tp_order_id"] = None
+        if PAPER_TRADE or not tp_order_id:
+            if price >= trade["tp_price"]:
+                log.info(f"🎯 [{label}] TP: {symbol} | +{pct:.2f}%")
+                return True, "TAKE_PROFIT"
+        # Simple trailing: once profit > 0.8%, trail at progressive rate
+        atr_pct = trade.get("atr_pct", 0.01)
+        peak_profit = (trade["highest_price"] / trade["entry_price"] - 1)
+        if peak_profit >= 0.008:  # 0.8% profit = trail activated
+            trail_pct = max(0.004, min(0.012, atr_pct * 0.8))  # tight trail for small moves
+            if price <= trade["highest_price"] * (1 - trail_pct):
+                log.info(f"📉 [{label}] Trail stop: {symbol} | {pct:+.2f}% | "
+                         f"peak +{peak_profit*100:.1f}% | trail {trail_pct*100:.2f}%")
+                if not PAPER_TRADE and tp_order_id:
+                    cancel_order(symbol, tp_order_id, label)
+                return True, "TRAILING_STOP"
+        # Flat exit: no progress after GRID_FLAT_MINS
+        if held_min >= GRID_FLAT_MINS and abs(pct) <= GRID_FLAT_RANGE * 100:
+            log.info(f"😴 [{label}] Flat exit: {symbol} | {pct:+.2f}% | {held_min:.0f}min")
+            if not PAPER_TRADE and tp_order_id:
+                cancel_order(symbol, tp_order_id, label)
+            return True, "FLAT_EXIT"
+        # Peak stall: meaningful peak but giving back
+        if pct >= 0 and peak_profit > 0.003:
+            mins_since_high = (time.time() - trade.get("last_new_high_at", time.time())) / 60
+            peak_gain = trade["highest_price"] - trade["entry_price"]
+            giveback = (trade["highest_price"] - price) / peak_gain if peak_gain > 0 else 0
+            if mins_since_high >= 8 and giveback >= 0.50:
+                log.info(f"🛡️ [{label}] Peak stall: {symbol} | {pct:+.2f}% | "
+                         f"peak +{peak_profit*100:.1f}% | stall {mins_since_high:.0f}min | "
+                         f"giveback {giveback*100:.0f}%")
+                if not PAPER_TRADE and tp_order_id:
+                    cancel_order(symbol, tp_order_id, label)
+                return True, "PROTECT_STOP"
 
     # ── FLOOR & CHASE EXIT (for MOONSHOT, REVERSAL, PRE_BREAKOUT) ──
     elif label in ("MOONSHOT", "REVERSAL", "PRE_BREAKOUT") and trade.get("trailing_active"):
@@ -3927,8 +4294,8 @@ def close_position(trade, reason) -> bool:
             _consecutive_losses += 1
         else:
             _consecutive_losses = 0
-    # P6: Per-strategy loss streak (Trinity/Reversal crash guard)
-    if label in ("TRINITY", "REVERSAL"):
+    # P6: Per-strategy loss streak (Trinity/Reversal/Grid crash guard)
+    if label in ("TRINITY", "REVERSAL", "GRID"):
         if pnl_pct <= 0:
             _strategy_loss_streaks[label] = _strategy_loss_streaks.get(label, 0) + 1
             streak = _strategy_loss_streaks[label]
@@ -4041,8 +4408,12 @@ def send_heartbeat(balance: float):
         alt_lines.append(f"  {ic} {t['symbol']} {pct:+.2f}%{fc}" if pct is not None else f"  {ic} {t['symbol']}")
     if not alt_trades:
         alt_lines.append(f"  {'👀 ' + last_top_alt['symbol'] if last_top_alt else 'scanning...'}")
+    grid_lines = []
+    for t in grid_trades:
+        _, pct = _trade_price_pct(t)
+        grid_lines.append(f"  📊 {t['symbol']} {pct:+.2f}%" if pct is not None else f"  📊 {t['symbol']}")
     total_value = balance
-    for t in scalper_trades + alt_trades:
+    for t in scalper_trades + alt_trades + grid_trades:
         px, _ = _trade_price_pct(t)
         total_value += px * t["qty"] if px else t.get("budget_used", 0)
     fg_icon = "😱" if _fear_greed_index <= 25 else "😨" if _fear_greed_index <= 40 else "😐" if _fear_greed_index <= 60 else "😀" if _fear_greed_index <= 75 else "🤑"
@@ -4058,6 +4429,8 @@ def send_heartbeat(balance: float):
         + "\n".join(scalper_lines) + "\n"
         + f"Alt ({len(alt_trades)}):\n"
         + "\n".join(alt_lines) + "\n"
+        + (f"Grid ({len(grid_trades)}/{GRID_MAX_CONCURRENT}):\n"
+           + "\n".join(grid_lines) + "\n" if grid_trades else "")
         + f"━━━━━━━━━━━━━━━\n"
         f"Today: {trades_today}t | <i>/status /pnl /config</i>"
     )
@@ -4235,7 +4608,7 @@ def send_daily_summary(balance: float):
         total = sum(t["pnl_usdt"] for t in trade_history)
         telegram(f"📅 <b>Daily</b> [{mode}]\n━━━━━━━━━━━━━━━"
                  + block("SCALPER") + block("MOONSHOT") + block("REVERSAL")
-                 + block("TRINITY") + block("PRE_BREAKOUT")
+                 + block("TRINITY") + block("PRE_BREAKOUT") + block("GRID")
                  + f"\n━━━━━━━━━━━━━━━\nP&L <b>${total:+.2f}</b> | Bal <b>${balance:.2f}</b>")
         return
     try:
@@ -4353,7 +4726,7 @@ def _cmd_status(balance: float):
     pauses = []
     if _session_loss_paused_until > time.time():
         pauses.append(f"📛 All entries paused ({(_session_loss_paused_until - time.time())/60:.0f}min)")
-    for lbl in ("TRINITY", "REVERSAL"):
+    for lbl in ("TRINITY", "REVERSAL", "GRID"):
         until = _strategy_paused_until.get(lbl, 0)
         if until > time.time():
             pauses.append(f"🛑 {lbl} paused ({(until - time.time())/60:.0f}min)")
@@ -4384,6 +4757,13 @@ def _cmd_status(balance: float):
             lines.append(f"{t['label']}: {t['symbol']} (unavailable)")
     if not alt_trades:
         lines.append("Alt: scanning...")
+    for t in grid_trades:
+        _, pct = _trade_price_pct(t)
+        if pct is not None:
+            lines.append(f"📊 <b>{t['symbol']}</b> | {pct:+.2f}% | "
+                         f"TP: ${t['tp_price']:.6f} | SL: ${t['sl_price']:.6f}")
+        else:
+            lines.append(f"📊 {t['symbol']} (unavailable)")
     lines.append(f"━━━━━━━━━━━━━━━\nBalance: <b>${balance:.2f} USDT</b>")
     telegram("\n".join(lines))
 
@@ -4431,7 +4811,7 @@ def _compute_metrics(trades: list, since_label: str = "all-time") -> dict:
             pass
     avg_hold_min = sum(hold_times) / len(hold_times) if hold_times else 0.0
     by_label = {}
-    for lbl in ("SCALPER", "MOONSHOT", "REVERSAL", "TRINITY", "PRE_BREAKOUT"):
+    for lbl in ("SCALPER", "MOONSHOT", "REVERSAL", "TRINITY", "PRE_BREAKOUT", "GRID"):
         lt = [t for t in full if t.get("label") == lbl]
         if not lt:
             continue
@@ -4509,8 +4889,8 @@ def _cmd_pnl(balance: float):
 
     def _strategy_line(trades: list) -> str:
         lines = []
-        icons = {"SCALPER": "🟢", "MOONSHOT": "🌙", "REVERSAL": "🔄", "TRINITY": "🔱", "PRE_BREAKOUT": "🔮"}
-        for lbl in ("SCALPER", "MOONSHOT", "REVERSAL", "TRINITY", "PRE_BREAKOUT"):
+        icons = {"SCALPER": "🟢", "MOONSHOT": "🌙", "REVERSAL": "🔄", "TRINITY": "🔱", "PRE_BREAKOUT": "🔮", "GRID": "📊"}
+        for lbl in ("SCALPER", "MOONSHOT", "REVERSAL", "TRINITY", "PRE_BREAKOUT", "GRID"):
             lt = [t for t in trades if t.get("label") == lbl]
             if not lt:
                 continue
@@ -4551,7 +4931,7 @@ def _cmd_pnl(balance: float):
     # Open positions
     open_pnl = 0.0
     open_lines = []
-    for t in scalper_trades + alt_trades:
+    for t in scalper_trades + alt_trades + grid_trades:
         px, pct = _trade_price_pct(t)
         if px and pct is not None:
             unrealized = (px - t["entry_price"]) * t["qty"]
@@ -4596,7 +4976,7 @@ def _cmd_metrics(balance: float):
         f"Total P&L:   <b>${m['total_pnl']:+.2f}</b>  |  Max DD: <b>-${m['max_drawdown']:.2f}</b>",
         f"Balance:     <b>${balance:.2f}</b>",
     ]
-    icons = {"SCALPER": "🟢", "MOONSHOT": "🌙", "REVERSAL": "🔄", "TRINITY": "🔱", "PRE_BREAKOUT": "🔮"}
+    icons = {"SCALPER": "🟢", "MOONSHOT": "🌙", "REVERSAL": "🔄", "TRINITY": "🔱", "PRE_BREAKOUT": "🔮", "GRID": "📊"}
     if m["by_label"]:
         lines.append("━━━━━━━━━━━━━━━")
         for lbl, s in m["by_label"].items():
@@ -4713,6 +5093,9 @@ def _cmd_close():
     for t in alt_trades[:]:
         if close_position(t, "STOP_LOSS"):
             alt_trades.remove(t); closed += 1
+    for t in grid_trades[:]:
+        if close_position(t, "STOP_LOSS"):
+            grid_trades.remove(t); closed += 1
     telegram(f"✅ Closed {closed} position(s).")
 
 def _cmd_restart():
@@ -4747,7 +5130,7 @@ def _cmd_ask(question: str, balance: float):
                 f"score={t.get('score',0):.0f} rsi={t.get('rsi',0):.0f} held={held}min"
             )
     open_ctx = []
-    for t in scalper_trades + alt_trades:
+    for t in scalper_trades + alt_trades + grid_trades:
         try:
             px  = ws_price(t["symbol"]) or float(public_get("/api/v3/ticker/price", {"symbol": t["symbol"]})["price"])
             pct = (px - t["entry_price"]) / t["entry_price"] * 100
@@ -4821,16 +5204,16 @@ def listen_for_commands(balance: float):
 
 def reconcile_open_positions():
     if PAPER_TRADE:
-        if scalper_trades or alt_trades:
-            log.info(f"✅ [PAPER] Restored {len(scalper_trades)} scalper + {len(alt_trades)} alt trades.")
+        if scalper_trades or alt_trades or grid_trades:
+            log.info(f"✅ [PAPER] Restored {len(scalper_trades)} scalper + {len(alt_trades)} alt + {len(grid_trades)} grid trades.")
         return
     try:
         # IMPORTANT: Use free+locked to avoid thinking positions are closed when they have open limit orders
         balances = {b["asset"]: float(b.get("free", 0)) + float(b.get("locked", 0))
                     for b in private_get("/api/v3/account").get("balances", [])}
-        if scalper_trades or alt_trades:
+        if scalper_trades or alt_trades or grid_trades:
             stale = []
-            for trade in list(scalper_trades + alt_trades):
+            for trade in list(scalper_trades + alt_trades + grid_trades):
                 asset = trade["symbol"].replace("USDT", "")
                 held  = balances.get(asset, 0.0)
                 expected_qty = trade.get("qty", 0)
@@ -4845,6 +5228,8 @@ def reconcile_open_positions():
                         scalper_trades.remove(trade)
                     if trade in alt_trades:
                         alt_trades.remove(trade)
+                    if trade in grid_trades:
+                        grid_trades.remove(trade)
                     trade_history.append({
                         **{k: v for k, v in trade.items() if not k.startswith("_")},
                         "exit_price":   trade.get("entry_price", 0),
@@ -4865,11 +5250,11 @@ def reconcile_open_positions():
                     f"⚠️ <b>Positions closed offline</b>\n"
                     f"{', '.join(syms)} — check MEXC for P&L"
                 )
-            elif scalper_trades or alt_trades:
-                log.info(f"✅ Restored {len(scalper_trades)} scalper + {len(alt_trades)} alt trades "
-                         f"— exchange balances confirmed.")
+            elif scalper_trades or alt_trades or grid_trades:
+                log.info(f"✅ Restored {len(scalper_trades)} scalper + {len(alt_trades)} alt + "
+                         f"{len(grid_trades)} grid trades — exchange balances confirmed.")
         if balances:
-            known_assets = {t["symbol"].replace("USDT", "") for t in scalper_trades + alt_trades}
+            known_assets = {t["symbol"].replace("USDT", "") for t in scalper_trades + alt_trades + grid_trades}
             candidates   = [a for a, q in balances.items()
                             if a not in ("USDT", "MX") and a not in known_assets and q > 0]
             if candidates:
@@ -4890,7 +5275,7 @@ def reconcile_open_positions():
         open_orders = private_get("/api/v3/openOrders", {})
         if not open_orders:
             return
-        known_symbols = {t["symbol"] for t in scalper_trades + alt_trades}
+        known_symbols = {t["symbol"] for t in scalper_trades + alt_trades + grid_trades}
         orphan_orders = [o for o in open_orders if o["symbol"] not in known_symbols]
         if orphan_orders:
             syms = list({o["symbol"] for o in orphan_orders})
@@ -4907,6 +5292,8 @@ def get_strategy_capital(balance: float, strategy: str) -> float:
         return balance * MOONSHOT_ALLOCATION_PCT
     elif strategy == "TRINITY":
         return balance * TRINITY_ALLOCATION_PCT
+    elif strategy == "GRID":
+        return balance * GRID_ALLOCATION_PCT
     else:
         return balance
 
@@ -5061,9 +5448,9 @@ def flush_telegram_updates():
         log.debug(f"Telegram flush failed: {e}")
 
 def startup() -> float:
-    global scalper_trades, alt_trades, trade_history, _consecutive_losses, \
+    global scalper_trades, alt_trades, grid_trades, trade_history, _consecutive_losses, \
            _win_rate_pause_until, _streak_paused_at, _paused, \
-           _scalper_excluded, _alt_excluded, _api_blacklist, \
+           _scalper_excluded, _alt_excluded, _grid_excluded, _api_blacklist, \
            _liquidity_blacklist, _liquidity_fail_count, \
            _adaptive_offsets, _last_rebalance_count, \
            _dynamic_scalper_budget, _dynamic_moonshot_budget
@@ -5071,9 +5458,9 @@ def startup() -> float:
     log.info(f"🚀 MEXC Bot — {mode}")
     flush_telegram_updates()  # clear stale commands (e.g. /restart) before processing
     _load_symbol_rules()
-    (scalper_trades, alt_trades, trade_history,
+    (scalper_trades, alt_trades, grid_trades, trade_history,
      _consecutive_losses, _win_rate_pause_until, _streak_paused_at,
-     _paused, _scalper_excluded, _alt_excluded, _api_blacklist,
+     _paused, _scalper_excluded, _alt_excluded, _grid_excluded, _api_blacklist,
      _liquidity_blacklist, _liquidity_fail_count,
      _adaptive_offsets, _last_rebalance_count,
      _dynamic_scalper_budget, _dynamic_moonshot_budget) = load_state()
@@ -5097,7 +5484,8 @@ def startup() -> float:
         f"🚀 <b>MEXC Bot Started</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━\n"
         f"💰 <b>${startup_balance:.2f}</b> | "
-        f"S {SCALPER_ALLOCATION_PCT*100:.0f}% M {MOONSHOT_ALLOCATION_PCT*100:.0f}% T {TRINITY_ALLOCATION_PCT*100:.0f}%\n"
+        f"S {SCALPER_ALLOCATION_PCT*100:.0f}% M {MOONSHOT_ALLOCATION_PCT*100:.0f}% "
+        f"T {TRINITY_ALLOCATION_PCT*100:.0f}% G {GRID_ALLOCATION_PCT*100:.0f}%\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🟢 Scalper × {SCALPER_MAX_TRADES} | TP {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% | "
         f"SL {SCALPER_SL_MIN*100:.1f}–{SCALPER_SL_MAX*100:.0f}% | trail prog\n"
@@ -5108,6 +5496,8 @@ def startup() -> float:
         f"🔄 Reversal | TP +{REVERSAL_TP*100:.1f}% | "
         f"SL cap-anchored | {REVERSAL_MAX_HOURS}h\n"
         f"🔮 Pre-breakout | TP +{PRE_BREAKOUT_TP*100:.0f}% | {PRE_BREAKOUT_MAX_HOURS}h\n"
+        f"📊 Grid × {GRID_MAX_CONCURRENT} | {GRID_INTERVAL} BB{GRID_BB_PERIOD} | "
+        f"TP +{GRID_TP_MIN*100:.1f}–{GRID_TP_MAX*100:.1f}% | {GRID_MAX_HOURS}h\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🛡️ BTC gate {MOONSHOT_BTC_EMA_GATE*100:.0f}%/{MOONSHOT_BTC_GATE_REOPEN*100:.0f}% | "
         f"CB {MAX_CONSECUTIVE_LOSSES}L | Session -{SESSION_LOSS_PAUSE_PCT*100:.0f}%\n"
@@ -5120,7 +5510,7 @@ def startup() -> float:
 def run():
     global _last_rotation_scan, _watchlist, _watchlist_at, \
            _last_rebound_rebuild, \
-           _scalper_excluded, _alt_excluded, _btc_ema_gap, _btc_ema_gap_macro, \
+           _scalper_excluded, _alt_excluded, _grid_excluded, _btc_ema_gap, _btc_ema_gap_macro, \
            _btc_ema_gap_daily, _btc_daily_at, _fear_greed_index, _fear_greed_at, \
            _streak_paused_at, _consecutive_losses, _win_rate_pause_until, \
            _paused, _fast_cycle_counter, _market_regime_mult, \
@@ -5166,9 +5556,10 @@ def run():
             scalper_capital   = get_strategy_capital(balance, "SCALPER")
             moonshot_capital  = get_strategy_capital(balance, "MOONSHOT")
             trinity_capital   = get_strategy_capital(balance, "TRINITY")
+            grid_capital      = get_strategy_capital(balance, "GRID")
 
             _load_symbol_rules()
-            all_trades   = scalper_trades + alt_trades
+            all_trades   = scalper_trades + alt_trades + grid_trades
             open_symbols = {t["symbol"] for t in all_trades}
             total_value = balance
             for t in all_trades:
@@ -5581,6 +5972,40 @@ def run():
                                     _alt_excluded = set()
                                 else:
                                     _alt_excluded.discard(opp["symbol"])
+
+            # ── GRID ENTRY (independent of alt slots — has own capital pool) ──
+            grid_strategy_paused = _strategy_paused_until.get("GRID", 0) > time.time()
+            if (not _paused and not session_paused and not over_exposed
+                    and not grid_strategy_paused
+                    and len(grid_trades) < GRID_MAX_CONCURRENT):
+                # Clean up expired cooldowns
+                now_ts = time.time()
+                expired = [s for s, t in _grid_excluded.items() if t <= now_ts]
+                for s in expired:
+                    del _grid_excluded[s]
+                used_grid = sum(t["budget_used"] for t in grid_trades)
+                available_grid = grid_capital - used_grid
+                if available_grid > 0:
+                    opp = find_grid_opportunity(available_grid,
+                                                exclude=_grid_excluded,
+                                                open_symbols=open_symbols)
+                    if opp:
+                        grid_budget = max(MOONSHOT_MIN_NOTIONAL, min(
+                            round(grid_capital * GRID_BUDGET_PCT, 2), available_grid))
+                        trade = open_position(opp, grid_budget,
+                                              opp["tp_pct"], opp["sl_pct"],
+                                              "GRID", max_hours=GRID_MAX_HOURS)
+                        if trade:
+                            grid_trades.append(trade)
+
+            # ── GRID EXITS ──────────────────────────────────────────────
+            for trade in grid_trades[:]:
+                should_exit, reason = check_exit(trade)
+                if should_exit:
+                    _grid_excluded[trade["symbol"]] = time.time() + GRID_SYMBOL_COOLDOWN
+                    if close_position(trade, reason):
+                        grid_trades.remove(trade)
+
             # Alt exits
             for trade in alt_trades[:]:
                 should_exit, reason = check_exit(trade)
@@ -5619,7 +6044,7 @@ def run():
                                 break
                     except Exception:
                         pass
-            if scalper_trades:
+            if scalper_trades or grid_trades:
                 time.sleep(2)
             elif alt_trades and alt_near_target:
                 if _fast_cycle_counter < MAX_FAST_CYCLES:
@@ -5637,7 +6062,7 @@ def run():
         except KeyboardInterrupt:
             log.info("🛑 Stopped.")
             save_state()
-            for t in scalper_trades + alt_trades:
+            for t in scalper_trades + alt_trades + grid_trades:
                 log.warning(f"⚠️  Holding {t['symbol']} ({t['label']}) — close manually if live!")
             telegram("🛑 <b>Bot stopped.</b> Check Railway.")
             break
