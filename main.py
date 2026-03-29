@@ -3259,13 +3259,23 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
                     return True, "TRAILING_STOP"
         # ── PEAK STALL DETECTOR ──────────────────────────────────────
         # If price peaked, stopped making new highs, and is giving back → cut early
-        if pct > 0.1 and peak_profit > 0.002:  # only when in profit with a real peak
+        # Check peak was meaningful (>0.3%), still above entry, and stall + giveback confirm
+        if pct >= 0 and peak_profit > 0.003:  # still above entry with a real peak (+0.3%+)
             mins_since_high = (time.time() - trade.get("last_new_high_at", time.time())) / 60
-            giveback = (trade["highest_price"] - price) / (trade["highest_price"] - trade["entry_price"]) if peak_profit > 0 else 0
+            peak_gain = trade["highest_price"] - trade["entry_price"]
+            giveback = (trade["highest_price"] - price) / peak_gain if peak_gain > 0 else 0
+            # Two tiers: fast cut for large giveback, slower for moderate
             if mins_since_high >= SCALPER_STALL_MINS and giveback >= SCALPER_STALL_GIVEBACK:
                 log.info(f"🛡️ [{label}] Peak stall: {symbol} | {pct:+.2f}% | "
                          f"peak +{peak_profit*100:.1f}% | stall {mins_since_high:.0f}min | "
                          f"giveback {giveback*100:.0f}%")
+                if not PAPER_TRADE and tp_order_id:
+                    cancel_order(symbol, tp_order_id, label)
+                return True, "PROTECT_STOP"
+            # Rapid giveback: peak was real but price dropped fast (>60% giveback in 3min)
+            if mins_since_high >= 3 and giveback >= 0.60 and peak_profit > 0.004:
+                log.info(f"🛡️ [{label}] Rapid giveback: {symbol} | {pct:+.2f}% | "
+                         f"peak +{peak_profit*100:.1f}% | {giveback*100:.0f}% given back in {mins_since_high:.0f}min")
                 if not PAPER_TRADE and tp_order_id:
                     cancel_order(symbol, tp_order_id, label)
                 return True, "PROTECT_STOP"
