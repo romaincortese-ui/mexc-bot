@@ -146,6 +146,18 @@ SCALPER_SL_MULT_DEFAULT   = float(os.getenv("SCALPER_SL_MULT_DEFAULT", "1.3"))
 SCALPER_SL_NOISE_MULT     = 2.0
 SCALPER_SL_MAX            = 0.04
 SCALPER_SL_MIN            = 0.015
+STOP_CONFIRM_SECS         = int(os.getenv("STOP_CONFIRM_SECS", "20"))
+STOP_CONFIRM_MIN_BUFFER   = float(os.getenv("STOP_CONFIRM_MIN_BUFFER", "0.0010"))
+STOP_CONFIRM_MAX_BUFFER   = float(os.getenv("STOP_CONFIRM_MAX_BUFFER", "0.0035"))
+STOP_CONFIRM_ATR_MULT     = float(os.getenv("STOP_CONFIRM_ATR_MULT", "0.30"))
+STOP_CONFIRM_CANDLE_MULT  = float(os.getenv("STOP_CONFIRM_CANDLE_MULT", "0.60"))
+STOP_CONFIRM_EARLY_MINS   = float(os.getenv("STOP_CONFIRM_EARLY_MINS", "18"))
+SCALPER_STOP_CONFIRM_SECS = int(os.getenv("SCALPER_STOP_CONFIRM_SECS", str(STOP_CONFIRM_SECS)))
+GRID_STOP_CONFIRM_SECS    = int(os.getenv("GRID_STOP_CONFIRM_SECS", "30"))
+TRINITY_STOP_CONFIRM_SECS = int(os.getenv("TRINITY_STOP_CONFIRM_SECS", "45"))
+REVERSAL_STOP_CONFIRM_SECS = int(os.getenv("REVERSAL_STOP_CONFIRM_SECS", "60"))
+MOONSHOT_STOP_CONFIRM_SECS = int(os.getenv("MOONSHOT_STOP_CONFIRM_SECS", "90"))
+PREBREAKOUT_STOP_CONFIRM_SECS = int(os.getenv("PREBREAKOUT_STOP_CONFIRM_SECS", "75"))
 
 # ── Watchlist / BTC pulse ─────────────────────────────────────
 WATCHLIST_SIZE      = 30
@@ -253,6 +265,13 @@ PROG_TRAIL_TIGHTEN     = float(os.getenv("PROG_TRAIL_TIGHTEN",      "0.25"))    
 PROG_TRAIL_VOL_ANCHOR  = float(os.getenv("PROG_TRAIL_VOL_ANCHOR",   "0.020"))   # ATR reference for vol adjustment
 PROG_TRAIL_VOL_MIN     = float(os.getenv("PROG_TRAIL_VOL_MIN",      "0.70"))    # min vol multiplier (low-vol coins)
 PROG_TRAIL_VOL_MAX     = float(os.getenv("PROG_TRAIL_VOL_MAX",      "1.40"))    # max vol multiplier (high-vol coins)
+TRAIL_BULL_MULT        = float(os.getenv("TRAIL_BULL_MULT",         "1.22"))
+TRAIL_BEAR_MULT        = float(os.getenv("TRAIL_BEAR_MULT",         "0.90"))
+TRAIL_SENTIMENT_MIN    = float(os.getenv("TRAIL_SENTIMENT_MIN",     "0.60"))
+TRAIL_SOCIAL_MIN       = float(os.getenv("TRAIL_SOCIAL_MIN",        "12.0"))
+TRAIL_SOCIAL_MULT      = float(os.getenv("TRAIL_SOCIAL_MULT",       "1.28"))
+TRAIL_DECAY_START      = float(os.getenv("TRAIL_DECAY_START",       "0.60"))
+TRAIL_DECAY_MIN_MULT   = float(os.getenv("TRAIL_DECAY_MIN_MULT",    "0.72"))
 # Scalper progressive trail
 SCALPER_PROG_CEILING   = float(os.getenv("SCALPER_PROG_CEILING",    "0.035"))   # trail % at low profit
 SCALPER_PROG_FLOOR     = float(os.getenv("SCALPER_PROG_FLOOR",      "0.012"))   # minimum trail % for runners
@@ -448,6 +467,12 @@ _strategy_paused_until: dict = {}   # {"TRINITY": timestamp, ...}
 _fast_cycle_counter = 0
 MAX_FAST_CYCLES = 10
 _market_regime_mult = 1.0   # default neutral
+_account_snapshot_lock = threading.Lock()
+_account_snapshot_cache = {"at": 0.0, "free_usdt": 0.0, "total_equity": 0.0}
+ACCOUNT_SNAPSHOT_TTL = 10.0
+_session_pnl_anchor_equity: float | None = None
+_daily_pnl_anchor_equity: float | None = None
+_daily_pnl_anchor_date = ""
 
 # ── Alert de‑duplication ─────────────────────────────────────
 _last_error_time: dict = {}      # symbol -> last time an error alert was sent
@@ -467,7 +492,8 @@ def calculate_true_breakeven(entry_price: float) -> float:
 
 def calc_progressive_trail(peak_profit: float, atr_pct: float,
                            ceiling: float = None, floor: float = None,
-                           tighten: float = None, strategy: str = "MOONSHOT") -> float:
+                           tighten: float = None, strategy: str = "MOONSHOT",
+                           trade: dict | None = None, held_min: float | None = None) -> float:
     """
     Compute a trail % that tightens smoothly as profit grows, and widens for volatile coins.
 
@@ -495,6 +521,36 @@ def calc_progressive_trail(peak_profit: float, atr_pct: float,
     vol_adj   = max(PROG_TRAIL_VOL_MIN, min(PROG_TRAIL_VOL_MAX, vol_ratio))
 
     result = base * vol_adj
+
+    # Regime adjustment: let winners breathe more in bull, tighten faster in bear.
+    if strategy != "SCALPER":
+        if _market_regime_mult < 0.95:
+            result *= TRAIL_BULL_MULT
+        elif _market_regime_mult > 1.10:
+            result *= TRAIL_BEAR_MULT
+
+    if trade:
+        # Strong social/sentiment momentum on moonshots deserves more room.
+        if strategy == "MOONSHOT":
+            sentiment = float(trade.get("sentiment") or 0.0)
+            social_boost = float(trade.get("social_boost") or 0.0)
+            if sentiment >= TRAIL_SENTIMENT_MIN or social_boost >= TRAIL_SOCIAL_MIN:
+                boost = max(1.0,
+                            min(1.40,
+                                max(TRAIL_SOCIAL_MULT,
+                                    1.0 + max(sentiment - TRAIL_SENTIMENT_MIN, 0.0) * 0.20,
+                                    1.0 + max(social_boost - TRAIL_SOCIAL_MIN, 0.0) / 40.0)))
+                result *= boost
+
+        # Tighten progressively after most of the expected holding time has elapsed.
+        if held_min is not None and trade.get("max_hours"):
+            max_mins = float(trade.get("max_hours", 0)) * 60
+            if max_mins > 0:
+                progress = held_min / max_mins
+                if progress > TRAIL_DECAY_START:
+                    decay_progress = min(1.0, (progress - TRAIL_DECAY_START) / max(0.001, 1.0 - TRAIL_DECAY_START))
+                    decay_mult = 1.0 - (1.0 - TRAIL_DECAY_MIN_MULT) * decay_progress
+                    result *= max(TRAIL_DECAY_MIN_MULT, decay_mult)
 
     # ATR-aware floor: never trail tighter than 0.8×ATR (avoids wick shakeouts)
     atr_floor = atr_pct * 0.8
@@ -619,6 +675,9 @@ def save_state():
             "last_rebalance_count":   _last_rebalance_count,
             "dynamic_scalper_budget": _dynamic_scalper_budget,
             "dynamic_moonshot_budget":_dynamic_moonshot_budget,
+            "session_pnl_anchor_equity": _session_pnl_anchor_equity,
+            "daily_pnl_anchor_equity":   _daily_pnl_anchor_equity,
+            "daily_pnl_anchor_date":     _daily_pnl_anchor_date,
             "saved_at":             datetime.now(timezone.utc).isoformat(),
         }
         tmp = STATE_FILE + ".tmp"
@@ -630,7 +689,7 @@ def save_state():
 
 def load_state() -> tuple:
     defaults = ([], [], [], [], 0, 0.0, 0.0, False, {}, set(), {}, set(), {}, {},
-                {"SCALPER": 0.0, "MOONSHOT": 0.0}, 0, None, None)
+                {"SCALPER": 0.0, "MOONSHOT": 0.0}, 0, None, None, None, None, "")
     try:
         if not os.path.exists(STATE_FILE):
             return defaults
@@ -663,6 +722,9 @@ def load_state() -> tuple:
             d.get("last_rebalance_count",   0),
             d.get("dynamic_scalper_budget", None),
             d.get("dynamic_moonshot_budget",None),
+            d.get("session_pnl_anchor_equity"),
+            d.get("daily_pnl_anchor_equity"),
+            d.get("daily_pnl_anchor_date", ""),
         )
     except Exception as e:
         log.warning(f"State load failed ({e}) — starting fresh")
@@ -1117,15 +1179,92 @@ def calc_qty(budget: float, price: float, step_size: float) -> float:
 def get_available_balance() -> float:
     if PAPER_TRADE:
         return round(PAPER_BALANCE + sum(t["pnl_usdt"] for t in trade_history), 2)
+    return round(get_live_account_snapshot().get("free_usdt", 0.0), 2)
+
+def get_live_account_snapshot(force_refresh: bool = False) -> dict:
+    if PAPER_TRADE:
+        total = round(PAPER_BALANCE + sum(t.get("pnl_usdt", 0) for t in trade_history), 4)
+        return {"at": time.time(), "free_usdt": total, "total_equity": total}
+
+    now = time.time()
+    with _account_snapshot_lock:
+        cached = dict(_account_snapshot_cache)
+    if (not force_refresh) and cached.get("at", 0) > 0 and now - cached["at"] < ACCOUNT_SNAPSHOT_TTL:
+        return cached
+
     try:
         data = private_get("/api/v3/account")
-        for b in data.get("balances", []):
-            if b["asset"] == "USDT":
-                return float(b["free"])   # only free USDT is available for new trades
-        return 0.0
+        balances = data.get("balances", [])
+        free_usdt = 0.0
+        total_equity = 0.0
+        non_usdt_assets = []
+        for bal in balances:
+            asset = bal.get("asset", "")
+            free = float(bal.get("free", 0) or 0.0)
+            locked = float(bal.get("locked", 0) or 0.0)
+            total = free + locked
+            if total <= 0:
+                continue
+            if asset == "USDT":
+                free_usdt = free
+                total_equity += total
+            else:
+                non_usdt_assets.append((asset, total))
+        if non_usdt_assets:
+            all_prices = {
+                item["symbol"]: float(item["price"])
+                for item in public_get("/api/v3/ticker/price")
+            }
+            for asset, qty in non_usdt_assets:
+                px = all_prices.get(f"{asset}USDT")
+                if px is not None:
+                    total_equity += qty * px
+                else:
+                    log.debug(f"[EQUITY] Missing USDT mark price for {asset} — excluded from total equity")
+        snapshot = {
+            "at": now,
+            "free_usdt": round(free_usdt, 4),
+            "total_equity": round(total_equity, 4),
+        }
+        with _account_snapshot_lock:
+            _account_snapshot_cache.update(snapshot)
+        return snapshot
     except Exception as e:
-        log.error(f"Balance fetch failed: {e}")
-        return 0.0
+        log.error(f"Live account snapshot failed: {e}")
+        if cached.get("at", 0) > 0:
+            return cached
+        return {"at": now, "free_usdt": 0.0, "total_equity": 0.0}
+
+def get_live_pnl_snapshot(force_refresh: bool = False) -> dict:
+    snapshot = get_live_account_snapshot(force_refresh=force_refresh)
+    total_equity = snapshot.get("total_equity", 0.0)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    global _session_pnl_anchor_equity, _daily_pnl_anchor_equity, _daily_pnl_anchor_date
+    if _session_pnl_anchor_equity is None:
+        _session_pnl_anchor_equity = total_equity
+    if _daily_pnl_anchor_equity is None or _daily_pnl_anchor_date != today:
+        _daily_pnl_anchor_equity = total_equity
+        _daily_pnl_anchor_date = today
+    session_anchor = _session_pnl_anchor_equity if _session_pnl_anchor_equity is not None else total_equity
+    daily_anchor = _daily_pnl_anchor_equity if _daily_pnl_anchor_equity is not None else total_equity
+    return {
+        **snapshot,
+        "session_anchor": round(session_anchor, 4),
+        "daily_anchor": round(daily_anchor, 4),
+        "session_pnl": round(total_equity - session_anchor, 4),
+        "daily_pnl": round(total_equity - daily_anchor, 4),
+    }
+
+def _iso_to_ms(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
 
 def get_asset_balance(symbol: str) -> float:
     """Return total (free + locked) balance of the base asset."""
@@ -1777,7 +1916,6 @@ def build_watchlist(tickers: pd.DataFrame):
 
     telegram(
         f"📋 <b>Watchlist</b> | {len(symbols)} pairs\n"
-        f"━━━━━━━━━━━━━━━\n"
         f"Top: <b>{top_line}</b>\n"
         f"{status_line}"
     )
@@ -1945,6 +2083,9 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
                       f"(delta={rsi_delta:+.1f} vol={vol_ratio:.1f}× — rebound context)")
         if rsi > MOONSHOT_RSI_ACCEL_MIN and rsi_delta < MOONSHOT_RSI_ACCEL_DELTA:
             return None
+        safe_opens = df_k["open"].replace(0, np.nan)
+        raw_candle_pct = ((close - df_k["open"]).abs() / safe_opens).iloc[-10:].mean()
+        avg_candle_pct = float(raw_candle_pct) if not np.isnan(raw_candle_pct) else 0.0
         rsi_score = max(0, 40 - rsi) if rsi < 50 else 0
         ema9  = calc_ema(close, 9)
         ema21 = calc_ema(close, 21)
@@ -2014,6 +2155,7 @@ def find_moonshot_opportunity(tickers: pd.DataFrame, budget: float,
                                                    is_trending=(sym in trending_syms),
                                                    label="MOONSHOT"),
             "price":        float(close.iloc[-1]),
+            "avg_candle_pct": round(avg_candle_pct, 6),
             "_df":          df_k,
             "_is_new":      is_new,
             "_is_trending": sym in trending_syms,
@@ -2099,6 +2241,9 @@ def evaluate_reversal_candidate(sym: str) -> dict | None:
     avg_vol = float(volume.iloc[-22:-2].mean())
     if avg_vol <= 0:
         return None
+    safe_opens = opens.replace(0, np.nan)
+    raw_candle_pct = ((close - opens).abs() / safe_opens).iloc[-10:].mean()
+    avg_candle_pct = float(raw_candle_pct) if not np.isnan(raw_candle_pct) else 0.0
 
     # Scan last 5 candles for capitulation (big red + high vol) followed by bounce (green)
     best_cap = None
@@ -2164,6 +2309,7 @@ def evaluate_reversal_candidate(sym: str) -> dict | None:
         "recovery":    round(best_cap["recovery"], 3),
         "cap_vol_ratio": round(best_cap["cap_vol"] / avg_vol, 2),
         "bounce_vol_ratio": round(best_cap["bounce_vol"] / avg_vol, 2),
+        "avg_candle_pct": round(avg_candle_pct, 6),
         "cap_sl_pct":  round(cap_sl_pct, 4),
     }
 
@@ -2222,6 +2368,9 @@ def evaluate_prebreakout_candidate(sym: str) -> dict | None:
     above_ema21 = price_now > float(ema21.iloc[-1])
     atr     = calc_atr(df, period=14)
     atr_pct = atr / price_now if price_now > 0 else 0.01
+    safe_opens = opens.replace(0, np.nan)
+    raw_candle_pct = ((close - opens).abs() / safe_opens).iloc[-10:].mean()
+    avg_candle_pct = float(raw_candle_pct) if not np.isnan(raw_candle_pct) else atr_pct
     pattern = None
     score   = 0.0
     n = PRE_BREAKOUT_ACCUM_CANDLES
@@ -2301,6 +2450,7 @@ def evaluate_prebreakout_candidate(sym: str) -> dict | None:
         "rsi":          round(rsi, 2),
         "rsi_delta":    rsi_delta,
         "atr_pct":      round(atr_pct, 6),
+        "avg_candle_pct": round(avg_candle_pct, 6),
         "entry_signal": pattern,
         "vol_ratio":    vol_ratio,
     }
@@ -2480,6 +2630,9 @@ def evaluate_grid_candidate(sym: str) -> dict | None:
     # ── ATR for position sizing / SL calibration ─────────────────
     atr     = calc_atr(df, period=14)
     atr_pct = atr / price_now if price_now > 0 else 0.01
+    safe_close = close.replace(0, np.nan)
+    raw_candle_pct = ((close - df["open"]).abs() / safe_close).iloc[-10:].mean()
+    avg_candle_pct = float(raw_candle_pct) if not np.isnan(raw_candle_pct) else atr_pct
 
     # ── Scoring ──────────────────────────────────────────────────
     score = 0.0
@@ -2544,6 +2697,7 @@ def evaluate_grid_candidate(sym: str) -> dict | None:
         "rsi":          round(rsi, 2),
         "rsi_delta":    0.0,
         "atr_pct":      round(atr_pct, 6),
+        "avg_candle_pct": round(avg_candle_pct, 6),
         "vol_ratio":    vol_ratio,
         "entry_signal": "GRID_MEAN_REVERT",
         "tp_pct":       round(tp_pct, 6),
@@ -2648,6 +2802,9 @@ def evaluate_trinity_candidate(sym: str) -> dict | None:
         return None
     atr     = calc_atr(df, period=14)
     atr_pct = atr / price_now if price_now > 0 else 0.01
+    safe_opens = opens.replace(0, np.nan)
+    raw_candle_pct = ((close - opens).abs() / safe_opens).iloc[-10:].mean()
+    avg_candle_pct = float(raw_candle_pct) if not np.isnan(raw_candle_pct) else atr_pct
     tp_pct = max(TRINITY_TP_MIN, atr_pct * TRINITY_TP_ATR_MULT)
     sl_pct = min(TRINITY_SL_MAX, atr_pct * TRINITY_SL_ATR_MULT)
     if sl_pct > 0 and tp_pct / sl_pct < 1.5:
@@ -2662,6 +2819,7 @@ def evaluate_trinity_candidate(sym: str) -> dict | None:
         "vol_ratio":    round(vol_burst, 2),
         "entry_signal": "DEEP_DIP_RECOVERY",
         "atr_pct":      round(atr_pct, 6),
+        "avg_candle_pct": round(avg_candle_pct, 6),
         "tp_pct":   round(tp_pct, 6),
         "sl_pct":   round(sl_pct, 6),
         "drop_pct": round(best_drop * 100, 2),
@@ -2846,7 +3004,8 @@ def get_order_details(symbol: str, order_id: int) -> dict:
         return {}
 
 def get_actual_fills(symbol: str, since_ms: int, retries: int = 3,
-                     buy_order_id=None, sell_order_ids: set | None = None) -> dict:
+                     buy_order_id=None, sell_order_ids: set | None = None,
+                     until_ms: int | None = None, strict_ids: bool = True) -> dict:
     if PAPER_TRADE:
         return {}
     def wavg_price(trades):
@@ -2862,6 +3021,8 @@ def get_actual_fills(symbol: str, since_ms: int, retries: int = 3,
                 "startTime": since_ms,
                 "limit":     50,
             })
+            if until_ms is not None:
+                fills = [f for f in fills if int(f.get("time", 0)) <= until_ms]
             if not fills:
                 if attempt < retries - 1:
                     time.sleep(1)
@@ -2872,13 +3033,26 @@ def get_actual_fills(symbol: str, since_ms: int, retries: int = 3,
             if buy_order_id:
                 buys = [f for f in all_buys if str(f.get("orderId")) == str(buy_order_id)]
                 if not buys:
+                    log.debug(f"[FILLS] {symbol}: buy order {buy_order_id} not visible yet on attempt {attempt+1}/{retries}")
+                    if strict_ids and attempt < retries - 1:
+                        time.sleep(1)
+                        continue
+                    if strict_ids:
+                        return {}
                     buys = all_buys
             else:
                 buys = all_buys
             if sell_order_ids:
+                expected_sell_ids = {str(s) for s in sell_order_ids}
                 sells = [f for f in all_sells if str(f.get("orderId")) in
-                         {str(s) for s in sell_order_ids}]
+                         expected_sell_ids]
                 if not sells:
+                    log.debug(f"[FILLS] {symbol}: sell orders {sorted(expected_sell_ids)} not visible yet on attempt {attempt+1}/{retries}")
+                    if strict_ids and attempt < retries - 1:
+                        time.sleep(1)
+                        continue
+                    if strict_ids:
+                        return {}
                     sells = all_sells
             else:
                 sells = all_sells
@@ -2968,6 +3142,121 @@ def calc_dynamic_tp_sl(opp: dict) -> tuple[float, float, str, str]:
              f"SL: {sl_pct*100:.2f}% [{sl_label}] | "
              f"R:R {tp_pct/sl_pct:.1f}:1")
     return tp_pct, sl_pct, tp_label, sl_label
+
+def calc_stop_confirmation_buffer(trade: dict, held_min: float = 0.0) -> float:
+    atr_pct = trade.get("atr_pct") or trade.get("trail_pct") or trade.get("sl_pct", 0.02)
+    avg_candle_pct = trade.get("avg_candle_pct") or atr_pct
+    raw_buffer = max(atr_pct * STOP_CONFIRM_ATR_MULT,
+                     avg_candle_pct * STOP_CONFIRM_CANDLE_MULT)
+    buffer_pct = min(STOP_CONFIRM_MAX_BUFFER,
+                     max(STOP_CONFIRM_MIN_BUFFER, raw_buffer))
+    if held_min > STOP_CONFIRM_EARLY_MINS:
+        fade = max(0.35, STOP_CONFIRM_EARLY_MINS / max(held_min, STOP_CONFIRM_EARLY_MINS))
+        buffer_pct *= fade
+    return buffer_pct
+
+def get_stop_confirm_secs(label: str) -> int:
+    return {
+        "SCALPER": SCALPER_STOP_CONFIRM_SECS,
+        "GRID": GRID_STOP_CONFIRM_SECS,
+        "TRINITY": TRINITY_STOP_CONFIRM_SECS,
+        "REVERSAL": REVERSAL_STOP_CONFIRM_SECS,
+        "MOONSHOT": MOONSHOT_STOP_CONFIRM_SECS,
+        "PRE_BREAKOUT": PREBREAKOUT_STOP_CONFIRM_SECS,
+    }.get(label, STOP_CONFIRM_SECS)
+
+def calc_dynamic_confirm_secs(label: str, atr_pct: float) -> int:
+    base_confirm = get_stop_confirm_secs(label)
+    atr_anchor = 0.015
+    atr_mult = max(0.7, min(1.8, atr_pct / atr_anchor)) if atr_anchor > 0 else 1.0
+    return max(8, int(round(base_confirm * atr_mult)))
+
+def should_trigger_stop_loss(trade: dict, price: float, pct: float,
+                             held_min: float, label: str, tp_order_id=None) -> tuple[bool, str]:
+    symbol = trade["symbol"]
+    hard_sl_pct = -(trade.get("sl_pct", 0.05) * 100 + 4.0)
+    if pct <= hard_sl_pct:
+        trade["_last_stop_context"] = {
+            "mode": "hard_cap",
+            "sl_price": trade.get("sl_price"),
+            "trigger_price": price,
+            "confirm_secs": 0,
+            "buffer_pct": 0.0,
+        }
+        log.info(f"🚨 [{label}] Hard SL: {symbol} | {pct:.2f}%")
+        if not PAPER_TRADE and tp_order_id:
+            cancel_order(symbol, tp_order_id, label)
+        trade.pop("_sl_breach_at", None)
+        trade.pop("_sl_breach_price", None)
+        return True, "STOP_LOSS"
+
+    sl_price = trade["sl_price"]
+    buffer_pct = calc_stop_confirmation_buffer(trade, held_min)
+    atr_pct = trade.get("atr_pct") or trade.get("trail_pct") or trade.get("sl_pct", 0.02)
+    confirm_secs = calc_dynamic_confirm_secs(label, atr_pct)
+    hard_breach_price = sl_price * (1 - buffer_pct)
+    recovery_price = sl_price * (1 + buffer_pct * 0.25)
+
+    if price > recovery_price:
+        if trade.get("_sl_breach_at") is not None:
+            log.debug(f"[SL] {symbol}: recovered above stop confirmation band — reset pending stop")
+        trade.pop("_sl_breach_at", None)
+        trade.pop("_sl_breach_price", None)
+        trade.pop("_last_stop_context", None)
+        return False, ""
+
+    if price > sl_price:
+        return False, ""
+
+    if price <= hard_breach_price:
+        trade["_last_stop_context"] = {
+            "mode": "hard_breach",
+            "sl_price": sl_price,
+            "trigger_price": price,
+            "confirm_secs": confirm_secs,
+            "buffer_pct": buffer_pct,
+        }
+        log.info(f"🛑 [{label}] SL hard breach: {symbol} | {pct:.2f}% | "
+                 f"trigger ${price:.6f} <= ${hard_breach_price:.6f}")
+        if not PAPER_TRADE and tp_order_id:
+            cancel_order(symbol, tp_order_id, label)
+        trade.pop("_sl_breach_at", None)
+        trade.pop("_sl_breach_price", None)
+        return True, "STOP_LOSS"
+
+    now = time.time()
+    breach_at = trade.get("_sl_breach_at")
+    if breach_at is None:
+        trade["_sl_breach_at"] = now
+        trade["_sl_breach_price"] = price
+        trade["_last_stop_context"] = {
+            "mode": "soft_watch",
+            "sl_price": sl_price,
+            "trigger_price": price,
+            "confirm_secs": confirm_secs,
+            "buffer_pct": buffer_pct,
+        }
+        log.info(f"⏳ [{label}] Soft SL watch: {symbol} | {pct:.2f}% | "
+                 f"stop ${sl_price:.6f} | band {buffer_pct*100:.2f}% | confirm {confirm_secs}s")
+        return False, ""
+
+    trade["_sl_breach_price"] = min(trade.get("_sl_breach_price", price), price)
+    if now - breach_at >= confirm_secs:
+        trade["_last_stop_context"] = {
+            "mode": "soft_confirmed",
+            "sl_price": sl_price,
+            "trigger_price": trade.get("_sl_breach_price", price),
+            "confirm_secs": confirm_secs,
+            "buffer_pct": buffer_pct,
+        }
+        log.info(f"🛑 [{label}] Soft SL confirmed: {symbol} | {pct:.2f}% | "
+                 f"below stop for {now - breach_at:.0f}s")
+        if not PAPER_TRADE and tp_order_id:
+            cancel_order(symbol, tp_order_id, label)
+        trade.pop("_sl_breach_at", None)
+        trade.pop("_sl_breach_price", None)
+        return True, "STOP_LOSS"
+    return False, ""
 
 def calc_risk_budget(opp: dict, balance: float) -> tuple[float, float, float, str, str]:
     score = opp.get("score", SCALPER_THRESHOLD)
@@ -3250,11 +3539,13 @@ def open_position(opp, budget_usdt, tp_pct, sl_pct, label, max_hours=None):
         "rsi":            opp.get("rsi", 0),
         "entry_signal":   opp.get("entry_signal", "UNKNOWN"),
         "sentiment":      opp.get("sentiment"),
+        "social_boost":   opp.get("social_boost"),
         "trail_pct":      opp.get("trail_pct", SCALPER_TRAIL_PCT) if label == "SCALPER" else None,
         "atr_pct":        opp.get("atr_pct") if opp.get("atr_pct") is not None else (
                               opp.get("trail_pct", SCALPER_TRAIL_PCT) if label == "SCALPER"
                               else actual_sl * 0.5
                           ),
+        "avg_candle_pct": opp.get("avg_candle_pct"),
         "vol_ratio":      opp.get("vol_ratio", 1.0),   # for micro‑cap detection
         "move_maturity":  opp.get("move_maturity"),
         "breakeven_act":  (SCALPER_BREAKEVEN_ACT if (
@@ -3357,7 +3648,7 @@ def activate_floor_and_chase(trade, exit_price):
     hwm = trade["highest_price"]
     peak_profit = (hwm / trade["entry_price"] - 1)
     label = trade.get("label", "MOONSHOT")
-    trail_pct = calc_progressive_trail(peak_profit, atr_pct, strategy=label)
+    trail_pct = calc_progressive_trail(peak_profit, atr_pct, strategy=label, trade=trade)
     trail_stop = hwm * (1 - trail_pct)
     # Ensure trail stop is not below hard floor
     trade["trailing_stop_price"] = max(trail_stop, hard_floor)
@@ -3401,17 +3692,11 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
     trade["highest_price"] = max(old_high, price)
     if price > old_high:
         trade["last_new_high_at"] = time.time()
-    hard_sl_pct = -(trade.get("sl_pct", 0.05) * 100 + 4.0)
-    if pct <= hard_sl_pct:
-        log.info(f"🚨 [{label}] Hard SL: {symbol} | {pct:.2f}%")
-        if not PAPER_TRADE and tp_order_id:
-            cancel_order(symbol, tp_order_id, label)
-        return True, "STOP_LOSS"
-    if price <= trade["sl_price"]:
-        log.info(f"🛑 [{label}] SL: {symbol} | {pct:.2f}%")
-        if not PAPER_TRADE and tp_order_id:
-            cancel_order(symbol, tp_order_id, label)
-        return True, "STOP_LOSS"
+    should_sl, sl_reason = should_trigger_stop_loss(
+        trade, price, pct, held_min, label, tp_order_id=tp_order_id
+    )
+    if should_sl:
+        return True, sl_reason
 
     # ── MOONSHOT HIGH-WATER MARK WITH MICRO‑CAP AND ATR GIVEBACK ──
     if label == "MOONSHOT" and not trade.get("partial_tp_hit") and not trade.get("micro_tp_hit"):
@@ -3560,7 +3845,7 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
         trail_activated = (peak_profit >= atr_pct * SCALPER_TRAIL_ATR_ACTIVATE
                            or trade.get("partial_tp_hit"))
         if trail_activated:
-            active_trail = calc_progressive_trail(peak_profit, atr_pct, strategy="SCALPER")
+            active_trail = calc_progressive_trail(peak_profit, atr_pct, strategy="SCALPER", trade=trade, held_min=held_min)
             trail_label  = f"prog {active_trail*100:.1f}%"
             if price <= trade["highest_price"] * (1 - active_trail):
                 log.info(f"📉 [{label}] Progressive trail ({trail_label}): {symbol} | {pct:+.2f}% "
@@ -3676,7 +3961,7 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             atr_pct = trade.get("atr_pct", 0.02)
             peak_profit = (trade["highest_price"] / trade["entry_price"] - 1)
             # Progressive trail: tightens as profit grows, adjusts for volatility
-            trail_pct = calc_progressive_trail(peak_profit, atr_pct, strategy=label)
+            trail_pct = calc_progressive_trail(peak_profit, atr_pct, strategy=label, trade=trade, held_min=held_min)
             new_trail = trade["highest_price"] * (1 - trail_pct)
             # Trail can only go up
             if new_trail > trade.get("trailing_stop_price", 0):
@@ -3693,7 +3978,7 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
             if price <= active_trigger:
                 curr_peak = (trade["highest_price"] / trade["entry_price"] - 1)
                 curr_trail_pct = calc_progressive_trail(
-                    curr_peak, trade.get("atr_pct", 0.02), strategy=label)
+                    curr_peak, trade.get("atr_pct", 0.02), strategy=label, trade=trade, held_min=held_min)
                 log.info(f"🛡️ Floor & Chase exit: {symbol} | price {price:.6f} ≤ "
                          f"{triggered_by} {active_trigger:.6f} | "
                          f"trail {curr_trail_pct*100:.1f}% at peak +{curr_peak*100:.1f}% | "
@@ -3707,7 +3992,7 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
     elif label == "MOONSHOT" and trade.get("partial_tp_hit") and not trade.get("trailing_active"):
         atr_pct     = trade.get("atr_pct") or MOONSHOT_SL * 0.5
         peak_profit = (trade["highest_price"] / trade["entry_price"] - 1)
-        trail_pct   = calc_progressive_trail(peak_profit, atr_pct, strategy="MOONSHOT")
+        trail_pct   = calc_progressive_trail(peak_profit, atr_pct, strategy="MOONSHOT", trade=trade, held_min=held_min)
         trail_sl    = trade["highest_price"] * (1 - trail_pct)
         if price <= trail_sl:
             log.info(f"📉 [{label}] Progressive trail ({trail_pct*100:.1f}%): {symbol} | {pct:+.2f}% | "
@@ -3736,7 +4021,7 @@ def check_exit(trade, best_score: float = 0) -> tuple[bool, str]:
                 atr_pct = trade.get("atr_pct", 0.02)
                 peak_profit = (trade.get("highest_price", price) / trade["entry_price"] - 1)
                 if peak_profit > 0.02:  # only trail once 2%+ up
-                    trail_pct = calc_progressive_trail(peak_profit, atr_pct, strategy=label)
+                    trail_pct = calc_progressive_trail(peak_profit, atr_pct, strategy=label, trade=trade, held_min=held_min)
                     trail_sl  = trade["highest_price"] * (1 - trail_pct)
                     if price <= trail_sl:
                         log.info(f"📈 [{label}] Bull trail exit: {symbol} | {pct:+.2f}% | "
@@ -4001,10 +4286,12 @@ def execute_partial_tp(trade, micro: bool = False) -> bool:
 def close_position(trade, reason) -> bool:
     label  = trade["label"]
     symbol = trade["symbol"]
+    original_tp_order_id = trade.get("tp_order_id")
+    manual_close = reason in ("MANUAL_CLOSE", "EMERGENCY_CLOSE")
     needs_sell = (
         (label in ("MOONSHOT", "REVERSAL", "PRE_BREAKOUT")) or
-        (label == "SCALPER" and reason in ("STOP_LOSS","TRAILING_STOP","TIMEOUT","FLAT_EXIT","ROTATION","VOL_COLLAPSE","PROTECT_STOP","MAJOR_PARTIAL_TP")) or
-        (label == "TRINITY" and reason in ("STOP_LOSS","TIMEOUT"))
+        (label == "SCALPER" and reason in ("STOP_LOSS","TRAILING_STOP","TIMEOUT","FLAT_EXIT","ROTATION","VOL_COLLAPSE","PROTECT_STOP","MAJOR_PARTIAL_TP","MANUAL_CLOSE","EMERGENCY_CLOSE")) or
+        (label == "TRINITY" and reason in ("STOP_LOSS","TIMEOUT","MANUAL_CLOSE","EMERGENCY_CLOSE"))
     )
     sell_order_id = None
 
@@ -4051,7 +4338,7 @@ def close_position(trade, reason) -> bool:
             trade["tp_order_id"] = None
 
         # For defensive exits: cancel all open orders, then market sell
-        defensive_reasons = ("STOP_LOSS", "TRAILING_STOP", "TIMEOUT", "FLAT_EXIT", "ROTATION", "VOL_COLLAPSE", "PROTECT_STOP")
+        defensive_reasons = ("STOP_LOSS", "TRAILING_STOP", "TIMEOUT", "FLAT_EXIT", "ROTATION", "VOL_COLLAPSE", "PROTECT_STOP", "MANUAL_CLOSE", "EMERGENCY_CLOSE")
         if reason in defensive_reasons:
             # Cancel all open orders to unlock balance
             cancel_all_orders(symbol)
@@ -4228,8 +4515,8 @@ def close_position(trade, reason) -> bool:
         bought_at_ms  = trade.get("bought_at_ms", int(time.time() * 1000) - 86400_000)
         buy_order_id  = trade.get("buy_order_id")
         known_sell_ids = set()
-        if trade.get("tp_order_id"):
-            known_sell_ids.add(trade["tp_order_id"])
+        if original_tp_order_id:
+            known_sell_ids.add(original_tp_order_id)
         if sell_order_id and sell_order_id != "already_closed":
             known_sell_ids.add(sell_order_id)
         retries    = 5 if (reason == "TAKE_PROFIT" and label in ("SCALPER", "TRINITY")) else 3
@@ -4289,13 +4576,13 @@ def close_position(trade, reason) -> bool:
                  f"exit {actual_profit*100:+.1f}% | gave back {giveback_ratio*100:.0f}%"
                  + (f" ⚠️ trail too wide" if giveback_ratio > GIVEBACK_TARGET_HIGH else ""))
     global _consecutive_losses, _win_rate_pause_until, _strategy_loss_streaks, _strategy_paused_until
-    if label == "SCALPER":
+    if label == "SCALPER" and not manual_close:
         if pnl_pct <= 0:
             _consecutive_losses += 1
         else:
             _consecutive_losses = 0
     # P6: Per-strategy loss streak (Trinity/Reversal/Grid crash guard)
-    if label in ("TRINITY", "REVERSAL", "GRID"):
+    if label in ("TRINITY", "REVERSAL", "GRID") and not manual_close:
         if pnl_pct <= 0:
             _strategy_loss_streaks[label] = _strategy_loss_streaks.get(label, 0) + 1
             streak = _strategy_loss_streaks[label]
@@ -4328,12 +4615,15 @@ def close_position(trade, reason) -> bool:
     full_trades = [t for t in trade_history if not t.get("is_partial")]
     wins        = [t for t in full_trades if t["pnl_pct"] > 0]
     win_rate    = len(wins) / len(full_trades) * 100 if full_trades else 0
-    total_pnl   = sum(t["pnl_usdt"] for t in trade_history)  # includes partials (real money)
+    live_pnl    = get_live_pnl_snapshot(force_refresh=True)
+    total_pnl   = live_pnl["session_pnl"]
     partial_count = sum(1 for t in trade_history if t.get("is_partial"))
     mode      = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
     icons     = {
         "TAKE_PROFIT":   ("🎯","Take Profit Hit"),
         "STOP_LOSS":     ("🛑","Stop Loss Hit"),
+        "MANUAL_CLOSE":  ("🚨","Manual Close"),
+        "EMERGENCY_CLOSE": ("🚨","Emergency Close"),
         "TRAILING_STOP": ("📉","Trailing Stop Hit"),
         "FLAT_EXIT":     ("😴","Flat Exit"),
         "ROTATION":      ("🔀","Rotated"),
@@ -4350,12 +4640,36 @@ def close_position(trade, reason) -> bool:
     }
     emoji, reason_label = icons.get(reason, ("✅", reason))
     fills_note = "✅" if exit_fills.get("avg_sell_price") else "⚠️ est"
+    stop_context = trade.get("_last_stop_context") if reason == "STOP_LOSS" else None
+    stop_line = ""
+    if stop_context:
+        stop_mode = {
+            "hard_cap": "hard cap",
+            "hard_breach": "hard breach",
+            "soft_confirmed": "soft confirmed",
+            "soft_watch": "soft watch",
+        }.get(stop_context.get("mode"), stop_context.get("mode", "stop"))
+        stop_sl = stop_context.get("sl_price")
+        stop_trigger = stop_context.get("trigger_price")
+        stop_confirm = int(stop_context.get("confirm_secs", 0) or 0)
+        stop_buffer = float(stop_context.get("buffer_pct", 0.0) or 0.0)
+        parts = [f"SL {stop_mode}"]
+        if stop_sl:
+            parts.append(f"set ${stop_sl:.6f}")
+        if stop_trigger:
+            parts.append(f"trigger ${stop_trigger:.6f}")
+        if stop_confirm > 0:
+            parts.append(f"confirm {stop_confirm}s")
+        if stop_buffer > 0:
+            parts.append(f"band {stop_buffer*100:.2f}%")
+        stop_line = " | ".join(parts) + "\n"
     peak_line  = (f"Peak +{peak_profit*100:.1f}% (gave back {giveback_display*100:.0f}%)\n"
                   if peak_profit > 0.005 else "")
     telegram(
         f"{emoji} <b>{reason_label} — {label} {symbol}</b> [{mode}]\n"
         f"━━━━━━━━━━━━━━━\n"
         f"${actual_entry:.6f} → <b>${actual_exit:.6f}</b> [{fills_note}]\n"
+        f"{stop_line}"
         f"P&L <b>{pnl_pct:+.2f}% (${pnl_usdt:+.2f})</b>"
         + (f" | Fees ${fee_usdt:.4f}" if fee_usdt > 0 else "") + "\n"
         f"{peak_line}"
@@ -4393,7 +4707,10 @@ def send_heartbeat(balance: float):
     elif mult > 0.95: regime_label = "⚪ SIDEWAYS"
     elif mult > 0.80: regime_label = "🟢 BULL"
     else: regime_label = "🚀 STRONG BULL"
-    session_pnl = sum(t.get("pnl_usdt", 0) for t in trade_history)
+    live_pnl = get_live_pnl_snapshot()
+    balance = live_pnl["free_usdt"]
+    total_value = live_pnl["total_equity"]
+    session_pnl = live_pnl["session_pnl"]
     scalper_lines = []
     for t in scalper_trades:
         _, pct = _trade_price_pct(t)
@@ -4412,10 +4729,6 @@ def send_heartbeat(balance: float):
     for t in grid_trades:
         _, pct = _trade_price_pct(t)
         grid_lines.append(f"  📊 {t['symbol']} {pct:+.2f}%" if pct is not None else f"  📊 {t['symbol']}")
-    total_value = balance
-    for t in scalper_trades + alt_trades + grid_trades:
-        px, _ = _trade_price_pct(t)
-        total_value += px * t["qty"] if px else t.get("budget_used", 0)
     fg_icon = "😱" if _fear_greed_index <= 25 else "😨" if _fear_greed_index <= 40 else "😐" if _fear_greed_index <= 60 else "😀" if _fear_greed_index <= 75 else "🤑"
     moon_gate = "✅" if _moonshot_gate_open else "⛔"
     telegram(
@@ -4717,7 +5030,10 @@ def _cmd_status(balance: float):
         regime_label = "🟢 BULL"
     else:
         regime_label = "🚀 STRONG BULL"
-    session_pnl = sum(t.get("pnl_usdt", 0) for t in trade_history)
+    live_pnl = get_live_pnl_snapshot()
+    session_pnl = live_pnl["session_pnl"]
+    total_equity = live_pnl["total_equity"]
+    balance = live_pnl["free_usdt"]
     lines = [f"📋 <b>Status</b> [{mode}]\n━━━━━━━━━━━━━━━"]
     fg_icon = "😱" if _fear_greed_index <= 25 else "😨" if _fear_greed_index <= 40 else "😐" if _fear_greed_index <= 60 else "😀" if _fear_greed_index <= 75 else "🤑"
     lines.append(f"Market: <b>{regime_label}</b> (×{mult:.2f}) | F&G: {fg_icon}{_fear_greed_index}")
@@ -4764,7 +5080,7 @@ def _cmd_status(balance: float):
                          f"TP: ${t['tp_price']:.6f} | SL: ${t['sl_price']:.6f}")
         else:
             lines.append(f"📊 {t['symbol']} (unavailable)")
-    lines.append(f"━━━━━━━━━━━━━━━\nBalance: <b>${balance:.2f} USDT</b>")
+    lines.append(f"━━━━━━━━━━━━━━━\nFree: <b>${balance:.2f}</b> | Total: <b>${total_equity:.2f}</b> | Session: <b>${session_pnl:+.2f}</b>")
     telegram("\n".join(lines))
 
 def _compute_metrics(trades: list, since_label: str = "all-time") -> dict:
@@ -4871,11 +5187,14 @@ def _cmd_pnl(balance: float):
     """Show P&L snapshot: today + session, using trade_history."""
     mode  = "📝 PAPER" if PAPER_TRADE else "💰 LIVE"
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    live_pnl = get_live_pnl_snapshot()
+    balance = live_pnl["free_usdt"]
+    total_equity = live_pnl["total_equity"]
     today_trades = [t for t in trade_history
                     if t.get("closed_at", "")[:10] == today
                     and not t.get("is_partial")]
     all_full = [t for t in trade_history if not t.get("is_partial")]
-    all_pnl  = sum(t["pnl_usdt"] for t in trade_history)  # includes partials
+    all_pnl  = live_pnl["session_pnl"]
 
     def _block(trades: list, label: str) -> str:
         if not trades:
@@ -4902,7 +5221,7 @@ def _cmd_pnl(balance: float):
 
     # Today section
     if today_trades:
-        today_pnl = sum(t["pnl_usdt"] for t in today_trades)
+        today_pnl = live_pnl["daily_pnl"]
         today_wins = sum(1 for t in today_trades if t["pnl_pct"] > 0)
         today_emoji = "📈" if today_pnl >= 0 else "📉"
         best_today  = max(today_trades, key=lambda t: t["pnl_usdt"])
@@ -4952,7 +5271,7 @@ def _cmd_pnl(balance: float):
         f"{session_section}"
         f"{open_section}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"Balance: <b>${balance:.2f}</b>"
+        f"Free: <b>${balance:.2f}</b> | Total: <b>${total_equity:.2f}</b>"
     )
 
 def _cmd_metrics(balance: float):
@@ -5055,46 +5374,33 @@ def _cmd_config():
     mg = "✅" if _moonshot_gate_open else "⛔"
     fg_icon = "😱" if _fear_greed_index <= 25 else "😨" if _fear_greed_index <= 40 else "😐" if _fear_greed_index <= 60 else "😀" if _fear_greed_index <= 75 else "🤑"
     telegram(
-        f"⚙️ <b>Config</b>\n━━━━━━━━━━━━━━━\n"
-        f"<b>Market</b>: {rl} (×{mult:.2f}) | F&G {fg_icon}{_fear_greed_index}\n"
-        f"BTC: 1h {_btc_ema_gap_macro*100:+.1f}% | 1d {_btc_ema_gap_daily*100:+.1f}%\n"
-        f"Moon gate: {mg} ({MOONSHOT_BTC_EMA_GATE*100:.1f}%/{MOONSHOT_BTC_GATE_REOPEN*100:.1f}%)\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"💰 S {SCALPER_ALLOCATION_PCT*100:.0f}% | M {MOONSHOT_ALLOCATION_PCT*100:.0f}% | T {TRINITY_ALLOCATION_PCT*100:.0f}%\n"
-        f"🟢 <b>Scalper</b> ×{SCALPER_MAX_TRADES}\n"
-        f"  TP {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% | SL {SCALPER_SL_MIN*100:.1f}–{SCALPER_SL_MAX*100:.0f}%\n"
-        f"  Trail {SCALPER_PROG_CEILING*100:.1f}→{SCALPER_PROG_FLOOR*100:.1f}% | "
-        f"BE ≥{SCALPER_BREAKEVEN_SCORE}pts +{SCALPER_BREAKEVEN_ACT*100:.1f}%\n"
-        f"  WL: {len(_watchlist)} pairs | Thresh: {get_effective_threshold('SCALPER'):.0f}\n"
-        f"🌙 <b>Moon</b> ×{ALT_MAX_TRADES}\n"
-        f"  TP +{MOONSHOT_TP_INITIAL*100:.0f}% | SL ATR×{MOONSHOT_SL_ATR_MULT:.1f}\n"
-        f"  μTP +{MOONSHOT_MICRO_TP_PCT*100:.0f}% → ½TP +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% → F&C\n"
-        f"  Trail {PROG_TRAIL_CEILING*100:.0f}→{PROG_TRAIL_FLOOR*100:.1f}% | "
-        f"TO {MOONSHOT_TIMEOUT_FLAT_MINS}/{MOONSHOT_TIMEOUT_MARGINAL_MINS}/{MOONSHOT_TIMEOUT_MAX_MINS}min\n"
-        f"🔱 <b>Trinity</b> ×{TRINITY_MAX_CONCURRENT} | {TRINITY_INTERVAL}\n"
-        f"  {'/'.join(s[:3] for s in TRINITY_SYMBOLS)} | drop ≥{TRINITY_DROP_PCT*100:.0f}% | "
-        f"RSI {TRINITY_MIN_RSI:.0f}–{TRINITY_MAX_RSI:.0f} | {TRINITY_MAX_HOURS}h\n"
-        f"🔄 <b>Reversal</b> | TP +{REVERSAL_TP*100:.1f}% | {REVERSAL_MAX_HOURS}h\n"
-        f"🔮 <b>Pre-break</b> | TP +{PRE_BREAKOUT_TP*100:.0f}% | {PRE_BREAKOUT_MAX_HOURS}h\n"
-        f"━━━━━━━━━━━━━━━\n"
+        f"⚙️ <b>Config</b>\n"
+        f"Market {rl} (×{mult:.2f}) | F&G {fg_icon}{_fear_greed_index} | Moon {mg}\n"
+        f"BTC 1h {_btc_ema_gap_macro*100:+.1f}% | 1d {_btc_ema_gap_daily*100:+.1f}%\n"
+        f"Alloc S/M/T {SCALPER_ALLOCATION_PCT*100:.0f}/{MOONSHOT_ALLOCATION_PCT*100:.0f}/{TRINITY_ALLOCATION_PCT*100:.0f} | "
+        f"WL {len(_watchlist)} | Thresh S {get_effective_threshold('SCALPER'):.0f} M {get_effective_threshold('MOONSHOT'):.0f}\n"
+        f"🟢 S×{SCALPER_MAX_TRADES} TP {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% SL {SCALPER_SL_MIN*100:.1f}–{SCALPER_SL_MAX*100:.0f}%\n"
+        f"🌙 M×{ALT_MAX_TRADES} TP +{MOONSHOT_TP_INITIAL*100:.0f}% SL ATR×{MOONSHOT_SL_ATR_MULT:.1f} | TO {MOONSHOT_TIMEOUT_FLAT_MINS}/{MOONSHOT_TIMEOUT_MARGINAL_MINS}/{MOONSHOT_TIMEOUT_MAX_MINS}m\n"
+        f"🔱 T×{TRINITY_MAX_CONCURRENT} {TRINITY_INTERVAL} | 🔄 Rev {REVERSAL_MAX_HOURS}h | 🔮 Pre {PRE_BREAKOUT_MAX_HOURS}h\n"
+        f"⏱️ Stop confirm(s): S {SCALPER_STOP_CONFIRM_SECS} | G {GRID_STOP_CONFIRM_SECS} | "
+        f"T {TRINITY_STOP_CONFIRM_SECS} | R {REVERSAL_STOP_CONFIRM_SECS} | "
+        f"M {MOONSHOT_STOP_CONFIRM_SECS} | P {PREBREAKOUT_STOP_CONFIRM_SECS}\n"
         f"🛡️ CB: {MAX_CONSECUTIVE_LOSSES}L streak | Session -{SESSION_LOSS_PAUSE_PCT*100:.0f}% | "
         f"WR <{WIN_RATE_CB_THRESHOLD*100:.0f}%\n"
-        f"🧬 S={get_effective_threshold('SCALPER'):.0f} M={get_effective_threshold('MOONSHOT'):.0f} | "
-        f"☠️ {dead_active} blacklisted\n"
-        f"{'⏸️ PAUSED' if _paused else '▶️ RUNNING'}"
+        f"☠️ {dead_active} blacklisted | {'⏸️ PAUSED' if _paused else '▶️ RUNNING'}"
     )
 
 def _cmd_close():
     telegram("🚨 <b>Emergency close triggered.</b>")
     closed = 0
     for t in scalper_trades[:]:
-        if close_position(t, "STOP_LOSS"):
+        if close_position(t, "EMERGENCY_CLOSE"):
             scalper_trades.remove(t); closed += 1
     for t in alt_trades[:]:
-        if close_position(t, "STOP_LOSS"):
+        if close_position(t, "EMERGENCY_CLOSE"):
             alt_trades.remove(t); closed += 1
     for t in grid_trades[:]:
-        if close_position(t, "STOP_LOSS"):
+        if close_position(t, "EMERGENCY_CLOSE"):
             grid_trades.remove(t); closed += 1
     telegram(f"✅ Closed {closed} position(s).")
 
@@ -5110,6 +5416,104 @@ def _cmd_resetstreak():
     _streak_paused_at      = 0.0
     save_state()
     telegram("✅ <b>Streak reset.</b> Losses cleared, entries resumed.")
+
+def _reconcile_trade_history(days: int = 7, max_trades: int = 80) -> dict:
+    if PAPER_TRADE:
+        return {"updated": 0, "checked": 0, "unresolved": 0, "skipped": 0, "ambiguous": 0}
+    cutoff_ms = int((time.time() - max(1, days) * 86400) * 1000)
+    candidates = []
+    for trade in trade_history:
+        if trade.get("exit_reason") in ("DUST", "UNKNOWN_CLOSED"):
+            continue
+        closed_ms = _iso_to_ms(trade.get("closed_at"))
+        if closed_ms is None or closed_ms < cutoff_ms:
+            continue
+        candidates.append((closed_ms, trade))
+    candidates.sort(key=lambda item: item[0])
+    candidates = candidates[-max_trades:]
+    updated = 0
+    unresolved = 0
+    skipped = 0
+    ambiguous = 0
+    for closed_ms, trade in candidates:
+        symbol = trade.get("symbol")
+        if not symbol:
+            skipped += 1
+            continue
+        since_ms = trade.get("bought_at_ms") or _iso_to_ms(trade.get("opened_at"))
+        if since_ms is None:
+            skipped += 1
+            continue
+        sell_ids = set()
+        if trade.get("tp_order_id"):
+            sell_ids.add(trade["tp_order_id"])
+        if trade.get("sell_order_id"):
+            sell_ids.add(trade["sell_order_id"])
+        if trade.get("exit_order_id"):
+            sell_ids.add(trade["exit_order_id"])
+        buy_order_id = trade.get("buy_order_id")
+        if not buy_order_id and not sell_ids:
+            ambiguous += 1
+            continue
+        fills = get_actual_fills(
+            symbol,
+            since_ms=max(0, since_ms - 5000),
+            retries=2,
+            buy_order_id=buy_order_id,
+            sell_order_ids=sell_ids or None,
+            until_ms=closed_ms + 120000,
+            strict_ids=True,
+        )
+        if not fills.get("avg_buy_price") or not fills.get("avg_sell_price"):
+            unresolved += 1
+            continue
+        fee_usdt = fills.get("fee_usdt", 0.0)
+        cost_usdt = round(fills.get("cost_usdt") or 0.0, 4)
+        revenue_usdt = round(fills.get("revenue_usdt") or 0.0, 4)
+        if cost_usdt <= 0 or revenue_usdt <= 0:
+            unresolved += 1
+            continue
+        pnl_usdt = round(revenue_usdt - cost_usdt - fee_usdt, 4)
+        pnl_pct = round(pnl_usdt / cost_usdt * 100, 4) if cost_usdt > 0 else 0.0
+        old_pnl = round(float(trade.get("pnl_usdt", 0.0) or 0.0), 4)
+        old_exit = float(trade.get("exit_price", 0.0) or 0.0)
+        new_exit = float(fills.get("avg_sell_price") or old_exit)
+        if abs(old_pnl - pnl_usdt) < 0.01 and abs(old_exit - new_exit) < max(0.000001, old_exit * 0.0005):
+            continue
+        trade["entry_price"] = float(fills.get("avg_buy_price") or trade.get("entry_price", 0.0))
+        trade["exit_price"] = new_exit
+        trade["fee_usdt"] = round(fee_usdt, 6)
+        trade["cost_usdt"] = cost_usdt
+        trade["revenue_usdt"] = revenue_usdt
+        trade["pnl_usdt"] = pnl_usdt
+        trade["pnl_pct"] = pnl_pct
+        trade["fills_used"] = True
+        trade["reconciled_at"] = datetime.now(timezone.utc).isoformat()
+        updated += 1
+        time.sleep(0.05)
+    if updated:
+        save_state()
+    return {
+        "updated": updated,
+        "checked": len(candidates),
+        "unresolved": unresolved,
+        "skipped": skipped,
+        "ambiguous": ambiguous,
+    }
+
+def _cmd_reconcile(days: int = 7):
+    days = max(1, min(days, 30))
+    telegram(f"🔧 <b>Reconciling trade history</b> | last {days} day(s) against MEXC fills...")
+    stats = _reconcile_trade_history(days=days)
+    telegram(
+        f"🔧 <b>Reconcile complete</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Checked: <b>{stats['checked']}</b>\n"
+        f"Updated: <b>{stats['updated']}</b>\n"
+        f"Unresolved: <b>{stats['unresolved']}</b>\n"
+        f"Skipped: <b>{stats['skipped']}</b>\n"
+        f"Ambiguous: <b>{stats['ambiguous']}</b>"
+    )
 
 def _cmd_ask(question: str, balance: float):
     if not SENTIMENT_ENABLED:
@@ -5193,6 +5597,13 @@ def listen_for_commands(balance: float):
             elif text == "/restart":      _cmd_restart()
             elif text == "/resetstreak":  _cmd_resetstreak()
             elif text == "/config":       _cmd_config()
+            elif text.startswith("/reconcile"):
+                parts = raw_text.split()
+                try:
+                    days = int(parts[1]) if len(parts) > 1 else 7
+                except Exception:
+                    days = 7
+                _cmd_reconcile(days)
             elif raw_text.startswith("/ask ") or raw_text.startswith("/ask@"):
                 question = raw_text.split(" ", 1)[1].strip() if " " in raw_text else ""
                 if not question:
@@ -5453,7 +5864,8 @@ def startup() -> float:
            _scalper_excluded, _alt_excluded, _grid_excluded, _api_blacklist, \
            _liquidity_blacklist, _liquidity_fail_count, \
            _adaptive_offsets, _last_rebalance_count, \
-           _dynamic_scalper_budget, _dynamic_moonshot_budget
+           _dynamic_scalper_budget, _dynamic_moonshot_budget, \
+           _session_pnl_anchor_equity, _daily_pnl_anchor_equity, _daily_pnl_anchor_date
     mode = "📝 PAPER TRADING" if PAPER_TRADE else "💰 LIVE TRADING"
     log.info(f"🚀 MEXC Bot — {mode}")
     flush_telegram_updates()  # clear stale commands (e.g. /restart) before processing
@@ -5463,7 +5875,9 @@ def startup() -> float:
      _paused, _scalper_excluded, _alt_excluded, _grid_excluded, _api_blacklist,
      _liquidity_blacklist, _liquidity_fail_count,
      _adaptive_offsets, _last_rebalance_count,
-     _dynamic_scalper_budget, _dynamic_moonshot_budget) = load_state()
+        _dynamic_scalper_budget, _dynamic_moonshot_budget,
+        _session_pnl_anchor_equity, _daily_pnl_anchor_equity,
+        _daily_pnl_anchor_date) = load_state()
     if _adaptive_offsets.get("SCALPER", 0) != 0 or _adaptive_offsets.get("MOONSHOT", 0) != 0:
         log.info(f"🧠 [ADAPTIVE] Restored offsets: "
                  f"SCALPER {_adaptive_offsets.get('SCALPER',0):+.0f} "
@@ -5479,31 +5893,19 @@ def startup() -> float:
     log.info("📋 Building initial watchlist...")
     build_watchlist(fetch_tickers())
     startup_balance = get_available_balance()
+    get_live_pnl_snapshot(force_refresh=True)
     log.info(f"💰 Starting balance: ${startup_balance:.2f} USDT")
     telegram(
         f"🚀 <b>MEXC Bot Started</b> [{mode}]\n"
-        f"━━━━━━━━━━━━━━━\n"
         f"💰 <b>${startup_balance:.2f}</b> | "
-        f"S {SCALPER_ALLOCATION_PCT*100:.0f}% M {MOONSHOT_ALLOCATION_PCT*100:.0f}% "
-        f"T {TRINITY_ALLOCATION_PCT*100:.0f}% G {GRID_ALLOCATION_PCT*100:.0f}%\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🟢 Scalper × {SCALPER_MAX_TRADES} | TP {SCALPER_TP_MIN*100:.1f}–{SCALPER_TP_MAX*100:.0f}% | "
-        f"SL {SCALPER_SL_MIN*100:.1f}–{SCALPER_SL_MAX*100:.0f}% | trail prog\n"
-        f"🌙 Moon × {ALT_MAX_TRADES} | TP +{MOONSHOT_TP_INITIAL*100:.0f}% | "
-        f"μTP +{MOONSHOT_MICRO_TP_PCT*100:.0f}% ½TP +{MOONSHOT_PARTIAL_TP_PCT*100:.0f}% → F&C\n"
-        f"🔱 Trinity × {TRINITY_MAX_CONCURRENT} | {TRINITY_INTERVAL} | "
-        f"drop ≥{TRINITY_DROP_PCT*100:.0f}% | {TRINITY_MAX_HOURS}h\n"
-        f"🔄 Reversal | TP +{REVERSAL_TP*100:.1f}% | "
-        f"SL cap-anchored | {REVERSAL_MAX_HOURS}h\n"
-        f"🔮 Pre-breakout | TP +{PRE_BREAKOUT_TP*100:.0f}% | {PRE_BREAKOUT_MAX_HOURS}h\n"
-        f"📊 Grid × {GRID_MAX_CONCURRENT} | {GRID_INTERVAL} BB{GRID_BB_PERIOD} | "
-        f"TP +{GRID_TP_MIN*100:.1f}–{GRID_TP_MAX*100:.1f}% | {GRID_MAX_HOURS}h\n"
-        f"━━━━━━━━━━━━━━━\n"
+        f"Alloc S/M/T/G {SCALPER_ALLOCATION_PCT*100:.0f}/{MOONSHOT_ALLOCATION_PCT*100:.0f}/"
+        f"{TRINITY_ALLOCATION_PCT*100:.0f}/{GRID_ALLOCATION_PCT*100:.0f}\n"
+        f"🟢 S×{SCALPER_MAX_TRADES} | 🌙 M×{ALT_MAX_TRADES} | 🔱 T×{TRINITY_MAX_CONCURRENT} | 📊 G×{GRID_MAX_CONCURRENT}\n"
         f"🛡️ BTC gate {MOONSHOT_BTC_EMA_GATE*100:.0f}%/{MOONSHOT_BTC_GATE_REOPEN*100:.0f}% | "
         f"CB {MAX_CONSECUTIVE_LOSSES}L | Session -{SESSION_LOSS_PAUSE_PCT*100:.0f}%\n"
         f"{'🧠 AI ✅' if SENTIMENT_ENABLED else '🧠 AI ⚠️'} | "
         f"📊 Adaptive ✅ | ⏸️ {'PAUSED' if _paused else 'Active'}\n"
-        f"<i>/status /pnl /metrics /config /pause /close /restart /ask</i>"
+        f"<i>/status /pnl /metrics /config /reconcile /pause /close /restart /ask</i>"
     )
     return startup_balance
 
@@ -5574,10 +5976,9 @@ def run():
                 else:
                     total_value += t["budget_used"]
             today        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            daily_pnl    = sum(t["pnl_usdt"] for t in trade_history
-                               if t.get("closed_at","")[:10] == today
-                               and not t.get("is_partial"))
-            loss_limit   = -(startup_balance * SCALPER_DAILY_LOSS_PCT)
+            live_pnl     = get_live_pnl_snapshot()
+            daily_pnl    = live_pnl["daily_pnl"]
+            loss_limit   = -(live_pnl["daily_anchor"] * SCALPER_DAILY_LOSS_PCT)
             daily_cb     = daily_pnl < loss_limit
             streak_cb    = _consecutive_losses >= MAX_CONSECUTIVE_LOSSES
             win_rate_cb  = time.time() < _win_rate_pause_until
@@ -5625,8 +6026,8 @@ def run():
                 log.debug(f"⚠️ Over-exposed (${open_exposure:.0f} / ${balance:.0f}) — skipping new entries")
 
             # P2: Session P&L pause — stop ALL entries if bleeding too much
-            session_pnl = sum(t.get("pnl_usdt", 0) for t in trade_history)
-            session_loss_limit = -(balance * SESSION_LOSS_PAUSE_PCT)
+            session_pnl = live_pnl["session_pnl"]
+            session_loss_limit = -(live_pnl["session_anchor"] * SESSION_LOSS_PAUSE_PCT)
             session_paused = False
             if _session_loss_paused_until > time.time():
                 session_paused = True
